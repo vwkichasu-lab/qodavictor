@@ -820,6 +820,58 @@ SELECT id, user_id, department, 'Lecturer'
 FROM users
 WHERE user_id = 'PULC/IT/00001';
 
+-- Default student credentials:
+-- Student: PUSE/22210033 / PUSE/22210033
+
+INSERT INTO students (
+    student_id,
+    studentId,
+    full_name,
+    fullName,
+    email,
+    password,
+    level,
+    programme,
+    department,
+    faculty,
+    status,
+    lecturer_id
+)
+SELECT
+    'PUSE/22210033',
+    'PUSE/22210033',
+    'Demo Student',
+    'Demo Student',
+    'student@qoda.test',
+    '$2y$10$.qOvckQyasCwO.B0fmRo5eZp/XnyOXlp2BPzTuzI7ycScZ/edHozC',
+    '200',
+    'Information Technology',
+    'IT',
+    'Technology',
+    'Active',
+    id
+FROM users
+WHERE user_id = 'PULC/IT/00001';
+
+INSERT INTO course_enrollments (
+    student_id,
+    course_code,
+    course_name,
+    lecturer_id,
+    semester,
+    academic_year
+)
+SELECT
+    s.id,
+    'PBIT102',
+    'Programming Fundamentals',
+    u.id,
+    'First Semester',
+    '2024/2025'
+FROM students s
+JOIN users u ON u.user_id = 'PULC/IT/00001'
+WHERE s.student_id = 'PUSE/22210033';
+
 -- ==============================================
 -- DEFAULT SYSTEM SETTINGS
 -- ==============================================
