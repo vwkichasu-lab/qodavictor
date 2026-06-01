@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+backend/node_modules/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# Runtime/generated files
+runtime/
+uploads/
+tools/
+*.log
+*.tmp
+*.cache
+
+# Local IDE/system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# PHP/Composer dependencies if added later
+vendor/
+
+# Build outputs
+dist/
+build/
+coverage/
+
+# Database local backups/dumps
+*.dump
+*.bak
+*.backup
+
+# Local repair/debug entrypoints
+hash.php
+web-client/fix_admin_password.php
+web-client/test_exams.php
+backend-php/test_login_direct.php

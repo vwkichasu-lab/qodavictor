@@ -1,0 +1,425 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ==================== USER MODELS ====================
+
+model User {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  name      String
+  email     String?  @unique
+  role      Role
+  password  String
+  avatar    String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  student   Student?
+  lecturer  Lecturer?
+  admin     Admin?
+  auditLogs AuditLog[]
+  securityEvents SecurityEvent[]
+}
+
+enum Role {
+  STUDENT
+  LECTURER
+  ADMIN
+}
+
+model Student {
+  id            String   @id @default(uuid())
+  userId        String   @unique
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Academic Info
+  studentId     String   @unique
+  level         String   // e.g., "100", "200", "300", "400"
+  academicYear  String   // e.g., "2025/2026"
+  department    String?
+  
+  // Relations
+  courses       StudentCourse[]
+  submissions   Submission[]
+  results       Result[]
+  studyGroups   StudyGroupMember[]
+  securityEvents SecurityEvent[]
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model Lecturer {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Professional Info
+  lecturerId  String   @unique
+  department  String
+  title       String?  // e.g., "Dr.", "Prof.", "Mr.", "Mrs."
+  
+  // Relations
+  courses     Course[]
+  exams       Exam[]
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Admin {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  adminId   String   @unique
+  superAdmin Boolean @default(false)
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ==================== COURSE MODELS ====================
+
+model Course {
+  id          String   @id @default(uuid())
+  name        String
+  code        String   @unique
+  description String?
+  level       String   // e.g., "100", "200", "300", "400"
+  creditHours Int      @default(3)
+  
+  // Relations
+  lecturerId  String?
+  lecturer    Lecturer? @relation(fields: [lecturerId], references: [id])
+  students    StudentCourse[]
+  exams       Exam[]
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model StudentCourse {
+  id        String   @id @default(uuid())
+  studentId String
+  student   Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  courseId  String
+  course    Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  
+  enrolledAt DateTime @default(now())
+  
+  @@unique([studentId, courseId])
+}
+
+// ==================== EXAM MODELS ====================
+
+model Exam {
+  id              String   @id @default(uuid())
+  title           String
+  description     String?
+  instructions    String   @default("")
+  
+  // Timing
+  durationMins    Int      @default(60)
+  startAt         DateTime?
+  endAt           DateTime?
+  
+  // Status
+  status          ExamStatus @default(DRAFT)
+  published       Boolean  @default(false)
+  resultsPublished Boolean @default(false)
+  
+  // Academic Context
+  academicYear    String
+  semester        String?  // e.g., "First", "Second"
+  
+  // Relations
+  courseId        String
+  course          Course   @relation(fields: [courseId], references: [id])
+  lecturerId      String
+  lecturer        Lecturer @relation(fields: [lecturerId], references: [id])
+  
+  questions       Question[]
+  markingSchemes  MarkingScheme[]
+  submissions     Submission[]
+  results         Result[]
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+enum ExamStatus {
+  DRAFT
+  PUBLISHED
+  ONGOING
+  COMPLETED
+  ARCHIVED
+}
+
+// ==================== QUESTION MODELS ====================
+
+model Question {
+  id          String       @id @default(uuid())
+  examId      String
+  exam        Exam         @relation(fields: [examId], references: [id], onDelete: Cascade)
+  
+  // Content
+  type        QuestionType
+  text        String
+  marks       Int          @default(10)
+  order       Int          @default(0)
+  
+  // Media
+  imageUrl    String?
+  
+  // Type-specific data (stored as JSON)
+  options     Json?        // For MCQ: [{text, isCorrect}, ...]
+  correctAnswer Json?      // For various types
+  starterCode Json?        // For Coding: {language, code, allowMultipleLangs}
+  testCases   Json?        // For Coding: [{input, expectedOutput}]
+  rubric      String?      // For Essay: marking guidelines
+  keywords    String?      // For Short Answer: comma-separated
+  
+  // Relations
+  answers     Answer[]
+  markingScheme MarkingScheme?
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+enum QuestionType {
+  MCQ
+  SHORT_ANSWER
+  ESSAY
+  CODING
+  FILL_BLANK
+  TRUE_FALSE
+  MATCHING
+}
+
+model MarkingScheme {
+  id          String   @id @default(uuid())
+  examId      String
+  exam        Exam     @relation(fields: [examId], references: [id], onDelete: Cascade)
+  
+  questionId  String?  @unique
+  question    Question? @relation(fields: [questionId], references: [id])
+  
+  // Auto-grading rules
+  rules       Json     // {type, correctValue, tolerance, keywords, partialCredit}
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ==================== SUBMISSION & ANSWER MODELS ====================
+
+model Submission {
+  id              String   @id @default(uuid())
+  examId          String
+  exam            Exam     @relation(fields: [examId], references: [id], onDelete: Cascade)
+  
+  studentId       String
+  student         Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  
+  // Timing
+  startedAt       DateTime @default(now())
+  submittedAt     DateTime?
+  autoSubmitted   Boolean  @default(false)
+  
+  // Status
+  status          SubmissionStatus @default(IN_PROGRESS)
+  
+  // Relations
+  answers         Answer[]
+  result          Result?
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  @@unique([examId, studentId])
+}
+
+enum SubmissionStatus {
+  IN_PROGRESS
+  SUBMITTED
+  GRADING
+  GRADED
+}
+
+model Answer {
+  id              String   @id @default(uuid())
+  submissionId    String
+  submission      Submission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  
+  questionId      String
+  question        Question   @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  
+  // Answer Content
+  answerText      String?    @db.Text
+  answerData      Json?      // For complex answers (coding files, matching pairs, etc.)
+  
+  // Grading
+  score           Float?
+  maxScore        Int
+  autoGraded      Boolean    @default(false)
+  needsManualReview Boolean @default(false)
+  feedback        String?    @db.Text
+  gradedBy        String?    // User ID of manual grader
+  gradedAt        DateTime?
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+// ==================== RESULT MODELS ====================
+
+model Result {
+  id              String   @id @default(uuid())
+  examId          String
+  exam            Exam     @relation(fields: [examId], references: [id], onDelete: Cascade)
+  
+  studentId       String
+  student         Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  
+  submissionId    String   @unique
+  submission      Submission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  
+  // Scores
+  totalScore      Float
+  maxScore        Int
+  percentage      Float
+  grade           String   // A, B, C, D, F
+  
+  // Status
+  published       Boolean  @default(false)
+  publishedAt     DateTime?
+  publishedBy     String?
+  
+  // Details
+  answerBreakdown Json?    // Per-question scores
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  @@unique([examId, studentId])
+}
+
+// ==================== STUDY GROUP MODELS ====================
+
+model StudyGroup {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  
+  // Relations
+  members     StudyGroupMember[]
+  messages    GroupMessage[]
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model StudyGroupMember {
+  id          String   @id @default(uuid())
+  groupId     String
+  group       StudyGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  
+  studentId   String
+  student     Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  
+  role        GroupRole @default(MEMBER)
+  joinedAt    DateTime @default(now())
+  
+  @@unique([groupId, studentId])
+}
+
+enum GroupRole {
+  ADMIN
+  MEMBER
+}
+
+model GroupMessage {
+  id          String   @id @default(uuid())
+  groupId     String
+  group       StudyGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  
+  senderId    String   // Student ID
+  content     String
+  
+  createdAt   DateTime @default(now())
+}
+
+// ==================== AUDIT & SECURITY MODELS ====================
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id])
+  
+  action      String   // e.g., "CREATE_EXAM", "SUBMIT_EXAM", "GRADE_ANSWER"
+  entityType  String   // e.g., "Exam", "Submission", "User"
+  entityId    String?
+  details     Json?    // Additional context
+  
+  ipAddress   String?
+  userAgent   String?
+  
+  createdAt   DateTime @default(now())
+}
+
+model SecurityEvent {
+  id            String   @id @default(uuid())
+  
+  studentId     String?
+  student       Student? @relation(fields: [studentId], references: [id])
+  
+  userId        String?
+  user          User?    @relation(fields: [userId], references: [id])
+  
+  examId        String?
+  
+  eventType     SecurityEventType
+  severity      Severity
+  description   String
+  
+  // Evidence
+  screenshotUrl String?
+  metadata      Json?    // Additional event data
+  
+  // Resolution
+  resolved      Boolean  @default(false)
+  resolvedBy    String?
+  resolvedAt    DateTime?
+  resolution    String?
+  
+  createdAt     DateTime @default(now())
+}
+
+enum SecurityEventType {
+  TAB_SWITCH
+  COPY_ATTEMPT
+  PASTE_ATTEMPT
+  RIGHT_CLICK
+  DEVTOOLS_OPEN
+  FULLSCREEN_EXIT
+  MOUSE_LEAVE
+  MULTIPLE_FACES
+  SUSPICIOUS_ACTIVITY
+  TIMEOUT_WARNING
+}
+
+enum Severity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
