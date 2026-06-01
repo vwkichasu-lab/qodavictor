@@ -19,6 +19,8 @@ $pdo = new PDO($dsn, $user, $password, [
 ]);
 
 $sql = file_get_contents($schemaPath);
+$sql = preg_replace('/^\s*CREATE\s+DATABASE\s+IF\s+NOT\s+EXISTS\s+`?[\w-]+`?\s*;\s*$/mi', '', $sql);
+$sql = preg_replace('/^\s*USE\s+`?[\w-]+`?\s*;\s*$/mi', '', $sql);
 $pdo->exec($sql);
 
 echo "Database import completed.\n";
