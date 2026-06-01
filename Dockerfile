@@ -11,7 +11,8 @@ RUN apt-get update \
         unzip \
         zip \
     && docker-php-ext-install pdo_mysql mysqli \
-    && a2enmod rewrite \
+    && a2dismod mpm_event mpm_worker \
+    && a2enmod mpm_prefork rewrite \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /var/www/html

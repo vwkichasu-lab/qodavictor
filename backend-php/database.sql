@@ -143,7 +143,7 @@ CREATE TABLE exams (
     shuffle_enabled TINYINT(1) NOT NULL DEFAULT 0,
     grading_mode VARCHAR(20) NOT NULL DEFAULT 'auto',
     published TINYINT(1) NOT NULL DEFAULT 0,
-    status ENUM('DRAFT', 'PUBLISHED', 'ONGOING', 'COMPLETED', 'ARCHIVED', 'draft', 'published', 'ongoing', 'completed', 'archived') DEFAULT 'draft',
+    status VARCHAR(50) DEFAULT 'draft',
     created_by INT NULL,
     lecturer_id INT NULL,
     lecturerId INT NULL,
@@ -235,7 +235,7 @@ CREATE TABLE exam_submissions (
     percentage DECIMAL(5,2) DEFAULT 0,
     auto_score DECIMAL(5,2) DEFAULT 0,
     manual_score DECIMAL(5,2) DEFAULT 0,
-    status ENUM('IN_PROGRESS', 'SUBMITTED', 'TIMED_OUT', 'ABANDONED', 'PENDING', 'GRADING', 'GRADED', 'MARKED', 'AUTO_GRADED', 'MANUALLY_GRADED', 'in_progress', 'submitted', 'timed_out', 'abandoned', 'pending', 'grading', 'graded') DEFAULT 'in_progress',
+    status VARCHAR(50) DEFAULT 'in_progress',
     ip_address VARCHAR(45) NULL,
     user_agent TEXT NULL,
     device_info JSON NULL,
@@ -717,7 +717,7 @@ CREATE TABLE security_events (
     userId INT NULL,
     examId INT NULL,
     eventType VARCHAR(100) NOT NULL,
-    severity ENUM('LOW', 'MEDIUM', 'HIGH', 'CRITICAL', 'low', 'medium', 'high', 'critical') DEFAULT 'LOW',
+    severity VARCHAR(20) DEFAULT 'LOW',
     description TEXT NULL,
     metadata JSON NULL,
     createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -999,11 +999,6 @@ CREATE TABLE IF NOT EXISTS screen_captures (
     INDEX idx_exam_student (exam_id, student_id),
     INDEX idx_captured_at (captured_at)
 );
-
-ALTER TABLE screen_captures
-    ADD COLUMN IF NOT EXISTS image_data LONGTEXT NULL,
-    ADD COLUMN IF NOT EXISTS capture_type VARCHAR(30) NOT NULL DEFAULT 'live',
-    ADD COLUMN IF NOT EXISTS notes TEXT NULL;
 
 CREATE TABLE IF NOT EXISTS proctor_commands (
     id INT AUTO_INCREMENT PRIMARY KEY,
