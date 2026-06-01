@@ -32,6 +32,29 @@ DB_PASS=your-database-password
 
 Import `backend-php/database.sql` into the production database.
 
+## Docker Deployment
+
+This repo includes a `Dockerfile` for PHP/Apache. The image installs PHP MySQL extensions and the local code execution tools used by QODA for Python, JavaScript, Java, C, C++, and PHP questions.
+
+Any Docker-capable host should set the database environment variables above and import `backend-php/database.sql`.
+
+Railway and Render configuration files are included:
+
+- `railway.json`
+- `render.yaml`
+
+For Railway, create a project from the GitHub repo, add a MySQL service, and set:
+
+```bash
+DB_HOST=${{MySQL.MYSQLHOST}}
+DB_PORT=${{MySQL.MYSQLPORT}}
+DB_NAME=${{MySQL.MYSQLDATABASE}}
+DB_USER=${{MySQL.MYSQLUSER}}
+DB_PASS=${{MySQL.MYSQLPASSWORD}}
+```
+
+For Render, use an external MySQL database provider and set the same variables in the service environment.
+
 ## Hosting Notes
 
 GitHub Pages, Netlify, and standard Vercel deployments are static/serverless-first platforms. They do not run this PHP/MySQL/XAMPP-style application as-is.

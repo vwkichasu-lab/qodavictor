@@ -1,0 +1,17 @@
+.git
+.gitignore
+.vscode
+.idea
+node_modules
+backend/node_modules
+runtime
+uploads
+web-client/uploads
+tools
+.env
+.env.*
+backend/.env
+backend/.env.*
+*.log
+*.tmp
+*.cache

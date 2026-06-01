@@ -17,9 +17,12 @@ function findExecutable(array $candidates): ?string
         if (is_file($candidate)) {
             return $candidate;
         }
-        $where = trim((string)@shell_exec('where ' . escapeshellarg($candidate) . ' 2>NUL'));
-        if ($where !== '') {
-            $first = strtok($where, "\r\n");
+        $lookupCommand = DIRECTORY_SEPARATOR === '\\'
+            ? 'where ' . escapeshellarg($candidate) . ' 2>NUL'
+            : 'command -v ' . escapeshellarg($candidate) . ' 2>/dev/null';
+        $path = trim((string)@shell_exec($lookupCommand));
+        if ($path !== '') {
+            $first = strtok($path, "\r\n");
             if ($first) return $first;
         }
     }
