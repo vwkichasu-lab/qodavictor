@@ -4,13 +4,14 @@
 // Remove duplicate function declarations
 
 // ========== DATABASE CONFIGURATION ==========
-$host = 'localhost';
-$dbname = 'qoda_db';
-$username = 'root';
-$password = '';
+$host = getenv('DB_HOST') ?: 'localhost';
+$port = getenv('DB_PORT') ?: '3306';
+$dbname = getenv('DB_NAME') ?: 'qoda_db';
+$username = getenv('DB_USER') ?: 'root';
+$password = getenv('DB_PASS') ?: '';
 
 try {
-    $pdo = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8mb4", $username, $password);
+    $pdo = new PDO("mysql:host=$host;port=$port;dbname=$dbname;charset=utf8mb4", $username, $password);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
     $pdo->exec("SET SESSION sql_mode = CONCAT_WS(',', @@SESSION.sql_mode, 'ANSI_QUOTES')");
