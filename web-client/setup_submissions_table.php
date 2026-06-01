@@ -24,7 +24,7 @@ try {
         auto_score DECIMAL(10,2) DEFAULT 0,
         manual_score DECIMAL(10,2) DEFAULT 0,
         percentage DECIMAL(5,2) DEFAULT 0,
-        status ENUM('IN_PROGRESS', 'SUBMITTED', 'TIMED_OUT', 'ABANDONED', 'PENDING', 'GRADING', 'GRADED', 'MARKED', 'AUTO_GRADED', 'MANUALLY_GRADED', 'in_progress', 'submitted', 'timed_out', 'abandoned', 'pending', 'grading', 'graded') DEFAULT 'in_progress',
+        status VARCHAR(50) DEFAULT 'in_progress',
         started_at DATETIME NULL,
         submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         submittedAt DATETIME NULL,

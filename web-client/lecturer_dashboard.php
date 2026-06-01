@@ -206,7 +206,7 @@ try {
     ensureLecturerColumn($pdo, 'exam_submissions', 'auto_graded_at', 'DATETIME NULL');
     $pdo->exec("
         ALTER TABLE exam_submissions
-        MODIFY status ENUM('IN_PROGRESS', 'SUBMITTED', 'TIMED_OUT', 'ABANDONED', 'PENDING', 'GRADING', 'GRADED', 'MARKED', 'AUTO_GRADED', 'MANUALLY_GRADED', 'in_progress', 'submitted', 'timed_out', 'abandoned', 'pending', 'grading', 'graded') DEFAULT 'in_progress'
+        MODIFY status VARCHAR(50) DEFAULT 'in_progress'
     ");
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS proctor_commands (
