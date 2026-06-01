@@ -11,7 +11,7 @@ function register_base_url(string $path = ''): string
 {
     $script = $_SERVER['SCRIPT_NAME'] ?? '';
     $pos = stripos($script, '/qoda/');
-    $root = $pos !== false ? substr($script, 0, $pos + 6) : '/QODA/';
+    $root = $pos !== false ? substr($script, 0, $pos + 6) : '/';
     return $root . ltrim($path, '/');
 }
 

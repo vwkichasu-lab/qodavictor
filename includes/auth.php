@@ -5,8 +5,8 @@ function e($s) { return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
 
 function base_url($path = '') {
     $script = $_SERVER['SCRIPT_NAME'];
-    $pos = strpos($script, '/qoda/');
-    $root = $pos !== false ? substr($script, 0, $pos + 6) : '/qoda/';
+    $pos = stripos($script, '/qoda/');
+    $root = $pos !== false ? substr($script, 0, $pos + 6) : '/';
     return $root . ltrim($path, '/');
 }
 
