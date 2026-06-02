@@ -4308,33 +4308,30 @@ function createCourseTable($courseCode)
     }
 
     .sticky-actions {
-        position: fixed !important;
-        bottom: 20px !important;
-        left: 50% !important;
-        transform: translateX(-50%) !important;
-        z-index: 99999 !important;
+        position: sticky !important;
+        top: 12px !important;
+        bottom: auto !important;
+        left: auto !important;
+        right: auto !important;
+        transform: none !important;
+        z-index: 60 !important;
         background: var(--panel) !important;
         padding: 12px 20px !important;
-        border-radius: 50px !important;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4) !important;
+        border-radius: 18px !important;
+        box-shadow: 0 10px 24px rgba(0, 0, 0, 0.16) !important;
         border: 1px solid var(--border) !important;
         display: flex !important;
         gap: 12px !important;
         flex-wrap: wrap !important;
         backdrop-filter: blur(10px) !important;
-        width: auto !important;
-        max-width: 90% !important;
+        width: 100% !important;
+        max-width: 100% !important;
         opacity: 1 !important;
         visibility: visible !important;
         pointer-events: auto !important;
-        margin: 0 !important;
-        /* This ensures it stays fixed to viewport, not page */
-        will-change: transform !important;
-    }
-
-    /* Remove any bottom padding that might push it */
-    .main {
-        padding-bottom: 0 !important;
+        margin: 0 0 20px !important;
+        justify-content: flex-end !important;
+        will-change: auto !important;
     }
 
     /* Ensure parent containers don't affect positioning */
@@ -4425,9 +4422,10 @@ function createCourseTable($courseCode)
     /* Responsive */
     @media (max-width: 768px) {
         .sticky-actions {
-            bottom: 15px !important;
+            top: 8px !important;
             padding: 10px 15px !important;
             gap: 8px !important;
+            justify-content: stretch !important;
         }
 
         .sticky-actions .btn {
@@ -4438,14 +4436,14 @@ function createCourseTable($courseCode)
 
     @media (max-width: 480px) {
         .sticky-actions {
-            bottom: 10px !important;
+            top: 6px !important;
             padding: 8px 12px !important;
             gap: 6px !important;
-            left: 10px !important;
-            right: 10px !important;
+            left: auto !important;
+            right: auto !important;
             transform: none !important;
             max-width: none !important;
-            justify-content: center !important;
+            justify-content: stretch !important;
         }
 
         .sticky-actions .btn {
@@ -4622,25 +4620,29 @@ function createCourseTable($courseCode)
     /* ============================================ */
 
     .sticky-actions {
-        position: fixed !important;
-        bottom: 20px !important;
-        left: 50% !important;
-        transform: translateX(-50%) !important;
-        z-index: 99999 !important;
+        position: sticky !important;
+        top: 12px !important;
+        bottom: auto !important;
+        left: auto !important;
+        right: auto !important;
+        transform: none !important;
+        z-index: 60 !important;
         background: var(--panel) !important;
         padding: 12px 20px !important;
-        border-radius: 50px !important;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4) !important;
+        border-radius: 18px !important;
+        box-shadow: 0 10px 24px rgba(0, 0, 0, 0.16) !important;
         border: 1px solid var(--border) !important;
         display: flex !important;
         gap: 12px !important;
         flex-wrap: wrap !important;
         backdrop-filter: blur(10px) !important;
-        width: auto !important;
-        max-width: 90% !important;
+        width: 100% !important;
+        max-width: 100% !important;
         opacity: 1 !important;
         visibility: visible !important;
         pointer-events: auto !important;
+        margin: 0 0 20px !important;
+        justify-content: flex-end !important;
     }
 
     .sticky-actions .btn {
@@ -4701,9 +4703,10 @@ function createCourseTable($courseCode)
 
     @media (max-width: 768px) {
         .sticky-actions {
-            bottom: 15px !important;
+            top: 8px !important;
             padding: 10px 15px !important;
             gap: 8px !important;
+            justify-content: stretch !important;
         }
 
         .sticky-actions .btn {
@@ -4725,14 +4728,14 @@ function createCourseTable($courseCode)
 
     @media (max-width: 480px) {
         .sticky-actions {
-            bottom: 10px !important;
+            top: 6px !important;
             padding: 8px 12px !important;
             gap: 6px !important;
-            left: 10px !important;
-            right: 10px !important;
+            left: auto !important;
+            right: auto !important;
             transform: none !important;
             max-width: none !important;
-            justify-content: center !important;
+            justify-content: stretch !important;
         }
 
         .sticky-actions .btn {
