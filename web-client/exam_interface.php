@@ -437,7 +437,6 @@ if ($examId) {
                         if (!isset($q['marks'])) $q['marks'] = 5;
                         if (!isset($q['compulsory'])) $q['compulsory'] = false;
                         if (!isset($q['language'])) $q['language'] = 'python';
-                        if (!isset($q['starterCode'])) $q['starterCode'] = '';
                         if (!isset($q['hasSubQuestions'])) $q['hasSubQuestions'] = false;
                         if (!isset($q['subQuestions'])) $q['subQuestions'] = [];
                         if (!isset($q['testCases'])) $q['testCases'] = [];
@@ -811,17 +810,28 @@ endif;
     }
 
     .timer {
-        padding: 6px 16px;
+        padding: 10px 18px;
         background: #252526;
-        border-radius: 6px;
-        font-weight: 600;
-        font-size: 14px;
+        border-radius: 8px;
+        font-weight: 800;
+        font-size: 24px;
         font-family: monospace;
         color: #4ec9b0;
+        min-width: 155px;
+        text-align: center;
+        box-shadow: 0 0 0 1px rgba(78, 201, 176, 0.18);
     }
 
     .timer.warning {
-        color: #f48771;
+        color: #ffffff;
+        background: #dc2626;
+        box-shadow: 0 0 0 8px rgba(220, 38, 38, 0.16);
+        animation: timerWarningPulse 0.8s infinite alternate;
+    }
+
+    @keyframes timerWarningPulse {
+        from { transform: scale(1); filter: brightness(1); }
+        to { transform: scale(1.04); filter: brightness(1.25); }
     }
 
     /* Question Navigation Bar */
@@ -911,16 +921,29 @@ endif;
         border-color: #007acc;
     }
 
+    .q-nav-btn.unanswered {
+        background: #34343a;
+        border-color: #5f6368;
+        color: #d1d5db;
+    }
+
     .q-nav-btn.active {
         background: #007acc;
         border-color: #007acc;
         color: white;
+        box-shadow: 0 0 0 3px rgba(0, 122, 204, 0.28);
     }
 
     .q-nav-btn.answered {
         background: #4ec9b0;
         border-color: #4ec9b0;
         color: #1e1e1e;
+    }
+
+    .q-nav-btn.answered.active {
+        background: #0ea5e9;
+        border-color: #7dd3fc;
+        color: #ffffff;
     }
 
     .q-nav-btn.flagged {
@@ -1676,6 +1699,45 @@ endif;
         resize: vertical;
     }
 
+    .stdin-panel {
+        flex-shrink: 0;
+        border-top: 1px solid #3e3e42;
+        background: #18181b;
+        padding: 10px 12px;
+        color: #d4d4d4;
+    }
+
+    .stdin-panel label {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 6px;
+        font-size: 12px;
+        font-weight: 700;
+    }
+
+    .stdin-panel textarea {
+        width: 100%;
+        min-height: 78px;
+        max-height: 160px;
+        resize: vertical;
+        border: 1px solid #3e3e42;
+        border-radius: 8px;
+        background: #0f0f12;
+        color: #f8fafc;
+        padding: 10px;
+        font-family: Consolas, monospace;
+        font-size: 13px;
+        line-height: 1.45;
+    }
+
+    .stdin-panel small {
+        display: block;
+        margin-top: 5px;
+        color: #9ca3af;
+        font-size: 11px;
+    }
+
     .console-input-row {
         display: grid;
         grid-template-columns: minmax(120px, 1fr) minmax(150px, 1.2fr);
@@ -2092,7 +2154,7 @@ endif;
     let outputInteractionUntil = 0;
 
     function markOutputInteraction() {
-        outputInteractionUntil = Date.now() + 20000;
+        outputInteractionUntil = Date.now() + 60000;
     }
 
     function isOutputInteractionActive() {
@@ -2327,9 +2389,9 @@ endif;
 
         if (timeLeft <= 1800 && timerDisplay && !isPreview) {
             timerDisplay.classList.add('warning');
-            timerDisplay.style.color = '#fff';
-            timerDisplay.style.backgroundColor = '#dc2626';
-            if (timeLeft === 1800) {
+            const warningKey = `exam_30_minute_warning_${examId}`;
+            if (!localStorage.getItem(warningKey)) {
+                localStorage.setItem(warningKey, 'shown');
                 showMessageBox('30 minutes remaining. Please hurry up and submit before time runs out.');
             }
         }
@@ -2850,7 +2912,6 @@ endif;
                 marks: q.marks || 5,
                 compulsory: q.compulsory || false,
                 language: q.language || 'python',
-                starterCode: q.starterCode || '',
                 subQuestions: q.subQuestions || null,
                 hasSubQuestions: q.hasSubQuestions || false,
                 testCases: q.testCases || [],
@@ -3199,10 +3260,10 @@ endif;
         if (!container) return;
 
         container.innerHTML = mainQuestions.map((q, idx) => {
-            let additionalClass = '';
-            if (idx === currentQuestionIndex) additionalClass = 'active';
             const answer = answers[q.id];
-            if (answer && answer.value && ((answer.value.code || '').trim() !== '' || (answer.value.files || []).some(f => (f.content || '').trim() !== ''))) additionalClass += ' answered';
+            const isAnswered = answer && answer.value && ((answer.value.code || '').trim() !== '' || (answer.value.files || []).some(f => (f.content || '').trim() !== ''));
+            let additionalClass = isAnswered ? 'answered' : 'unanswered';
+            if (idx === currentQuestionIndex) additionalClass += ' active';
             if (flaggedQuestions.has(q.id)) additionalClass += ' flagged';
             return `<button class="q-nav-btn ${additionalClass}" onclick="jumpToQuestion(${idx})">${idx + 1}</button>`;
         }).join('');
@@ -3406,12 +3467,16 @@ endif;
                     </div>
                     <span id="testResultStatus" style="font-size: 11px;"></span>
                 </div>
-                <textarea id="programInput" style="display:none;"></textarea>
                 <div id="consoleOutput" class="output-area">Click 'Execute' to run your code...</div>
                 <iframe id="webPreview" class="web-preview-frame" title="Live Preview" sandbox="allow-same-origin allow-scripts allow-popups allow-forms"></iframe>
                 <div id="uiOutput" class="ui-output-area" style="display:none;">
                     <i class="fas fa-window-maximize" style="font-size:34px;color:#888;"></i>
                     <span>Desktop GUI windows cannot open inside the cloud exam server. Use Browser for web UI output; Java Swing and Windows Forms are checked as source/compile tasks.</span>
+                </div>
+                <div class="stdin-panel">
+                    <label for="programInput"><i class="fas fa-keyboard"></i> Program input / stdin</label>
+                    <textarea id="programInput" placeholder="Type keyboard input here. Put each Scanner/input/scanf value on its own line when the program asks step by step. Example:\nAlice\n80\n70\n90"></textarea>
+                    <small>Execute feeds this text to the program exactly like keyboard input in a normal IDE terminal.</small>
                 </div>
             </div>
         </div>
@@ -4700,111 +4765,6 @@ endif;
         return `Stored input values:\n${values.map((value, index) => `Input ${index + 1}: ${value}`).join('\n')}\n\n`;
     }
 
-    function requestProgramInputIfNeeded(code, language) {
-        const inputField = document.getElementById('programInput');
-        const existingInput = inputField?.value || '';
-        const inputPlan = buildInputPlan(code, language);
-        if (!inputPlan.needsInput && !codeLikelyNeedsInput(code, language)) {
-            return Promise.resolve(existingInput);
-        }
-
-        return new Promise((resolve) => {
-            switchOutputTab('console');
-            const consoleOutput = document.getElementById('consoleOutput');
-            if (!consoleOutput) {
-                resolve('');
-                return;
-            }
-
-            const previousValues = existingInput.trim() ? existingInput.trim().split(/\s+/) : [];
-            const close = (value) => {
-                if (inputField) inputField.value = value;
-                resolve(value);
-            };
-
-            if (!inputPlan.combined) {
-                const prompts = inputPlan.groups.flatMap((group) => {
-                    return Array.from({ length: group.count }, (_, valueIndex) => {
-                        return group.count === 1 ? group.prompt : `${group.prompt} ${valueIndex + 1}`;
-                    });
-                });
-                const values = [];
-
-                const renderPrompt = (index) => {
-                    const prompt = prompts[index] || `Input ${index + 1}`;
-                    consoleOutput.innerHTML = `
-                        <div class="console-input-card">
-                            <strong>${escapeHtml(prompt)}</strong>
-                            <span>Type the value and press Enter to continue.</span>
-                            <input id="programStepInput" type="text" autocomplete="off" value="${escapeHtml(previousValues[index] || '')}">
-                            <div style="font-family:Consolas,monospace;font-size:12px;white-space:pre-wrap;color:#9ca3af;">${escapeHtml(formatInputSummary(values.join('\n')))}</div>
-                            <div style="display:flex; gap:10px; justify-content:flex-end;">
-                                <button class="output-tab" id="runWithoutInputBtn" type="button">Run Without Input</button>
-                                <button class="output-tab active" id="continueInputBtn" type="button">${index === prompts.length - 1 ? 'Run Code' : 'Next Input'}</button>
-                            </div>
-                        </div>
-                    `;
-
-                    const input = consoleOutput.querySelector('#programStepInput');
-                    const advance = () => {
-                        values[index] = input.value || '';
-                        if (index < prompts.length - 1) {
-                            renderPrompt(index + 1);
-                        } else {
-                            close(values.join('\n') + '\n');
-                        }
-                    };
-
-                    input.focus();
-                    input.select();
-                    input.addEventListener('keydown', (event) => {
-                        if (event.key === 'Enter') {
-                            event.preventDefault();
-                            advance();
-                        }
-                    });
-                    consoleOutput.querySelector('#continueInputBtn').onclick = advance;
-                    consoleOutput.querySelector('#runWithoutInputBtn').onclick = () => close('');
-                };
-
-                renderPrompt(0);
-                return;
-            }
-
-            const inputMarkup = `
-                <input id="programInputConsoleValue" type="text" placeholder="Example: 5 8" value="${escapeHtml(existingInput)}" autocomplete="off">
-            `;
-
-            consoleOutput.innerHTML = `
-                <div class="console-input-card">
-                    <strong>Program Input</strong>
-                    <span>This code reads multiple values at once. Enter them in the same field, then press Enter or Run Code.</span>
-                    ${inputMarkup}
-                    <div style="display:flex; gap:10px; justify-content:flex-end;">
-                        <button class="output-tab" id="runWithoutInputBtn" type="button">Run Without Input</button>
-                        <button class="output-tab active" id="runWithInputBtn" type="button">Run Code</button>
-                    </div>
-                </div>
-            `;
-
-            consoleOutput.querySelector('#runWithInputBtn').onclick = () => {
-                const combinedInput = consoleOutput.querySelector('#programInputConsoleValue');
-                if (combinedInput) {
-                    close(combinedInput.value || '');
-                    return;
-                }
-            };
-            consoleOutput.querySelector('#programInputConsoleValue')?.addEventListener('keydown', (event) => {
-                if (event.key === 'Enter') {
-                    event.preventDefault();
-                    close(event.target.value || '');
-                }
-            });
-            consoleOutput.querySelector('#runWithoutInputBtn').onclick = () => close('');
-        });
-    }
-
-
     async function runCode() {
         if (!monacoEditor) {
             showToast('Create a file before running code', 'warning');
@@ -4835,7 +4795,15 @@ endif;
             return;
         }
 
-        programInput = await requestProgramInputIfNeeded(code, language);
+        if (!programInput.trim() && codeLikelyNeedsInput(code, language)) {
+            switchOutputTab('console');
+            if (consoleOutput) {
+                consoleOutput.textContent =
+                    'This program reads keyboard input.\n\nType the required values in "Program input / stdin" below, then click Execute again.\n\nUse new lines for step-by-step prompts, for example:\nAlice\n80\n70\n90';
+            }
+            showToast('Enter stdin values, then Execute again', 'warning');
+            return;
+        }
 
         console.log("Running code in:", language);
         console.log("Code length:", code.length);

@@ -14,6 +14,44 @@ function roundToInt($value)
     return (int)round(floatval($value));
 }
 
+function qodaQuestionMarks(array $question): float
+{
+    if (!empty($question['hasSubQuestions']) && !empty($question['subQuestions']) && is_array($question['subQuestions'])) {
+        $sum = 0.0;
+        foreach ($question['subQuestions'] as $subQuestion) {
+            $sum += floatval($subQuestion['marks'] ?? 0);
+        }
+        return $sum;
+    }
+
+    return floatval($question['marks'] ?? 0);
+}
+
+function qodaEffectiveExamMarks(array $questions, int $questionsToAnswer = 0): float
+{
+    if (!$questions) {
+        return 0.0;
+    }
+
+    $limit = $questionsToAnswer > 0 ? min($questionsToAnswer, count($questions)) : count($questions);
+    $compulsoryMarks = 0.0;
+    $optionalMarks = [];
+
+    foreach ($questions as $question) {
+        $marks = qodaQuestionMarks(is_array($question) ? $question : []);
+        if (!empty($question['compulsory'])) {
+            $compulsoryMarks += $marks;
+        } else {
+            $optionalMarks[] = $marks;
+        }
+    }
+
+    rsort($optionalMarks, SORT_NUMERIC);
+    $compulsoryCount = count(array_filter($questions, fn($q) => is_array($q) && !empty($q['compulsory'])));
+    $optionalSlots = max(0, $limit - $compulsoryCount);
+    return $compulsoryMarks + array_sum(array_slice($optionalMarks, 0, $optionalSlots));
+}
+
 function normalizeDateTimeInput($value): ?string
 {
     $value = trim((string)$value);
@@ -308,7 +346,7 @@ try {
                     $testAnswers[$idx] = [
                         'question_id' => $q['id'] ?? $idx,
                         'answer' => "Sample answer for question " . ($idx + 1) . ": " . substr($q['text'] ?? 'No question text', 0, 100),
-                        'code' => $q['starterCode'] ?? "// Student's code would be here\nfunction solution() {\n    return 'Hello World';\n}"
+                        'code' => ''
                     ];
                 }
             } else {
@@ -1442,7 +1480,6 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                                     'text' => $question['text'] ?? 'No question text',
                                     'marks' => $question['marks'] ?? 0,
                                     'language' => $question['language'] ?? 'text',
-                                    'starterCode' => $question['starterCode'] ?? '',
                                     'expectedOutput' => $question['expectedOutput'] ?? '',
                                     'answer' => $answers[$index]['code'] ?? $answers[$index]['answer'] ?? 'No answer provided',
                                     'savedScore' => $submission['question_scores'][$index] ?? 0
@@ -1551,13 +1588,10 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             // Get question details if available
                             $questionText = '';
                             $expectedLanguage = 'txt';
-                            $starterCode = '';
-
                             if (is_array($questions) && isset($questions[$index])) {
                                 $q = $questions[$index];
                                 $questionText = isset($q['text']) ? (string)$q['text'] : 'No question text provided';
                                 $expectedLanguage = isset($q['language']) ? (string)$q['language'] : 'txt';
-                                $starterCode = isset($q['starterCode']) ? (string)$q['starterCode'] : '';
                             }
 
                             // Save question text
@@ -1617,11 +1651,6 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             // Also save as .txt for easy viewing
                             file_put_contents($questionFolder . DIRECTORY_SEPARATOR . 'answer.txt', $codeContent);
 
-                            // If there's starter code, save it too
-                            if (!empty($starterCode)) {
-                                $starterFile = $questionFolder . DIRECTORY_SEPARATOR . 'starter_code.' . $extension;
-                                file_put_contents($starterFile, (string)$starterCode);
-                            }
                         }
                     }
 
@@ -2495,14 +2524,8 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         $duration = max(1, (int)round((strtotime($endDatetime) - strtotime($startDatetime)) / 60));
                     }
 
-                    // Calculate total marks from questions
                     $questions = json_decode($questionsJson, true);
-                    $totalMarks = 0;
-                    if (is_array($questions)) {
-                        foreach ($questions as $q) {
-                            $totalMarks += floatval($q['marks'] ?? 0);
-                        }
-                    }
+                    $totalMarks = is_array($questions) ? qodaEffectiveExamMarks($questions, $questionsToAnswer) : 0;
 
                     $existingPasswordHash = null;
                     if ($examId > 0) {
@@ -3176,7 +3199,7 @@ case 'save_question_score':
                                     $testAnswers[$idx] = [
                                         'question_id' => $q['id'] ?? $idx,
                                         'answer' => "Sample answer for question " . ($idx + 1) . ": " . substr($q['text'] ?? 'No question text', 0, 100),
-                                        'code' => $q['starterCode'] ?? "// Student's code would be here\nfunction solution() {\n    return 'Hello World';\n}"
+                                        'code' => ''
                                     ];
                                 }
                             } else {
@@ -7975,8 +7998,10 @@ function createCourseTable($courseCode)
                             <div class="field">
                                 <label>📝 Questions to answer</label>
                                 <input id="bQuestionsToAnswer" type="number" min="0" value="0"
-                                    onchange="updateExamField('questionsToAnswer', parseInt(this.value))">
+                                    onchange="updateExamField('questionsToAnswer', parseInt(this.value) || 0)"
+                                    oninput="updateExamField('questionsToAnswer', parseInt(this.value) || 0)">
                                 <div class="hint">0 = all questions, or specify number like 5</div>
+                                <div class="hint" id="questionAnswerRuleHint">Answer all questions. Total marks will update after questions are added.</div>
                             </div>
                         </div>
 
@@ -9257,90 +9282,6 @@ function createCourseTable($courseCode)
         "C#", "VB.NET", "SQL", "HTML", "CSS"
     ];
 
-    const starterCodeTemplates = {
-        "C": `#include <stdio.h>
-
-int main() {
-    // Write your code here
-    printf("Hello World\\n");
-    return 0;
-}`,
-        "C++": `#include <iostream>
-using namespace std;
-
-int main() {
-    // Write your code here
-    cout << "Hello World" << endl;
-    return 0;
-}`,
-        "C#": `using System;
-
-class Program {
-    static void Main() {
-        // Write your code here
-        Console.WriteLine("Hello World");
-    }
-}`,
-        "Java": `public class Main {
-    public static void main(String[] args) {
-        // Write your code here
-        System.out.println("Hello World");
-    }
-}`,
-        "Advanced Java": `import java.util.*;
-
-public class Main {
-    public static void main(String[] args) {
-        // Write your code here
-        System.out.println("Hello World");
-    }
-}`,
-        "HTML": `<!DOCTYPE html>
-<html>
-<head>
-    <title>My Page</title>
-</head>
-<body>
-    <h1>Hello World</h1>
-</body>
-</html>`,
-        "CSS": `/* Your CSS styles here */
-body {
-    font-family: Arial, sans-serif;
-    margin: 0;
-    padding: 20px;
-}`,
-        "JavaScript": `// Your JavaScript code here
-console.log("Hello World");
-
-function main() {
-    // Write your solution here
-}
-
-main();`,
-        "PHP": `<?php
-                    // Your PHP code here
-                    echo "Hello World";
-                    ?>`,
-        "VB.NET": `Module Module1
-    Sub Main()
-        ' Your code here
-        Console.WriteLine("Hello World")
-    End Sub
-End Module`,
-        "Python": `# Your Python code here
-def main():
-    print("Hello World")
-
-if __name__ == "__main__":
-    main()`,
-        "Linux Bash": `#!/bin/bash
-# Your bash script here
-echo "Hello World"`,
-        "SQL": `-- Your SQL query here
-SELECT * FROM table_name;`
-    };
-
     let routeState = {
         route: "dashboard",
         params: {}
@@ -9792,7 +9733,7 @@ SELECT * FROM table_name;`
                 }
             }
 
-            const totalMarks = (exam.questions || []).reduce((sum, q) => sum + (parseFloat(q.marks) || 0), 0);
+            const totalMarks = calculateEffectiveExamMarks(exam);
 
             return `
             <tr>
@@ -10557,6 +10498,55 @@ SELECT * FROM table_name;`
         }
     }
 
+    function getQuestionMarks(question) {
+        if (!question) return 0;
+        if (question.hasSubQuestions && Array.isArray(question.subQuestions) && question.subQuestions.length) {
+            return question.subQuestions.reduce((sum, subQuestion) => sum + (parseFloat(subQuestion.marks) || 0), 0);
+        }
+        return parseFloat(question.marks) || 0;
+    }
+
+    function getQuestionAnswerLimit(examOrQuestions, explicitLimit) {
+        const questions = Array.isArray(examOrQuestions) ? examOrQuestions : (examOrQuestions?.questions || []);
+        const rawLimit = explicitLimit !== undefined ? explicitLimit : (examOrQuestions?.questionsToAnswer ?? examOrQuestions?.questions_to_answer ?? 0);
+        const parsedLimit = parseInt(rawLimit, 10) || 0;
+        return parsedLimit > 0 ? Math.min(parsedLimit, questions.length) : questions.length;
+    }
+
+    function calculateEffectiveExamMarks(examOrQuestions, explicitLimit) {
+        const questions = Array.isArray(examOrQuestions) ? examOrQuestions : (examOrQuestions?.questions || []);
+        const limit = getQuestionAnswerLimit(examOrQuestions, explicitLimit);
+        const compulsory = questions.filter(q => !!q.compulsory);
+        const optionalSlots = Math.max(0, limit - compulsory.length);
+        const optionalMarks = questions
+            .filter(q => !q.compulsory)
+            .map(getQuestionMarks)
+            .sort((a, b) => b - a)
+            .slice(0, optionalSlots);
+        return compulsory.reduce((sum, q) => sum + getQuestionMarks(q), 0) +
+            optionalMarks.reduce((sum, marks) => sum + marks, 0);
+    }
+
+    function describeQuestionAnswerRule(examOrQuestions, explicitLimit) {
+        const questions = Array.isArray(examOrQuestions) ? examOrQuestions : (examOrQuestions?.questions || []);
+        const limit = getQuestionAnswerLimit(examOrQuestions, explicitLimit);
+        if (!questions.length || limit >= questions.length) return 'Answer all questions';
+        const compulsoryCount = questions.filter(q => !!q.compulsory).length;
+        return compulsoryCount > 0 ?
+            `Answer ${limit} questions including ${compulsoryCount} compulsory question(s)` :
+            `Answer any ${limit} question(s)`;
+    }
+
+    function refreshQuestionAnswerRuleHint() {
+        const hint = document.getElementById('questionAnswerRuleHint');
+        if (!hint || !currentExamId) return;
+        const exam = findExam(currentExamId);
+        if (!exam) return;
+        const qta = parseInt(document.getElementById('bQuestionsToAnswer')?.value) || 0;
+        exam.questionsToAnswer = qta;
+        hint.textContent = `${describeQuestionAnswerRule(exam, qta)}. Total obtainable marks: ${calculateEffectiveExamMarks(exam, qta)}.`;
+    }
+
     async function togglePublish(examId) {
         const selectedExam = getExams().find(e => parseInt(e.id) === parseInt(examId));
         const isPublished = !!selectedExam?.published;
@@ -10618,11 +10608,7 @@ SELECT * FROM table_name;`
         const exam = exams.find(e => parseInt(e.id) === parseInt(currentExamId));
         const questions = exam?.questions || [];
 
-        // Calculate total marks
-        let totalMarks = 0;
-        questions.forEach(q => {
-            totalMarks += parseFloat(q.marks) || 0;
-        });
+        const totalMarks = calculateEffectiveExamMarks(questions, questionsToAnswer);
 
         // ========== VALIDATION ==========
         const errors = [];
@@ -10642,7 +10628,7 @@ SELECT * FROM table_name;`
         }
 
         const approved = await confirmPopup(
-            `Publish "${title}" for ${courseCode}?\nStudents who are enrolled and visible will see it according to the start and end time.`,
+            `Publish "${title}" for ${courseCode}?\n${describeQuestionAnswerRule(questions, questionsToAnswer)}. Total obtainable marks: ${totalMarks}.\nStudents who are enrolled and visible will see it according to the start and end time.`,
             'Publish exam',
             'Publish Exam'
         );
@@ -11077,7 +11063,7 @@ SELECT * FROM table_name;`
             return;
         }
 
-        const totalMarks = (exam.questions || []).reduce((sum, q) => sum + (parseFloat(q.marks) || 0), 0);
+        const totalMarks = calculateEffectiveExamMarks(exam);
         const questionCount = (exam.questions || []).length;
         const durationText = exam.durationMins ? `${Math.floor(exam.durationMins / 60)}h ${exam.durationMins % 60}m` :
             'N/A';
@@ -11096,14 +11082,11 @@ SELECT * FROM table_name;`
 
                 let answerArea = '';
                 if (q.type === 'code') {
-                    const starterCode = q.starterCode || `// Write your ${q.language || 'code'} here`;
                     answerArea = `
                         <div style="margin-top:12px;">
                             <div style="font-size:12px; font-weight:600; color:var(--muted); margin-bottom:6px;">
-                                <i class="fas fa-terminal"></i> Starter Code (${escapeHTML(q.language || 'Code')}):
+                                <i class="fas fa-terminal"></i> Student Code (${escapeHTML(q.language || 'Code')}):
                             </div>
-                            <pre style="background:#1e1e1e; color:#d4d4d4; padding:14px; border-radius:10px; font-family:monospace; font-size:12px; white-space:pre-wrap; overflow-x:auto;">${escapeHTML(starterCode)}</pre>
-                            <div style="font-size:12px; font-weight:600; color:var(--muted); margin:10px 0 6px;">Your Code:</div>
                             <textarea rows="6" disabled placeholder="Student types code here..."
                                 style="width:100%; padding:12px; border-radius:10px; border:2px solid var(--border); background:var(--input-bg); color:var(--text); font-family:monospace; font-size:13px; resize:vertical;"></textarea>
                         </div>`;
@@ -11382,24 +11365,11 @@ SELECT * FROM table_name;`
             marks: 5,
             compulsory: false,
             language: "Python",
-            starterCode: starterCodeTemplates["Python"],
             testCases: [],
             expectedOutput: "",
             gradingMode: "auto"
         };
     }
-
-    function getLineNumbers(code) {
-        const count = Math.max(1, String(code || '').split('\n').length);
-        return Array.from({ length: count }, (_, i) => i + 1).join('\n');
-    }
-
-    function updateStarterCodeLines(questionId, code) {
-        const lineBox = document.getElementById(`starterCodeLines_${questionId}`);
-        if (lineBox) lineBox.textContent = getLineNumbers(code);
-    }
-
-    const starterCodeEditors = {};
 
     function monacoLanguageFromQuestion(language) {
         const lang = String(language || '').toLowerCase();
@@ -11412,37 +11382,6 @@ SELECT * FROM table_name;`
         if (lang.includes('html')) return 'html';
         if (lang.includes('css')) return 'css';
         return 'plaintext';
-    }
-
-    function initializeStarterCodeEditors(questions) {
-        if (typeof require === 'undefined') return;
-        require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs' } });
-        require(['vs/editor/editor.main'], function() {
-            questions.forEach(q => {
-                const container = document.getElementById(`monacoStarter_${q.id}`);
-                const textarea = document.getElementById(`starterCode_${q.id}`);
-                if (!container || !textarea || starterCodeEditors[q.id]) return;
-                textarea.style.display = 'none';
-                const grid = textarea.closest('.code-editor-grid');
-                if (grid) grid.style.display = 'none';
-                container.style.display = 'block';
-                starterCodeEditors[q.id] = monaco.editor.create(container, {
-                    value: textarea.value || '',
-                    language: monacoLanguageFromQuestion(q.language),
-                    theme: 'vs-dark',
-                    minimap: { enabled: false },
-                    lineNumbers: 'on',
-                    fontSize: 13,
-                    automaticLayout: true,
-                    scrollBeyondLastLine: false
-                });
-                starterCodeEditors[q.id].onDidChangeModelContent(() => {
-                    const value = starterCodeEditors[q.id].getValue();
-                    textarea.value = value;
-                    updateQuestion(q.id, 'starterCode', value);
-                });
-            });
-        });
     }
 
     function addQuestionToExam(exams, idx) {
@@ -11521,7 +11460,7 @@ SELECT * FROM table_name;`
                 renderCodingQuestionCard(q, idx, exam.questions.length)
             ).join('');
             console.log(`Rendered ${exam.questions.length} coding questions`);
-            setTimeout(() => initializeStarterCodeEditors(exam.questions), 50);
+            refreshQuestionAnswerRuleHint();
         }
     }
 
@@ -11530,11 +11469,6 @@ SELECT * FROM table_name;`
         q.subQuestions = [];
         // Calculate total marks
         let totalMarks = parseFloat(q.marks) || 0;
-
-        let currentStarterCode = q.starterCode;
-        if (!currentStarterCode || currentStarterCode === '') {
-            currentStarterCode = starterCodeTemplates[q.language] || starterCodeTemplates["Python"];
-        }
 
         let html = `
         <div class="coding-question-card" style="background: var(--panel); border-radius: 16px; padding: 24px; margin-bottom: 20px; border: 2px solid var(--border);">
@@ -11663,28 +11597,6 @@ SELECT * FROM table_name;`
         }
 
         html += `
-            <div class="field" style="margin-bottom: 20px;">
-                <label style="display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
-                    <i class="fas fa-terminal"></i> Starter Code (Optional)
-                </label>
-                <div class="code-editor-shell">
-                    <div class="code-editor-titlebar">
-                        <span><i class="fas fa-code"></i> ${escapeHTML(q.language || 'Code')}</span>
-                        <span>Starter code</span>
-                    </div>
-                    <div class="code-editor-grid">
-                        <pre class="code-line-numbers" id="starterCodeLines_${q.id}">${getLineNumbers(currentStarterCode)}</pre>
-                        <textarea onchange="updateQuestion('${q.id}', 'starterCode', this.value)" oninput="updateStarterCodeLines('${q.id}', this.value)" rows="10"
-                            class="starter-code-input code-editor"
-                            id="starterCode_${q.id}">${escapeHTML(currentStarterCode)}</textarea>
-                    </div>
-                    <div id="monacoStarter_${q.id}" style="height:280px; display:none;"></div>
-                </div>
-                <small style="display: block; margin-top: 8px; color: var(--muted);">
-                    <i class="fas fa-info-circle"></i> This code will be shown to students as a starting point
-                </small>
-            </div>
-            
             <div class="field" style="margin-bottom: 20px;">
                 <label style="display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
                     <i class="fas fa-file-alt"></i> Expected Output / Model Solution
@@ -12006,20 +11918,12 @@ SELECT * FROM table_name;`
 
         q.language = language;
 
-        if (starterCodeTemplates[language]) {
-            q.starterCode = starterCodeTemplates[language];
-            console.log("Starter code updated to:", language, "template");
-        } else {
-            q.starterCode = `// ${language} code here\n// Write your solution\n`;
-            console.log("Using fallback template for:", language);
-        }
-
         setExams(exams);
         saveExamToDatabase().then(() => {
-            console.log("Exam saved with new language and starter code");
+            console.log("Exam saved with new language");
         });
         renderQuestions();
-        toast(`✅ Language changed to ${language} - Starter code updated`);
+        toast(`Language changed to ${language}`);
     }
 
     function previewCodeQuestion(questionId) {
@@ -12098,32 +12002,12 @@ SELECT * FROM table_name;`
                 </div>`;
         }
 
-        if (q.starterCode && q.starterCode.trim() !== '') {
-            previewHtml += `
-                <div style="margin-bottom: 25px;">
-                    <h4 style="margin-bottom: 10px; color: var(--text);">
-                        <i class="fas fa-terminal"></i> Starter Code:
-                    </h4>
-                    <div style="background: #1e1e1e; border-radius: 12px; overflow: hidden;">
-                        <div style="background: #2d2d2d; padding: 8px 15px; border-bottom: 1px solid #3d3d3d;">
-                            <span style="color: #858585; font-size: 12px;">${q.language || 'Code'}</span>
-                        </div>
-                        <pre style="margin: 0; padding: 20px; color: #d4d4d4; font-family: 'Courier New', monospace; font-size: 13px; line-height: 1.5; overflow-x: auto;">${escapeHTML(q.starterCode)}</pre>
-                    </div>
-                    <div style="margin-top: 15px;">
-                        <label style="font-size: 13px; font-weight: 600;">Your Code:</label>
-                        <textarea rows="8" placeholder="Write your code here..." 
-                            style="width: 100%; margin-top: 5px; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--input-bg); color: var(--text); font-family: monospace;"></textarea>
-                    </div>
-                </div>`;
-        } else {
-            previewHtml += `
-                <div style="margin-bottom: 25px;">
-                    <label style="font-size: 14px; font-weight: 600;">Your Answer / Code:</label>
-                    <textarea rows="8" placeholder="Write your code here..." 
-                        style="width: 100%; margin-top: 8px; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--input-bg); color: var(--text); font-family: monospace;"></textarea>
-                </div>`;
-        }
+        previewHtml += `
+            <div style="margin-bottom: 25px;">
+                <label style="font-size: 14px; font-weight: 600;">Your Answer / Code:</label>
+                <textarea rows="8" placeholder="Write your code here..." 
+                    style="width: 100%; margin-top: 8px; padding: 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--input-bg); color: var(--text); font-family: monospace;"></textarea>
+            </div>`;
 
         if (q.testCases && q.testCases.length > 0 && q.gradingMode !== 'manual') {
             previewHtml += `
@@ -12193,48 +12077,13 @@ SELECT * FROM table_name;`
         if (!q) return;
 
         q[field] = value;
-        if (field === 'language' && ['HTML', 'CSS', 'JavaScript', 'PHP'].includes(value) && (!q.files || q.files.length === 0)) {
-            q.files = buildDefaultProjectFiles();
-        }
         setExams(exams);
+        if (field === 'marks' || field === 'compulsory') {
+            refreshQuestionAnswerRuleHint();
+        }
         saveExamToDatabase().then(() => {
             console.log(`Question ${qId} updated: ${field} = ${value}`);
         });
-    }
-
-    function buildDefaultProjectFiles() {
-        return [
-            {
-                name: 'index.html',
-                language: 'html',
-                content: [
-                    '<!DOCTYPE html>',
-                    '<html>',
-                    '<head>',
-                    '    <title>Exam Project</title>',
-                    '    <link rel="stylesheet" href="style.css">',
-                    '</head>',
-                    '<body>',
-                    '    <h1>Hello</h1>',
-                    '    <script src="script.js"><\\/script>',
-                    '</body>',
-                    '</html>'
-                ].join('\n'),
-                active: true
-            },
-            {
-                name: 'style.css',
-                language: 'css',
-                content: 'body {\n    font-family: Arial, sans-serif;\n}',
-                active: false
-            },
-            {
-                name: 'script.js',
-                language: 'javascript',
-                content: 'console.log("Ready");',
-                active: false
-            }
-        ];
     }
 
     function moveQ(qId, dir) {
@@ -12299,7 +12148,6 @@ SELECT * FROM table_name;`
         delete q.rubric;
         delete q.language;
         delete q.allowMultipleLangs;
-        delete q.starterCode;
         delete q.testCases;
         delete q.pairs;
         delete q.correctIndices;
@@ -12315,7 +12163,6 @@ SELECT * FROM table_name;`
 
         q.type = newType;
         q.language = "Python";
-        q.starterCode = starterCodeTemplates["Python"];
         q.testCases = [];
         q.hasSubQuestions = false;
         q.subQuestions = [];
@@ -17999,7 +17846,7 @@ SELECT * FROM table_name;`
         }
 
         // Calculate total marks
-        const totalMarks = (exam.questions || []).reduce((sum, q) => sum + (parseFloat(q.marks) || 0), 0);
+        const totalMarks = calculateEffectiveExamMarks(exam);
         const questionCount = (exam.questions || []).length;
         const durationText = exam.durationMins ? `${Math.floor(exam.durationMins / 60)}h ${exam.durationMins % 60}m` :
             'N/A';
@@ -18018,14 +17865,11 @@ SELECT * FROM table_name;`
 
                 let answerArea = '';
                 if (q.type === 'code') {
-                    const starterCode = q.starterCode || `// Write your ${q.language || 'code'} here`;
                     answerArea = `
                     <div style="margin-top:12px;">
                         <div style="font-size:12px; font-weight:600; color:var(--muted); margin-bottom:6px;">
-                            <i class="fas fa-terminal"></i> Starter Code (${escapeHTML(q.language || 'Code')}):
+                            <i class="fas fa-terminal"></i> Student Code (${escapeHTML(q.language || 'Code')}):
                         </div>
-                        <pre style="background:#1e1e1e; color:#d4d4d4; padding:14px; border-radius:10px; font-family:monospace; font-size:12px; white-space:pre-wrap; overflow-x:auto;">${escapeHTML(starterCode)}</pre>
-                        <div style="font-size:12px; font-weight:600; color:var(--muted); margin:10px 0 6px;">Your Code:</div>
                         <textarea rows="6" disabled placeholder="Student types code here..."
                             style="width:100%; padding:12px; border-radius:10px; border:2px solid var(--border); background:var(--input-bg); color:var(--text); font-family:monospace; font-size:13px; resize:vertical;"></textarea>
                     </div>`;
@@ -19873,6 +19717,9 @@ SELECT * FROM table_name;`
             exams[idx][field] = value;
             setExams(exams);
             console.log(`Updated ${field} = ${value}`);
+            if (['questionsToAnswer', 'marks', 'questions'].includes(field)) {
+                refreshQuestionAnswerRuleHint();
+            }
         }
     }
 
@@ -20301,6 +20148,9 @@ SELECT * FROM table_name;`
         const qtaField = document.getElementById('bQuestionsToAnswer');
         if (qtaField) {
             qtaField.addEventListener('change', function() {
+                updateExamField('questionsToAnswer', parseInt(this.value) || 0);
+            });
+            qtaField.addEventListener('input', function() {
                 updateExamField('questionsToAnswer', parseInt(this.value) || 0);
             });
         }

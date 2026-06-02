@@ -182,7 +182,8 @@ $stmt = $pdo->prepare("
         s.student_id as student_identifier,
         e.title as exam_title,
         e.questions as exam_questions,
-        e.total_marks as exam_total_marks
+        e.total_marks as exam_total_marks,
+        e.questions_to_answer as questions_to_answer
     FROM exam_submissions es
     LEFT JOIN students s ON es.student_id = s.id
     LEFT JOIN exams e ON es.exam_id = e.id
@@ -1094,6 +1095,7 @@ foreach ($questions as $q) {
     let currentQuestions = <?= json_encode($questions) ?>;
     let currentAnswers = <?= json_encode($answers) ?>;
     let currentScores = <?= json_encode($saved_scores) ?>;
+    let questionsToAnswer = <?= intval($submission['questions_to_answer'] ?? 0) ?>;
     let currentSubmittedFiles = <?= json_encode($current_files) ?>;
     let currentMarkingScheme = '';
     let currentTestCases = [];
@@ -1551,22 +1553,45 @@ foreach ($questions as $q) {
         }
     }
 
+    function questionMaxMarks(question) {
+        if (!question) return 0;
+        if (question.hasSubQuestions && Array.isArray(question.subQuestions) && question.subQuestions.length) {
+            return question.subQuestions.reduce((sum, subQuestion) => sum + (parseFloat(subQuestion.marks) || 0), 0);
+        }
+        return parseFloat(question.marks) || 0;
+    }
+
+    function calculateRuleBasedGradeTotal() {
+        const rows = currentQuestions.map((question, index) => ({
+            index,
+            question,
+            score: parseFloat(currentScores[index]) || 0,
+            maxMarks: questionMaxMarks(question),
+            compulsory: !!question?.compulsory
+        }));
+        const limit = questionsToAnswer > 0 ? Math.min(questionsToAnswer, rows.length) : rows.length;
+        const compulsoryRows = rows.filter(row => row.compulsory);
+        const optionalSlots = Math.max(0, limit - compulsoryRows.length);
+        const optionalRows = rows
+            .filter(row => !row.compulsory)
+            .sort((a, b) => b.score - a.score || b.maxMarks - a.maxMarks)
+            .slice(0, optionalSlots);
+        const includedRows = [...compulsoryRows, ...optionalRows];
+        return {
+            includedRows,
+            limit,
+            totalScore: includedRows.reduce((sum, row) => sum + row.score, 0),
+            totalPossible: includedRows.reduce((sum, row) => sum + row.maxMarks, 0),
+            includedQuestionNumbers: includedRows.map(row => row.index + 1).sort((a, b) => a - b)
+        };
+    }
+
     async function saveAllGrades() {
         if (!questionAutoGraded) {
             showModal('Auto Grade Required',
                 'Please run Auto Grade for the current question before saving final grades. This keeps every manual adjustment tied to an automatic execution report.',
                 'OK');
             return;
-        }
-
-        let totalScore = 0;
-        let totalPossible = 0;
-
-        for (let i = 0; i < currentQuestions.length; i++) {
-            const score = currentScores[i] || 0;
-            const maxMarks = currentQuestions[i]?.marks || 20;
-            totalScore += score;
-            totalPossible += maxMarks;
         }
 
         const missing = currentQuestions
@@ -1579,12 +1604,16 @@ foreach ($questions as $q) {
             return;
         }
 
+        const gradeTotal = calculateRuleBasedGradeTotal();
+        const totalScore = gradeTotal.totalScore;
+        const totalPossible = gradeTotal.totalPossible;
         const percentage = totalPossible > 0 ? (totalScore / totalPossible) * 100 : 0;
         const examScore60 = (percentage * 60) / 100;
 
         showModal('Save Grades', `
             <p>Are you sure you want to save all grades?</p>
             <p><strong>Total Score: ${totalScore}/${totalPossible} marks (${percentage.toFixed(1)}%)</strong></p>
+            <p><strong>Rule Applied:</strong> ${questionsToAnswer > 0 ? `Best ${gradeTotal.limit} question(s)` : 'Answer all questions'}${gradeTotal.includedQuestionNumbers.length ? ` | Counted: Q${gradeTotal.includedQuestionNumbers.join(', Q')}` : ''}</p>
             <p><strong>Score Sheet Exam Component: ${examScore60.toFixed(1)}/60</strong></p>
             <p>This updates the lecturer score sheet from the database.</p>
         `, 'Confirm Save', async () => {
@@ -1618,16 +1647,16 @@ foreach ($questions as $q) {
     }
 
     function calculateTotalMarks() {
-        let total = 0;
-        for (let i = 0; i < currentQuestions.length; i++) {
-            total += currentScores[i] || 0;
-        }
+        const gradeTotal = calculateRuleBasedGradeTotal();
+        const total = gradeTotal.totalScore;
+        const totalPossible = gradeTotal.totalPossible || 1;
         showModal('Total Marks', `
             <div style="text-align:center;">
                 <div style="font-size:48px; color:#22c55e;">${total}</div>
-                <div>Total marks earned out of ${document.getElementById('totalMarksAll').innerText}</div>
-                <div style="margin-top:10px;">Percentage: ${((total / parseInt(document.getElementById('totalMarksAll').innerText)) * 100).toFixed(1)}%</div>
-                <div style="margin-top:10px;">Score Sheet Exam Component: ${((((total / parseInt(document.getElementById('totalMarksAll').innerText)) * 100) * 60) / 100).toFixed(1)}/60</div>
+                <div>Total counted marks out of ${totalPossible}</div>
+                <div style="margin-top:10px;">Counted questions: Q${gradeTotal.includedQuestionNumbers.join(', Q') || '-'}</div>
+                <div style="margin-top:10px;">Percentage: ${((total / totalPossible) * 100).toFixed(1)}%</div>
+                <div style="margin-top:10px;">Score Sheet Exam Component: ${((((total / totalPossible) * 100) * 60) / 100).toFixed(1)}/60</div>
             </div>
         `, 'Close');
     }
