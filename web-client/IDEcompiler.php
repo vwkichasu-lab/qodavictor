@@ -222,6 +222,22 @@ function extractSubmittedCode($answer): string
     return '';
 }
 
+function extractSubmittedFiles($answer): array
+{
+    if (!is_array($answer)) {
+        return [];
+    }
+
+    if (isset($answer['files']) && is_array($answer['files'])) {
+        return $answer['files'];
+    }
+    if (isset($answer['value']['files']) && is_array($answer['value']['files'])) {
+        return $answer['value']['files'];
+    }
+
+    return [];
+}
+
 $answer_entry = $answers[$question_index] ?? null;
 if ($answer_entry === null && is_array($current_question)) {
     $question_id = $current_question['id'] ?? $current_question['question_id'] ?? null;
@@ -230,6 +246,7 @@ if ($answer_entry === null && is_array($current_question)) {
     }
 }
 $current_answer = extractSubmittedCode($answer_entry);
+$current_files = extractSubmittedFiles($answer_entry);
 $current_score = isset($saved_scores[$question_index]) ? $saved_scores[$question_index] : null;
 
 $language = isset($current_question['language']) ? $current_question['language'] : 'java';
@@ -809,7 +826,7 @@ foreach ($questions as $q) {
                 <div class="output-tab" onclick="switchTab('browser')">Browser</div>
                 <div class="output-tab" onclick="switchTab('terminal')">Terminal</div>
             </div>
-            <div id="outputContent" class="output-content">Click "Run Code" to execute or "Grade/Mark" for AI grading...
+            <div id="outputContent" class="output-content">Click "Run Code" to execute or "Grade/Mark" for automatic grading...
             </div>
             <div id="browserContent" class="output-content" style="display:none;"><iframe id="browserFrame"
                     style="width:100%; height:100%; border:none; background:white;"></iframe></div>
@@ -929,6 +946,7 @@ foreach ($questions as $q) {
     let currentQuestions = <?= json_encode($questions) ?>;
     let currentAnswers = <?= json_encode($answers) ?>;
     let currentScores = <?= json_encode($saved_scores) ?>;
+    let currentSubmittedFiles = <?= json_encode($current_files) ?>;
     let currentMarkingScheme = '';
     let currentTestCases = [];
     let currentGradedScore = null;
@@ -967,6 +985,26 @@ foreach ($questions as $q) {
         }
     }
 
+    function getCurrentProjectFiles() {
+        if (!Array.isArray(currentSubmittedFiles) || currentSubmittedFiles.length === 0) {
+            return [];
+        }
+
+        let activeUpdated = false;
+        const updatedFiles = currentSubmittedFiles.map((file, index) => {
+            const copy = {
+                ...file
+            };
+            if (!activeUpdated && (copy.active || index === 0)) {
+                copy.content = editor ? editor.getValue() : (copy.content || '');
+                copy.active = true;
+                activeUpdated = true;
+            }
+            return copy;
+        });
+        return updatedFiles;
+    }
+
     async function runCode() {
         const code = editor.getValue();
         const language = currentQuestions[currentQuestionIndex]?.language || 'java';
@@ -986,7 +1024,8 @@ foreach ($questions as $q) {
                 body: JSON.stringify({
                     code: code,
                     language: language,
-                    test_cases: getCurrentTestCases()
+                    test_cases: getCurrentTestCases(),
+                    files: getCurrentProjectFiles()
                 })
             });
             const data = await response.json();
@@ -1037,9 +1076,9 @@ foreach ($questions as $q) {
         const markingScheme = document.getElementById('markingSchemeText').value;
         const testCases = getCurrentTestCases();
 
-        showModal('AI Grading in Progress', `
+        showModal('Auto Grading in Progress', `
             <div class="progress-bar-container"><div class="progress-fill" id="aiProgressFill"></div></div>
-            <p id="aiStatusMsg">Analyzing code with AI...</p>
+            <p id="aiStatusMsg">Running code against lecturer test cases...</p>
             <div id="aiResultPreview" style="margin-top:15px; display:none;"></div>
         `, 'Close');
 
@@ -1064,6 +1103,7 @@ foreach ($questions as $q) {
                     code: code,
                     language: language,
                     test_cases: testCases,
+                    files: getCurrentProjectFiles(),
                     marking_scheme: markingScheme,
                     max_marks: maxMarks,
                     question_text: <?= json_encode($question_text) ?>
@@ -1080,14 +1120,14 @@ foreach ($questions as $q) {
                 resultPreview.innerHTML = `
                     <div style="text-align:center;">
                         <div style="font-size:32px; font-weight:bold; color:#22c55e;">${data.score}/${maxMarks}</div>
-                        <div style="margin-top:10px;"><strong>AI Feedback:</strong></div>
+                        <div style="margin-top:10px;"><strong>Auto Grading Feedback:</strong></div>
                         <div style="background:#0f0f1a; padding:12px; border-radius:6px; margin-top:8px; font-size:11px;">${escapeHtml(data.feedback)}</div>
                     </div>
                 `;
 
                 document.getElementById('obtainedMarks').innerText = data.score;
                 document.getElementById('aiFeedbackBox').innerHTML =
-                    `<strong>AI Feedback:</strong> ${escapeHtml(data.feedback.substring(0, 200))}...`;
+                    `<strong>Auto Grading Feedback:</strong> ${escapeHtml(data.feedback.substring(0, 200))}...`;
 
                 if (data.results) {
                     data.results.forEach((r, idx) => {

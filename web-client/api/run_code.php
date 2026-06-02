@@ -3,59 +3,68 @@ header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: POST');
 
+require_once '../../backend-php/lib/code_runner.php';
+require_once '../../backend-php/lib/code_grader.php';
+
 $input = json_decode(file_get_contents('php://input'), true);
-$code = $input['code'] ?? '';
-$language = $input['language'] ?? 'java';
-$test_cases = $input['test_cases'] ?? [];
-
-$results = [];
-$output = '';
-
-foreach ($test_cases as $idx => $tc) {
-    $input_val = $tc['input'] ?? '';
-    $expected = trim($tc['expected'] ?? '');
-    
-    // Execute code
-    $actual = simulateExecution($code, $language, $input_val);
-    $passed = (trim($actual) === $expected);
-    
-    $results[] = [
-        'test_case' => $idx + 1,
-        'passed' => $passed,
-        'input' => $input_val,
-        'expected' => $expected,
-        'actual' => $actual
-    ];
-    
-    $output .= $actual . "\n";
+if (!is_array($input)) {
+    echo json_encode(['success' => false, 'error' => 'Invalid JSON payload.']);
+    exit;
 }
 
-echo json_encode([
-    'success' => true,
-    'output' => trim($output),
-    'results' => $results,
-    'memory' => rand(20000, 50000)
-]);
+$code = (string)($input['code'] ?? '');
+$language = (string)($input['language'] ?? 'java');
+$files = $input['files'] ?? [];
+$programInput = (string)($input['input'] ?? '');
+$testCases = $input['test_cases'] ?? [];
+if (is_string($testCases)) {
+    $decoded = json_decode($testCases, true);
+    $testCases = is_array($decoded) ? $decoded : [];
+}
 
-function simulateExecution($code, $language, $input) {
-    preg_match_all('/-?\d+/', $input, $matches);
-    $numbers = $matches[0];
-    
-    // Check if code is adding numbers
-    if (strpos($code, 'add') !== false || strpos($code, 'sum') !== false || strpos($code, '+') !== false) {
-        if (count($numbers) >= 2) {
-            $sum = array_sum($numbers);
-            if (strpos($input, 'x =') !== false && count($numbers) >= 2) {
-                return "Sum of x + y = " . $sum;
+try {
+    if (is_array($testCases) && count($testCases) > 0) {
+        $results = [];
+        $combinedOutput = '';
+        foreach (array_values($testCases) as $idx => $tc) {
+            $caseInput = (string)($tc['input'] ?? '');
+            $expected = (string)($tc['expected'] ?? '');
+            $run = executeQodaCode($code, $language, $caseInput, is_array($files) ? $files : []);
+            $actual = (string)($run['output'] ?? '');
+            $error = (string)($run['error'] ?? '');
+            $passed = !empty($run['success']) && qodaOutputsMatch($actual, $expected, isset($tc['tolerance']) ? (float)$tc['tolerance'] : null);
+            $results[] = [
+                'test_case' => $idx + 1,
+                'passed' => $passed,
+                'input' => $caseInput,
+                'expected' => qodaNormalizeOutput($expected),
+                'actual' => qodaNormalizeOutput($actual),
+                'error' => qodaNormalizeOutput($error),
+                'execution_time_ms' => $run['execution_time_ms'] ?? null,
+            ];
+            $combinedOutput .= "Test " . ($idx + 1) . " output:\n" . trim($actual);
+            if (trim($error) !== '') {
+                $combinedOutput .= "\nError:\n" . trim($error);
             }
-            return (string)$sum;
+            $combinedOutput .= "\n\n";
         }
+        echo json_encode([
+            'success' => true,
+            'output' => trim($combinedOutput),
+            'results' => $results,
+            'memory' => 'N/A',
+        ]);
+        exit;
     }
-    
-    if (strpos($code, 'Hello') !== false || strpos($code, 'World') !== false) {
-        return "Hello World";
-    }
-    
-    return $input ?: "0";
+
+    $run = executeQodaCode($code, $language, $programInput, is_array($files) ? $files : []);
+    echo json_encode([
+        'success' => !empty($run['success']),
+        'output' => $run['output'] ?? '',
+        'error' => $run['error'] ?? '',
+        'execution_time_ms' => $run['execution_time_ms'] ?? null,
+        'memory' => 'N/A',
+    ]);
+} catch (Throwable $e) {
+    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
 }
-?>
