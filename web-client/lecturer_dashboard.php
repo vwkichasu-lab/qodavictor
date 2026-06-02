@@ -1009,7 +1009,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         SELECT
                             active.student_id,
                             MAX(COALESCE(sc.captured_at, es.updated_at, es.started_at, es.created_at)) AS last_activity,
-                            CASE WHEN MAX(sc.captured_at) >= (NOW() - INTERVAL 12 SECOND) THEN 1 ELSE 0 END AS screen_sharing_active,
+                            CASE WHEN MAX(CASE WHEN sc.capture_type = 'live' THEN sc.captured_at ELSE NULL END) >= (NOW() - INTERVAL 12 SECOND) THEN 1 ELSE 0 END AS screen_sharing_active,
                             COUNT(DISTINCT sl.id) AS violations,
                             MAX(CASE WHEN pc.command_type = 'lock' THEN 1 WHEN pc.command_type = 'unlock' THEN 0 ELSE 0 END) AS screen_locked,
                             MAX(COALESCE(es.submitted, 0)) AS submitted,
@@ -1020,14 +1020,25 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                                 FROM screen_captures sc3
                                 WHERE sc3.exam_id = ?
                                   AND sc3.student_id = active.student_id
+                                  AND sc3.capture_type = 'live'
                                 ORDER BY sc3.id DESC
                                 LIMIT 1
                             ) AS snapshot,
+                            (
+                                SELECT sc5.id
+                                FROM screen_captures sc5
+                                WHERE sc5.exam_id = ?
+                                  AND sc5.student_id = active.student_id
+                                  AND sc5.capture_type = 'live'
+                                ORDER BY sc5.id DESC
+                                LIMIT 1
+                            ) AS snapshot_id,
                             (
                                 SELECT sc4.captured_at
                                 FROM screen_captures sc4
                                 WHERE sc4.exam_id = ?
                                   AND sc4.student_id = active.student_id
+                                  AND sc4.capture_type = 'live'
                                 ORDER BY sc4.id DESC
                                 LIMIT 1
                             ) AS latest_snapshot_at,
@@ -1058,7 +1069,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         )
                         GROUP BY active.student_id
                     ");
-                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId]);
+                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId]);
                     echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -1070,6 +1081,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $examId = intval($_POST['exam_id'] ?? 0);
                     $stmt = $pdo->prepare("
                         SELECT active.student_id,
+                               sc.id AS snapshot_id,
                                sc.image_data AS snapshot,
                                sc.captured_at,
                                COUNT(DISTINCT sl.id) AS violations,
@@ -1094,12 +1106,13 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             FROM screen_captures sc2
                             WHERE sc2.exam_id = ?
                               AND sc2.student_id = active.student_id
+                              AND sc2.capture_type = 'live'
                             ORDER BY sc2.id DESC
                             LIMIT 1
                         )
                         LEFT JOIN exam_submissions es ON es.exam_id = ? AND es.student_id = active.student_id
                         LEFT JOIN suspicious_logs sl ON sl.exam_id = ? AND sl.student_id = active.student_id
-                        GROUP BY active.student_id, sc.image_data, sc.captured_at
+                        GROUP BY active.student_id, sc.id, sc.image_data, sc.captured_at
                     ");
                     $stmt->execute([$examId, $examId, $examId, $examId, $examId]);
                     echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
@@ -18636,6 +18649,8 @@ function createCourseTable($courseCode)
                         violationCount: session ? parseInt(session.violations || 0) : 0,
                         lastActivity: session ? session.last_activity : null,
                         snapshot: session ? (session.snapshot || '') : '',
+                        snapshotId: session ? (session.snapshot_id || '') : '',
+                        lastRenderedSnapshotId: '',
                         latestSnapshotAt: session ? (session.latest_snapshot_at || '') : '',
                         screenLocked: session ? !!parseInt(session.screen_locked || 0) : false,
                         isSubmitted: isSubmittedProctorRecord(session),
@@ -18728,7 +18743,7 @@ function createCourseTable($courseCode)
                     </div>
                     <div style="display: flex; gap: 10px; margin-top: 10px; font-size: 12px; color: var(--muted);">
                         <span><i class="fas fa-graduation-cap"></i> Level ${student.level || 'N/A'}</span>
-                        <span><i class="fas fa-clock"></i> Last activity: ${activityTime}</span>
+                        <span id="screenFrameTime_${student.id}"><i class="fas fa-clock"></i> Last live frame: ${activityTime}</span>
                     </div>
                 </div>
                 
@@ -18783,7 +18798,7 @@ function createCourseTable($courseCode)
         // Poll quickly so submitted students leave the live grid without waiting.
         proctoringInterval = setInterval(() => {
             fetchScreenUpdates();
-        }, 1000);
+        }, 800);
 
         toast('✅ Proctoring started - Monitoring student screens');
         fetchScreenUpdates();
@@ -18821,19 +18836,13 @@ function createCourseTable($courseCode)
                     const student = activeProctoringStudents.find(s => String(s.id) === String(update.student_id));
                     if (student) {
                         const ageMs = update.captured_at ? Date.now() - new Date(update.captured_at).getTime() : 0;
-                        student.screenSharing = !ageMs || ageMs < 15000;
+                        student.screenSharing = !!update.snapshot && (!ageMs || ageMs < 12000);
                         student.status = student.screenSharing ? 'active' : student.status;
                         student.lastActivity = update.captured_at || student.lastActivity;
                         student.violationCount = parseInt(update.violations || student.violationCount || 0);
                         student.snapshot = update.snapshot || student.snapshot || '';
+                        student.snapshotId = update.snapshot_id || student.snapshotId || '';
                         updateProctorCardLiveState(student);
-                    }
-                    const screenImg = document.getElementById(`screenImg_${update.student_id}`);
-                    if (screenImg && update.snapshot) {
-                        screenImg.src = `data:image/jpeg;base64,${update.snapshot}`;
-                        screenImg.style.display = 'block';
-                        const placeholder = document.getElementById(`screenPlaceholder_${update.student_id}`);
-                        if (placeholder) placeholder.style.display = 'none';
                     }
 
                     // Update violation count if needed
@@ -18874,6 +18883,7 @@ function createCourseTable($courseCode)
         const liveBadge = document.getElementById(`liveBadge_${student.id}`);
         const placeholder = document.getElementById(`screenPlaceholder_${student.id}`);
         const screenImg = document.getElementById(`screenImg_${student.id}`);
+        const frameTime = document.getElementById(`screenFrameTime_${student.id}`);
         const isSharing = !!student.screenSharing;
 
         if (card) {
@@ -18886,18 +18896,29 @@ function createCourseTable($courseCode)
         if (liveBadge) {
             liveBadge.style.display = isSharing ? 'block' : 'none';
         }
-        if (screenImg && student.snapshot) {
-            screenImg.src = `data:image/jpeg;base64,${student.snapshot}`;
+        if (screenImg && student.snapshot && isSharing) {
+            if (String(student.lastRenderedSnapshotId || '') !== String(student.snapshotId || '')) {
+                screenImg.src = `data:image/jpeg;base64,${student.snapshot}`;
+                student.lastRenderedSnapshotId = student.snapshotId || Date.now();
+            }
             screenImg.style.display = 'block';
+        } else if (screenImg && !isSharing) {
+            screenImg.style.display = 'none';
         }
-        if (placeholder && student.snapshot) {
-            placeholder.style.display = 'none';
+        if (placeholder) {
+            placeholder.style.display = isSharing && student.snapshot ? 'none' : 'block';
+            const label = placeholder.querySelector('p');
+            if (label) label.textContent = student.snapshot ? 'Live feed paused' : 'Screen not shared';
+        }
+        if (frameTime) {
+            const text = student.lastActivity ? new Date(student.lastActivity).toLocaleTimeString() : 'N/A';
+            frameTime.innerHTML = `<i class="fas fa-clock"></i> Last live frame: ${text}`;
         }
     }
 
     function startScreenPolling() {
         if (proctoringInterval) return;
-        proctoringInterval = setInterval(fetchScreenUpdates, 1000);
+        proctoringInterval = setInterval(fetchScreenUpdates, 800);
     }
 
     function updateProctoringStats(students) {

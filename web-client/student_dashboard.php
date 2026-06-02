@@ -2113,26 +2113,7 @@ $student = (object)[
                 'Continue'
             );
             if (!approved) return;
-            const url = `exam_landing.php?exam_id=${examId}&app_window=1`;
-            const features = [
-                'popup=yes',
-                `width=${screen.availWidth || window.innerWidth}`,
-                `height=${screen.availHeight || window.innerHeight}`,
-                'left=0',
-                'top=0',
-                'toolbar=no',
-                'menubar=no',
-                'location=no',
-                'status=no',
-                'scrollbars=yes',
-                'resizable=no'
-            ].join(',');
-            const examWindow = window.open(url, `qoda_exam_${examId}`, features);
-            if (examWindow) {
-                examWindow.focus();
-            } else {
-                window.location.href = url;
-            }
+            window.location.href = `exam_landing.php?exam_id=${examId}`;
         }
     }
 

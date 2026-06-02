@@ -2711,8 +2711,8 @@ endif;
         screenVideoEl.srcObject = screenStream;
         screenVideoEl.play().catch(() => {});
         if (screenCaptureInterval) clearInterval(screenCaptureInterval);
-        screenCaptureInterval = setInterval(sendScreenSnapshot, 1000);
-        setTimeout(sendScreenSnapshot, 500);
+        screenCaptureInterval = setInterval(sendScreenSnapshot, 700);
+        setTimeout(sendScreenSnapshot, 250);
     }
 
     function stopScreenCapturePipeline() {

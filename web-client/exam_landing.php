@@ -922,7 +922,7 @@ $instructions = [
             return;
         }
 
-        window.location.assign(`exam_interface.php?exam_id=${examId}&app_window=1`);
+        window.location.assign(`exam_interface.php?exam_id=${examId}`);
     }
 
     // Theme toggle
