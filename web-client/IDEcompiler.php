@@ -253,13 +253,35 @@ $language = isset($current_question['language']) ? $current_question['language']
 $max_marks = isset($current_question['marks']) ? $current_question['marks'] : 20;
 $question_text = $current_question['text'] ?? $current_question['prompt'] ?? $current_question['title'] ?? '';
 
-// Load saved marking scheme and test cases from database
-$stmt2 = $pdo->prepare("SELECT marking_scheme, test_cases FROM exam_question_grading WHERE submission_id = ? AND question_index = ?");
+// Load saved marking scheme, test cases, and grading state from database
+$stmt2 = $pdo->prepare("
+    SELECT marking_scheme, test_cases, ai_score, ai_feedback, manual_score, manual_feedback, score_source
+    FROM exam_question_grading
+    WHERE submission_id = ? AND question_index = ?
+");
 $stmt2->execute([$submission_id, $question_index]);
 $grading_data = $stmt2->fetch(PDO::FETCH_ASSOC);
 
 $marking_scheme = $grading_data ? $grading_data['marking_scheme'] : ($current_question['markingScheme'] ?? '');
-$test_cases = $grading_data ? json_decode($grading_data['test_cases'], true) : ($current_question['testCases'] ?? []);
+$question_test_cases = $current_question['testCases'] ?? ($current_question['test_cases'] ?? []);
+$test_cases = $grading_data ? json_decode($grading_data['test_cases'], true) : $question_test_cases;
+if (!is_array($test_cases)) {
+    $test_cases = [];
+}
+
+$saved_ai_score = $grading_data && $grading_data['ai_score'] !== null ? (float)$grading_data['ai_score'] : null;
+$saved_manual_score = $grading_data && $grading_data['manual_score'] !== null ? (float)$grading_data['manual_score'] : null;
+$saved_score_source = $grading_data['score_source'] ?? ($answers['_score_source'][$question_index] ?? '');
+$saved_ai_feedback = $grading_data['ai_feedback'] ?? ($answers['_ai_feedback'][$question_index] ?? '');
+$saved_manual_feedback = $grading_data['manual_feedback'] ?? ($answers['_manual_feedback'][$question_index] ?? '');
+if ($current_score === null) {
+    if ($saved_score_source === 'manual' && $saved_manual_score !== null) {
+        $current_score = $saved_manual_score;
+    } elseif ($saved_ai_score !== null) {
+        $current_score = $saved_ai_score;
+    }
+}
+$has_autograded = $saved_ai_score !== null || trim((string)$saved_ai_feedback) !== '';
 
 // Calculate total marks
 $total_marks_all = 0;
@@ -346,6 +368,12 @@ foreach ($questions as $q) {
         transition: all 0.2s;
     }
 
+    .btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+        filter: grayscale(0.4);
+    }
+
     .btn-run {
         background: #238636;
         color: white;
@@ -382,14 +410,33 @@ foreach ($questions as $q) {
         background: #287fb8;
     }
 
-    /* Main Layout - 3 column grid */
+    /* Main Layout - VS Code-like resizable workspace */
     .main-layout {
         display: grid;
-        grid-template-columns: 280px 1fr 360px;
-        grid-template-rows: 1fr 280px;
+        grid-template-columns: var(--left-col, 280px) 6px minmax(360px, 1fr) 6px var(--right-col, 390px);
+        grid-template-rows: minmax(300px, var(--top-row, 58vh)) 6px minmax(220px, 1fr);
         height: calc(100vh - 60px);
-        gap: 1px;
         background: #2d2d44;
+    }
+
+    .resize-handle {
+        background: #2d2d44;
+        position: relative;
+        z-index: 20;
+    }
+
+    .resize-handle.vertical {
+        cursor: col-resize;
+    }
+
+    .resize-handle.horizontal {
+        cursor: row-resize;
+        grid-column: 1 / -1;
+    }
+
+    .resize-handle:hover,
+    body.resizing .resize-handle.active {
+        background: #f97316;
     }
 
     /* Left Panel */
@@ -398,6 +445,8 @@ foreach ($questions as $q) {
         display: flex;
         flex-direction: column;
         overflow: hidden;
+        grid-column: 1;
+        grid-row: 1 / 4;
     }
 
     .panel-header {
@@ -439,9 +488,34 @@ foreach ($questions as $q) {
     }
 
     .questions-list {
-        flex: 1;
+        flex: 0 0 42%;
         overflow-y: auto;
         padding: 8px;
+    }
+
+    .question-context {
+        border-top: 1px solid #2d2d44;
+        min-height: 190px;
+        overflow: auto;
+        padding: 14px;
+        background: #0b1220;
+    }
+
+    .question-context h4 {
+        font-size: 12px;
+        margin-bottom: 10px;
+        color: #f8fafc;
+    }
+
+    .question-context-text {
+        background: #0f0f1a;
+        border: 1px solid #2d2d44;
+        border-radius: 8px;
+        padding: 12px;
+        color: #dbeafe;
+        font-size: 12px;
+        line-height: 1.6;
+        white-space: pre-wrap;
     }
 
     .question-item {
@@ -488,6 +562,8 @@ foreach ($questions as $q) {
         display: flex;
         flex-direction: column;
         overflow: hidden;
+        grid-column: 3;
+        grid-row: 1;
     }
 
     .editor-toolbar {
@@ -516,6 +592,8 @@ foreach ($questions as $q) {
         display: flex;
         flex-direction: column;
         overflow: hidden;
+        grid-column: 5;
+        grid-row: 1;
     }
 
     .output-tabs {
@@ -554,6 +632,21 @@ foreach ($questions as $q) {
         display: flex;
         flex-direction: column;
         overflow: hidden;
+    }
+
+    .bottom-left {
+        grid-column: 1;
+        grid-row: 3;
+    }
+
+    .bottom-center {
+        grid-column: 3;
+        grid-row: 3;
+    }
+
+    .bottom-right {
+        grid-column: 5;
+        grid-row: 3;
     }
 
     .bottom-header {
@@ -620,6 +713,45 @@ foreach ($questions as $q) {
         border-radius: 4px;
         color: white;
         font-size: 10px;
+    }
+
+    .run-input-box {
+        border-top: 1px solid #2d2d44;
+        background: #0b1220;
+        padding: 10px 12px;
+    }
+
+    .run-input-box label {
+        display: flex;
+        justify-content: space-between;
+        color: #9ca3af;
+        font-size: 11px;
+        margin-bottom: 6px;
+    }
+
+    .run-input-box textarea {
+        width: 100%;
+        min-height: 74px;
+        resize: vertical;
+        background: #0f0f1a;
+        border: 1px solid #2d2d44;
+        color: #e5e7eb;
+        border-radius: 6px;
+        padding: 9px;
+        font-family: Consolas, monospace;
+        font-size: 12px;
+    }
+
+    .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        border: 1px solid #2d2d44;
+        background: #111827;
+        color: #cbd5e1;
+        border-radius: 999px;
+        padding: 5px 10px;
+        font-size: 11px;
     }
 
     .test-marks {
@@ -772,11 +904,12 @@ foreach ($questions as $q) {
             <i class="fas fa-code"></i> Qoda Code Grader IDE
         </div>
         <div class="title-buttons">
-            <button class="btn btn-run" onclick="runCode()"><i class="fas fa-play"></i> Run Code</button>
-            <button class="btn btn-grade" onclick="gradeWithAI()"><i class="fas fa-robot"></i> Grade/Mark</button>
+            <span class="status-pill" id="autoGradeStatus"><i class="fas fa-shield-halved"></i> Auto-grade required</span>
+            <button class="btn btn-run" id="runCodeBtn" onclick="runCode()"><i class="fas fa-play"></i> Run Code</button>
+            <button class="btn btn-grade" id="autoGradeBtn" onclick="gradeWithAI()"><i class="fas fa-robot"></i> Auto Grade</button>
             <button class="btn btn-calc" onclick="calculateTotalMarks()"><i class="fas fa-calculator"></i>
                 Total</button>
-            <button class="btn btn-save" onclick="saveAllGrades()"><i class="fas fa-save"></i> Save Grade</button>
+            <button class="btn btn-save" id="saveGradeBtn" onclick="saveAllGrades()"><i class="fas fa-save"></i> Save Grade</button>
         </div>
     </div>
 
@@ -808,7 +941,13 @@ foreach ($questions as $q) {
                 </div>
                 <?php endforeach; ?>
             </div>
+            <div class="question-context">
+                <h4><i class="fas fa-circle-question"></i> Question <?= $question_index + 1 ?> Prompt</h4>
+                <div class="question-context-text"><?= nl2br(htmlspecialchars($question_text ?: 'No question text was saved for this submission.')) ?></div>
+            </div>
         </div>
+
+        <div class="resize-handle vertical" data-resize="left"></div>
 
         <!-- CENTER PANEL - EDITOR -->
         <div class="center-panel">
@@ -818,6 +957,8 @@ foreach ($questions as $q) {
             </div>
             <div id="editor-container" style="height: 100%;"></div>
         </div>
+
+        <div class="resize-handle vertical" data-resize="right"></div>
 
         <!-- RIGHT PANEL - OUTPUT -->
         <div class="right-panel">
@@ -832,7 +973,16 @@ foreach ($questions as $q) {
                     style="width:100%; height:100%; border:none; background:white;"></iframe></div>
             <div id="terminalContent" class="output-content" style="display:none;">Terminal output will appear here...
             </div>
+            <div class="run-input-box">
+                <label for="programInput">
+                    <span><i class="fas fa-keyboard"></i> Program input / stdin</span>
+                    <span>Use new lines for separate prompts</span>
+                </label>
+                <textarea id="programInput" placeholder="Example:&#10;2&#10;3"></textarea>
+            </div>
         </div>
+
+        <div class="resize-handle horizontal" data-resize="bottom"></div>
 
         <!-- BOTTOM LEFT - MARKING SCHEME -->
         <div class="bottom-left">
@@ -875,10 +1025,8 @@ foreach ($questions as $q) {
                         <?php foreach($test_cases as $idx => $tc): ?>
                         <tr data-test-idx="<?= $idx ?>">
                             <td><?= $idx+1 ?></td>
-                            <td><input type="text" class="test-input"
-                                    value="<?= htmlspecialchars($tc['input'] ?? '') ?>"></td>
-                            <td><input type="text" class="test-expected"
-                                    value="<?= htmlspecialchars($tc['expected'] ?? '') ?>"></td>
+                            <td><textarea class="test-input" rows="2"><?= htmlspecialchars($tc['input'] ?? '') ?></textarea></td>
+                            <td><textarea class="test-expected" rows="2"><?= htmlspecialchars($tc['expected'] ?? '') ?></textarea></td>
                             <td><input type="number" class="test-marks" value="<?= $tc['marks'] ?? 5 ?>"></td>
                             <td class="test-result-<?= $idx ?>">Pending</td>
                             <td><button class="delete-btn" onclick="removeTestCase(this)"><i
@@ -916,7 +1064,7 @@ foreach ($questions as $q) {
                                 value="<?= $current_score !== null ? htmlspecialchars((string)$current_score) : '' ?>"
                                 style="width: 90px; background:#0f0f1a; border:1px solid #2d2d44; color:white; padding:8px; border-radius:6px;">
                             <span style="font-size: 12px; color: #8b949e;">/ <?= $max_marks ?></span>
-                            <button class="add-btn" onclick="saveManualScore()"><i class="fas fa-check"></i> Save Manual</button>
+                            <button class="add-btn" id="saveManualBtn" onclick="saveManualScore()"><i class="fas fa-check"></i> Save Manual</button>
                         </div>
                         <textarea id="manualFeedbackInput" rows="3" placeholder="Manual feedback or reason for overriding auto grade..."
                             style="width:100%; margin-top:8px; background:#0f0f1a; border:1px solid #2d2d44; color:white; padding:8px; border-radius:6px; resize:vertical;"></textarea>
@@ -950,6 +1098,10 @@ foreach ($questions as $q) {
     let currentMarkingScheme = '';
     let currentTestCases = [];
     let currentGradedScore = null;
+    let questionAutoGraded = <?= $has_autograded ? 'true' : 'false' ?>;
+    let savedAiFeedback = <?= json_encode($saved_ai_feedback) ?>;
+    let savedManualFeedback = <?= json_encode($saved_manual_feedback) ?>;
+    let savedScoreSource = <?= json_encode($saved_score_source) ?>;
     let modalCallback = null;
 
     // Initialize Monaco Editor
@@ -972,7 +1124,85 @@ foreach ($questions as $q) {
             scrollBeyondLastLine: false,
             wordWrap: 'on'
         });
+        hydrateGradingState();
+        initResizableWorkspace();
     });
+
+    function hydrateGradingState() {
+        const firstTestInput = getCurrentTestCases()[0]?.input || '';
+        const inputBox = document.getElementById('programInput');
+        if (inputBox && !inputBox.value && firstTestInput) inputBox.value = firstTestInput;
+
+        if (savedManualFeedback) {
+            const manualBox = document.getElementById('manualFeedbackInput');
+            if (manualBox) manualBox.value = savedManualFeedback;
+        }
+
+        const feedback = savedScoreSource === 'manual' && savedManualFeedback ? savedManualFeedback : savedAiFeedback;
+        if (feedback) {
+            document.getElementById('aiFeedbackBox').innerHTML =
+                `<strong>${savedScoreSource === 'manual' ? 'Manual' : 'Auto'} Feedback:</strong> ${escapeHtml(String(feedback).substring(0, 350))}${String(feedback).length > 350 ? '...' : ''}`;
+        }
+        updateAutoGradeStatus();
+    }
+
+    function updateAutoGradeStatus() {
+        const status = document.getElementById('autoGradeStatus');
+        const saveBtn = document.getElementById('saveGradeBtn');
+        const manualBtn = document.getElementById('saveManualBtn');
+        if (!status) return;
+        if (questionAutoGraded) {
+            status.innerHTML = '<i class="fas fa-circle-check" style="color:#22c55e;"></i> Auto-graded';
+            status.style.borderColor = '#14532d';
+            status.style.color = '#bbf7d0';
+            if (saveBtn) saveBtn.disabled = false;
+            if (manualBtn) manualBtn.disabled = false;
+        } else {
+            status.innerHTML = '<i class="fas fa-triangle-exclamation" style="color:#f97316;"></i> Auto-grade required';
+            status.style.borderColor = '#7c2d12';
+            status.style.color = '#fed7aa';
+            if (saveBtn) saveBtn.disabled = true;
+            if (manualBtn) manualBtn.disabled = true;
+        }
+    }
+
+    function initResizableWorkspace() {
+        const layout = document.querySelector('.main-layout');
+        if (!layout) return;
+        let drag = null;
+        document.querySelectorAll('.resize-handle').forEach(handle => {
+            handle.addEventListener('pointerdown', (event) => {
+                drag = {
+                    type: handle.dataset.resize,
+                    startX: event.clientX,
+                    startY: event.clientY,
+                    left: parseFloat(getComputedStyle(layout).getPropertyValue('--left-col')) || 280,
+                    right: parseFloat(getComputedStyle(layout).getPropertyValue('--right-col')) || 390,
+                    top: parseFloat(getComputedStyle(layout).getPropertyValue('--top-row')) || (window.innerHeight * 0.58)
+                };
+                handle.classList.add('active');
+                document.body.classList.add('resizing');
+                handle.setPointerCapture(event.pointerId);
+            });
+            handle.addEventListener('pointermove', (event) => {
+                if (!drag) return;
+                if (drag.type === 'left') {
+                    layout.style.setProperty('--left-col', Math.max(220, Math.min(520, drag.left + event.clientX - drag.startX)) + 'px');
+                } else if (drag.type === 'right') {
+                    layout.style.setProperty('--right-col', Math.max(300, Math.min(700, drag.right - (event.clientX - drag.startX))) + 'px');
+                } else if (drag.type === 'bottom') {
+                    layout.style.setProperty('--top-row', Math.max(280, Math.min(window.innerHeight - 250, drag.top + event.clientY - drag.startY)) + 'px');
+                }
+                if (editor) editor.layout();
+            });
+            handle.addEventListener('pointerup', () => {
+                drag = null;
+                handle.classList.remove('active');
+                document.body.classList.remove('resizing');
+                if (editor) editor.layout();
+            });
+        });
+    }
 
     function loadQuestion(index) {
         window.location.href = `IDEcompiler.php?submission_id=${currentSubmissionId}&q_index=${index}`;
@@ -1069,6 +1299,100 @@ foreach ($questions as $q) {
         }
     }
 
+    async function runCode() {
+        const code = editor.getValue();
+        const language = currentQuestions[currentQuestionIndex]?.language || 'java';
+        const normalizedLanguage = String(language).toLowerCase();
+        const outputDiv = document.getElementById('outputContent');
+        const terminalDiv = document.getElementById('terminalContent');
+        const browserFrame = document.getElementById('browserFrame');
+        const testCases = getCurrentTestCases();
+        const stdin = document.getElementById('programInput')?.value || '';
+
+        if (['html', 'css', 'javascript', 'js', 'web'].includes(normalizedLanguage) && testCases.length === 0) {
+            const projectFiles = getCurrentProjectFiles();
+            const htmlFile = projectFiles.find(f => String(f.name || '').toLowerCase().endsWith('.html'));
+            const cssFiles = projectFiles.filter(f => String(f.name || '').toLowerCase().endsWith('.css'));
+            const jsFiles = projectFiles.filter(f => String(f.name || '').toLowerCase().endsWith('.js'));
+            let html = htmlFile ? htmlFile.content : code;
+            if (!/<html[\s>]/i.test(html)) {
+                html = `<!doctype html><html><head><meta charset="utf-8"><title>Qoda Preview</title></head><body>${html}</body></html>`;
+            }
+            if (cssFiles.length) {
+                html = html.replace('</head>', `<style>${cssFiles.map(f => f.content || '').join('\n')}</style></head>`);
+            }
+            if (jsFiles.length && !htmlFile) {
+                html = html.replace('</body>', `<script>${jsFiles.map(f => f.content || '').join('\n')}<\/script></body>`);
+            }
+            if (browserFrame) browserFrame.srcdoc = html;
+            outputDiv.innerHTML = '<span style="color:#22c55e;">Browser preview rendered successfully.</span>';
+            if (terminalDiv) terminalDiv.innerHTML = 'Web preview rendered in the Browser tab.';
+            document.getElementById('compilationStatus').innerHTML = '<span style="color:#22c55e;">Preview ready</span>';
+            switchTab('browser');
+            return;
+        }
+
+        outputDiv.innerHTML =
+            '<span style="color: #f97316;"><i class="fas fa-spinner fa-spin"></i> Compiling and executing...</span>';
+        if (terminalDiv) terminalDiv.innerHTML = 'Running...';
+        switchTab('output');
+        const startTime = performance.now();
+
+        try {
+            const response = await fetch('api/run_code.php', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    code: code,
+                    language: language,
+                    input: stdin,
+                    test_cases: testCases,
+                    files: getCurrentProjectFiles()
+                })
+            });
+            const data = await response.json();
+            const execTime = ((performance.now() - startTime) / 1000).toFixed(2);
+
+            if (data.success) {
+                let outputHtml = `<div style="margin-bottom:12px;"><strong>Program Output:</strong></div>`;
+                outputHtml += `<pre style="background:#0f0f1a; padding:12px; border-radius:6px;">${escapeHtml(data.output || 'No output')}</pre>`;
+                if (terminalDiv) terminalDiv.innerHTML = escapeHtml(data.output || 'No terminal output.');
+
+                if (data.results && data.results.length) {
+                    let passed = 0;
+                    outputHtml += `<div style="margin-top:12px;"><strong>Test Results:</strong></div>`;
+                    for (const r of data.results) {
+                        const color = r.passed ? '#22c55e' : '#ef4444';
+                        if (r.passed) passed++;
+                        outputHtml += `<div style="margin-top:8px; padding:8px; background:#1a1a2e; border-radius:6px;">
+                            <span style="color:${color}">${r.passed ? '✓' : '✗'}</span> Test ${r.test_case}: ${r.passed ? 'PASSED' : 'FAILED'}
+                            <div style="font-size:10px; margin-top:4px;">Input: ${escapeHtml(r.input || '[none]')}<br>Expected: ${escapeHtml(r.expected)}<br>Got: ${escapeHtml(r.actual || '[empty]')}${r.error ? '<br>Error: ' + escapeHtml(r.error) : ''}</div>
+                        </div>`;
+                    }
+                    document.getElementById('testStatusRow').style.display = 'flex';
+                    document.getElementById('testStatus').innerHTML = passed === data.results.length ?
+                        '<span style="color:#22c55e;">All tests passed ✓</span>' :
+                        `<span style="color:#ef4444;">${passed}/${data.results.length} passed</span>`;
+                }
+
+                outputDiv.innerHTML = outputHtml;
+                document.getElementById('cpuTime').innerText = data.execution_time_ms ? `${data.execution_time_ms} ms` : `${execTime} sec(s)`;
+                document.getElementById('memoryUsage').innerText = data.memory || 'N/A';
+                document.getElementById('compilationStatus').innerHTML = '<span style="color:#22c55e;">Success ✓</span>';
+            } else {
+                const message = data.error || data.output || 'Execution failed.';
+                outputDiv.innerHTML = `<span style="color:#ef4444;">Error:</span><pre style="margin-top:10px;">${escapeHtml(message)}</pre>`;
+                if (terminalDiv) terminalDiv.innerHTML = escapeHtml(message);
+                document.getElementById('compilationStatus').innerHTML = '<span style="color:#ef4444;">Failed ✗</span>';
+            }
+        } catch (error) {
+            outputDiv.innerHTML = `<span style="color:#ef4444;">Network error: ${escapeHtml(error.message)}</span>`;
+            if (terminalDiv) terminalDiv.innerHTML = `Network error: ${escapeHtml(error.message)}`;
+        }
+    }
+
     async function gradeWithAI() {
         const code = editor.getValue();
         const language = currentQuestions[currentQuestionIndex]?.language || 'java';
@@ -1139,6 +1463,10 @@ foreach ($questions as $q) {
                     });
                 }
 
+                questionAutoGraded = true;
+                savedAiFeedback = data.feedback || '';
+                savedScoreSource = 'ai';
+                updateAutoGradeStatus();
                 setQuestionScore(currentQuestionIndex, data.score, data.feedback, 'ai');
             } else {
                 statusMsg.innerHTML = 'Grading failed';
@@ -1176,6 +1504,13 @@ foreach ($questions as $q) {
     }
 
     async function saveManualScore() {
+        if (!questionAutoGraded) {
+            showModal('Auto Grade Required',
+                'Run Auto Grade first. After the submitted code has been checked by the system, you can adjust the marks manually with feedback.',
+                'OK');
+            return;
+        }
+
         const score = document.getElementById('manualScoreInput').value;
         const feedback = document.getElementById('manualFeedbackInput').value ||
             'Manual score entered by lecturer because auto grading needed review.';
@@ -1217,6 +1552,13 @@ foreach ($questions as $q) {
     }
 
     async function saveAllGrades() {
+        if (!questionAutoGraded) {
+            showModal('Auto Grade Required',
+                'Please run Auto Grade for the current question before saving final grades. This keeps every manual adjustment tied to an automatic execution report.',
+                'OK');
+            return;
+        }
+
         let totalScore = 0;
         let totalPossible = 0;
 
@@ -1225,6 +1567,16 @@ foreach ($questions as $q) {
             const maxMarks = currentQuestions[i]?.marks || 20;
             totalScore += score;
             totalPossible += maxMarks;
+        }
+
+        const missing = currentQuestions
+            .map((question, index) => currentScores[index] === undefined || currentScores[index] === null ? index + 1 : null)
+            .filter(Boolean);
+        if (missing.length > 0) {
+            showModal('Incomplete Grading',
+                `Please grade these question(s) before final save: ${missing.join(', ')}.`,
+                'OK');
+            return;
         }
 
         const percentage = totalPossible > 0 ? (totalScore / totalPossible) * 100 : 0;
@@ -1308,8 +1660,8 @@ foreach ($questions as $q) {
         const tr = document.createElement('tr');
         tr.innerHTML = `
             <td>${newIndex + 1}</td>
-            <td><input type="text" class="test-input" placeholder="e.g., 5 3"></td>
-            <td><input type="text" class="test-expected" placeholder="e.g., 8"></td>
+            <td><textarea class="test-input" rows="2" placeholder="Example:\n2\n3"></textarea></td>
+            <td><textarea class="test-expected" rows="2" placeholder="Example:\n5"></textarea></td>
             <td><input type="number" class="test-marks" value="5" style="width:60px;"></td>
             <td class="test-result-${newIndex}">Pending</td>
             <td><button class="delete-btn" onclick="removeTestCase(this)"><i class="fas fa-trash"></i></button></td>
