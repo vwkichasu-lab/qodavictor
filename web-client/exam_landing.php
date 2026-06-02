@@ -724,10 +724,10 @@ $instructions = [
                     <i class="fas fa-arrow-left"></i> Back to Dashboard
                 </a>
                 <?php elseif ($examStatus === 'ongoing'): ?>
-                <a class="attempt-btn" id="attemptBtn" href="exam_interface.php?exam_id=<?php echo urlencode($examId); ?>"
+                <button class="attempt-btn" id="attemptBtn" onclick="startExam()"
                     style="text-decoration: none; background: linear-gradient(135deg, #10b981, #059669);">
                     <i class="fas fa-play"></i> Attempt Quiz Now
-                </a>
+                </button>
                 <?php else: ?>
                 <button class="attempt-btn" id="attemptBtn" onclick="startExam()" <?php echo $examStatus === 'ongoing' ? '' : 'disabled'; ?>>
                     <i class="fas fa-spinner fa-spin"></i> Please wait...
@@ -922,7 +922,7 @@ $instructions = [
             return;
         }
 
-        window.location.assign(`exam_interface.php?exam_id=${examId}`);
+        window.location.assign(`exam_interface.php?exam_id=${examId}&app_window=1`);
     }
 
     // Theme toggle

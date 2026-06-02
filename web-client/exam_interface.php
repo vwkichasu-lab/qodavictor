@@ -221,6 +221,12 @@ if (isset($_POST['action'])) {
 
     if ($_POST['action'] === 'screen_snapshot') {
         $snapshot = $_POST['snapshot'] ?? '';
+        $captureType = strtolower(trim($_POST['capture_type'] ?? 'live'));
+        $allowedCaptureTypes = ['live', 'manual', 'violation', 'evidence'];
+        if (!in_array($captureType, $allowedCaptureTypes, true)) {
+            $captureType = 'live';
+        }
+        $notes = trim($_POST['notes'] ?? '');
         if (strpos($snapshot, 'base64,') !== false) {
             $snapshot = substr($snapshot, strpos($snapshot, 'base64,') + 7);
         }
@@ -228,11 +234,30 @@ if (isset($_POST['action'])) {
             echo json_encode(['success' => false, 'error' => 'No snapshot received']);
             exit;
         }
+        $imagePath = '';
+        if ($captureType !== 'live') {
+            $safeStudentFolder = preg_replace('/[^A-Za-z0-9_-]+/', '_', $studentIdentifierForSubmission ?: ('student_' . $studentRowId));
+            $evidenceRoot = dirname(__DIR__) . DIRECTORY_SEPARATOR . 'storage' . DIRECTORY_SEPARATOR . 'proctoring_evidence';
+            $evidenceDir = $evidenceRoot . DIRECTORY_SEPARATOR . $safeStudentFolder . DIRECTORY_SEPARATOR . 'exam_' . $ajaxExamId;
+            if (!is_dir($evidenceDir)) {
+                @mkdir($evidenceDir, 0775, true);
+            }
+            $fileBase = date('Ymd_His') . '_' . $captureType . '_' . bin2hex(random_bytes(3));
+            $absoluteImagePath = $evidenceDir . DIRECTORY_SEPARATOR . $fileBase . '.jpg';
+            $absoluteNotePath = $evidenceDir . DIRECTORY_SEPARATOR . $fileBase . '.txt';
+            $binary = base64_decode($snapshot, true);
+            if ($binary !== false && is_dir($evidenceDir)) {
+                @file_put_contents($absoluteImagePath, $binary);
+                $imagePath = 'storage/proctoring_evidence/' . $safeStudentFolder . '/exam_' . $ajaxExamId . '/' . $fileBase . '.jpg';
+                $noteText = "Student: {$studentIdentifierForSubmission}\nExam ID: {$ajaxExamId}\nCapture type: {$captureType}\nTime: " . date('Y-m-d H:i:s') . "\nReason: {$notes}\n";
+                @file_put_contents($absoluteNotePath, $noteText);
+            }
+        }
         $stmt = $pdo->prepare("
-            INSERT INTO screen_captures (exam_id, student_id, image_path, image_data, capture_type, captured_at)
-            VALUES (?, ?, '', ?, 'live', NOW())
+            INSERT INTO screen_captures (exam_id, student_id, image_path, image_data, capture_type, notes, captured_at)
+            VALUES (?, ?, ?, ?, ?, ?, NOW())
         ");
-        $stmt->execute([$ajaxExamId, $studentRowId, $snapshot]);
+        $stmt->execute([$ajaxExamId, $studentRowId, $imagePath, $snapshot, $captureType, $notes]);
         $session = $pdo->prepare("SELECT id FROM exam_submissions WHERE exam_id = ? AND student_id = ? LIMIT 1");
         $session->execute([$ajaxExamId, $studentRowId]);
         $sessionId = $session->fetchColumn();
@@ -1700,42 +1725,47 @@ endif;
     }
 
     .stdin-panel {
-        flex-shrink: 0;
-        border-top: 1px solid #3e3e42;
-        background: #18181b;
-        padding: 10px 12px;
-        color: #d4d4d4;
+        display: none;
     }
 
-    .stdin-panel label {
+    .terminal-session {
+        min-height: 100%;
+        padding: 16px;
+        background: #111;
+        color: #f8fafc;
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 14px;
+        line-height: 1.65;
+        white-space: pre-wrap;
+    }
+
+    .terminal-transcript {
+        margin: 0;
+        color: inherit;
+        white-space: pre-wrap;
+        font: inherit;
+    }
+
+    .terminal-input-line {
         display: flex;
         align-items: center;
-        gap: 8px;
-        margin-bottom: 6px;
-        font-size: 12px;
-        font-weight: 700;
+        flex-wrap: wrap;
+        gap: 6px;
     }
 
-    .stdin-panel textarea {
-        width: 100%;
-        min-height: 78px;
-        max-height: 160px;
-        resize: vertical;
-        border: 1px solid #3e3e42;
-        border-radius: 8px;
-        background: #0f0f12;
+    .terminal-input-prompt {
         color: #f8fafc;
-        padding: 10px;
-        font-family: Consolas, monospace;
-        font-size: 13px;
-        line-height: 1.45;
     }
 
-    .stdin-panel small {
-        display: block;
-        margin-top: 5px;
-        color: #9ca3af;
-        font-size: 11px;
+    .terminal-input-field {
+        flex: 1;
+        min-width: 140px;
+        border: 0;
+        outline: 0;
+        background: transparent;
+        color: #f8fafc;
+        font: inherit;
+        caret-color: #22c55e;
     }
 
     .console-input-row {
@@ -2414,11 +2444,16 @@ endif;
         localStorage.setItem('exam_lock_reason_' + examId, reason);
         localStorage.setItem('exam_lock_time_' + examId, Date.now());
 
-        // Report to server
-        reportViolation(reason);
+        captureViolationEvidence(reason).finally(() => {
+            reportViolation(reason);
+            showLockedScreen();
+        });
+    }
 
-        // Show locked screen
-        showLockedScreen();
+    async function captureViolationEvidence(reason) {
+        if (!screenSharingActive || !screenVideoEl || screenVideoEl.readyState < 2 || !screenCanvasEl) return;
+        const timestamp = new Date().toLocaleString();
+        await sendScreenSnapshot('violation', `Screen locked after rule violation: ${reason}. Captured before lock at ${timestamp}.`);
     }
 
     function lockExamFromLecturer(message = 'Your exam screen has been locked by the lecturer.') {
@@ -2685,7 +2720,7 @@ endif;
         screenCaptureInterval = null;
     }
 
-    async function sendScreenSnapshot() {
+    async function sendScreenSnapshot(captureType = 'live', notes = '') {
         if (!screenSharingActive || !screenVideoEl || screenVideoEl.readyState < 2 || !screenCanvasEl) return;
         const ctx = screenCanvasEl.getContext('2d');
         const sourceWidth = screenVideoEl.videoWidth || 960;
@@ -2703,6 +2738,8 @@ endif;
         formData.append('action', 'screen_snapshot');
         formData.append('exam_id', examId);
         formData.append('snapshot', snapshot);
+        formData.append('capture_type', captureType);
+        if (notes) formData.append('notes', notes);
         try {
             await fetch('', {
                 method: 'POST',
@@ -3473,11 +3510,7 @@ endif;
                     <i class="fas fa-window-maximize" style="font-size:34px;color:#888;"></i>
                     <span>Desktop GUI windows cannot open inside the cloud exam server. Use Browser for web UI output; Java Swing and Windows Forms are checked as source/compile tasks.</span>
                 </div>
-                <div class="stdin-panel">
-                    <label for="programInput"><i class="fas fa-keyboard"></i> Program input / stdin</label>
-                    <textarea id="programInput" placeholder="Type keyboard input here. Put each Scanner/input/scanf value on its own line when the program asks step by step. Example:\nAlice\n80\n70\n90"></textarea>
-                    <small>Execute feeds this text to the program exactly like keyboard input in a normal IDE terminal.</small>
-                </div>
+                <textarea id="programInput" class="stdin-panel" aria-hidden="true"></textarea>
             </div>
         </div>
     `;
@@ -4759,10 +4792,106 @@ endif;
             .trimEnd();
     }
 
-    function formatInputSummary(input) {
-        const values = String(input || '').trim().split(/\s+/).filter(Boolean);
-        if (!values.length) return '';
-        return `Stored input values:\n${values.map((value, index) => `Input ${index + 1}: ${value}`).join('\n')}\n\n`;
+    function inputPromptsFromPlan(plan) {
+        const prompts = [];
+        (plan.groups || []).forEach((group, groupIndex) => {
+            const basePrompt = cleanInputPrompt(group.prompt, `Input ${groupIndex + 1}`);
+            for (let i = 0; i < Math.max(1, group.count || 1); i++) {
+                prompts.push(group.count > 1 ? `${basePrompt} ${i + 1}` : basePrompt);
+            }
+        });
+        return prompts;
+    }
+
+    function renderTerminalPrompt(transcript, prompt) {
+        const consoleOutput = document.getElementById('consoleOutput');
+        if (!consoleOutput) return null;
+        consoleOutput.innerHTML = `
+            <div class="terminal-session">
+                <pre class="terminal-transcript" id="terminalTranscript">${escapeHtml(transcript)}</pre>
+                <div class="terminal-input-line">
+                    <span class="terminal-input-prompt">${escapeHtml(prompt)}</span>
+                    <input id="terminalInputField" class="terminal-input-field" autocomplete="off" spellcheck="false">
+                </div>
+            </div>
+        `;
+        const input = document.getElementById('terminalInputField');
+        if (input) input.focus();
+        return input;
+    }
+
+    function collectProgramInputInConsole(code, language) {
+        const plan = buildInputPlan(code, language);
+        if (!plan.needsInput) return Promise.resolve('');
+
+        switchOutputTab('console');
+        return new Promise(resolve => {
+            const prompts = inputPromptsFromPlan(plan);
+            const values = [];
+            let transcript = 'run:\n';
+            let index = 0;
+
+            const askNext = () => {
+                const prompt = prompts[index] || `Input ${index + 1}:`;
+                const input = renderTerminalPrompt(transcript, prompt);
+                if (!input) {
+                    resolve('');
+                    return;
+                }
+                input.addEventListener('keydown', event => {
+                    if (event.key !== 'Enter') return;
+                    event.preventDefault();
+                    const value = input.value;
+                    values.push(value);
+                    transcript += `${prompt} ${value}\n`;
+                    index += 1;
+                    if (index >= prompts.length) {
+                        const programInput = values.join('\n') + '\n';
+                        const storedInput = document.getElementById('programInput');
+                        if (storedInput) storedInput.value = programInput;
+                        const consoleOutput = document.getElementById('consoleOutput');
+                        if (consoleOutput) {
+                            consoleOutput.innerHTML = `
+                                <div class="terminal-session">
+                                    <pre class="terminal-transcript">${escapeHtml(transcript + '\nRunning...\n')}</pre>
+                                </div>
+                            `;
+                        }
+                        resolve(programInput);
+                    } else {
+                        askNext();
+                    }
+                });
+            };
+
+            askNext();
+        });
+    }
+
+    function formatConsoleOutputWithInputEcho(output, input, code, language, success = true) {
+        let formatted = formatConsoleOutput(output || '');
+        const values = String(input || '').replace(/\r\n/g, '\n').split('\n').filter(value => value.length > 0);
+        const prompts = inputPromptsFromPlan(buildInputPlan(code, language));
+
+        prompts.forEach((prompt, index) => {
+            if (!values[index]) return;
+            const escapedPrompt = prompt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const pattern = new RegExp(`${escapedPrompt}\\s*`, 'i');
+            if (pattern.test(formatted)) {
+                formatted = formatted.replace(pattern, `${prompt} ${values[index]}\n`);
+            }
+        });
+
+        if (values.length && !prompts.some(prompt => formatted.toLowerCase().includes(prompt.toLowerCase()))) {
+            const transcript = prompts.map((prompt, index) => `${prompt} ${values[index] || ''}`).join('\n');
+            formatted = `${transcript}\n${formatted}`.trimEnd();
+        }
+
+        if (success && formatted && !/BUILD SUCCESSFUL/i.test(formatted)) {
+            formatted += '\n\nBUILD SUCCESSFUL';
+        }
+
+        return formatted || (success ? 'Program finished successfully with no output.\n\nBUILD SUCCESSFUL' : '');
     }
 
     async function runCode() {
@@ -4787,7 +4916,7 @@ endif;
         const language = activeFile.language;
         const consoleOutput = document.getElementById('consoleOutput');
         const webPreview = document.getElementById('webPreview');
-        let programInput = document.getElementById('programInput')?.value || '';
+        let programInput = '';
 
         if (!code || code.trim() === '') {
             showToast('No code to execute', 'warning');
@@ -4795,14 +4924,8 @@ endif;
             return;
         }
 
-        if (!programInput.trim() && codeLikelyNeedsInput(code, language)) {
-            switchOutputTab('console');
-            if (consoleOutput) {
-                consoleOutput.textContent =
-                    'This program reads keyboard input.\n\nType the required values in "Program input / stdin" below, then click Execute again.\n\nUse new lines for step-by-step prompts, for example:\nAlice\n80\n70\n90';
-            }
-            showToast('Enter stdin values, then Execute again', 'warning');
-            return;
+        if (codeLikelyNeedsInput(code, language)) {
+            programInput = await collectProgramInputInConsole(code, language);
         }
 
         console.log("Running code in:", language);
@@ -4910,19 +5033,20 @@ endif;
                     consoleOutput.textContent = `❌ Error:\n${result.error}`;
                     showToast('Execution failed', 'error');
                 } else {
-                    const output = formatConsoleOutput(result.output || 'Program finished successfully with no output.');
-                    if (shouldRenderAsHtml(output, language) && webPreview) {
-                        webPreview.srcdoc = output;
+                    const rawOutput = formatConsoleOutput(result.output || 'Program finished successfully with no output.');
+                    if (shouldRenderAsHtml(rawOutput, language) && webPreview) {
+                        webPreview.srcdoc = rawOutput;
                         bindSafeOutputFrame(webPreview);
                         markOutputInteraction();
                         switchOutputTab('browser');
                     } else {
+                        const output = formatConsoleOutputWithInputEcho(rawOutput, programInput, code, language, true);
                         switchOutputTab(preferredOutputTab(language) === 'ui' ? 'ui' : 'console');
                         const uiOutput = document.getElementById('uiOutput');
                         if (preferredOutputTab(language) === 'ui' && uiOutput) {
-                            uiOutput.innerHTML = `<pre style="text-align:left;width:100%;white-space:pre-wrap;">${escapeHtml(formatInputSummary(programInput) + output)}</pre>`;
+                            uiOutput.innerHTML = `<pre style="text-align:left;width:100%;white-space:pre-wrap;">${escapeHtml(output)}</pre>`;
                         }
-                        consoleOutput.textContent = formatInputSummary(programInput) + output;
+                        consoleOutput.textContent = output;
                     }
                     showToast('Code processed', 'success');
                 }

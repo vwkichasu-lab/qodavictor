@@ -1015,6 +1015,22 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             MAX(COALESCE(es.submitted, 0)) AS submitted,
                             MAX(es.submitted_at) AS submitted_at,
                             MAX(es.submittedAt) AS submittedAt,
+                            (
+                                SELECT sc3.image_data
+                                FROM screen_captures sc3
+                                WHERE sc3.exam_id = ?
+                                  AND sc3.student_id = active.student_id
+                                ORDER BY sc3.id DESC
+                                LIMIT 1
+                            ) AS snapshot,
+                            (
+                                SELECT sc4.captured_at
+                                FROM screen_captures sc4
+                                WHERE sc4.exam_id = ?
+                                  AND sc4.student_id = active.student_id
+                                ORDER BY sc4.id DESC
+                                LIMIT 1
+                            ) AS latest_snapshot_at,
                             SUBSTRING_INDEX(GROUP_CONCAT(es.status ORDER BY es.id DESC SEPARATOR '||'), '||', 1) AS submission_status,
                             MAX(CASE
                                 WHEN COALESCE(es.submitted, 0) = 1
@@ -1042,7 +1058,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         )
                         GROUP BY active.student_id
                     ");
-                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId]);
+                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId]);
                     echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -6622,8 +6638,8 @@ function createCourseTable($courseCode)
     /* Proctoring Grid Styles */
     .student-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
-        gap: 24px;
+        grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+        gap: 16px;
         margin-top: 20px;
     }
 
@@ -6644,7 +6660,9 @@ function createCourseTable($courseCode)
     .screen-preview-container {
         position: relative;
         background: #1e1e1e;
-        height: 220px;
+        aspect-ratio: 16 / 9;
+        height: auto;
+        min-height: 170px;
         overflow: hidden;
     }
 
@@ -18617,6 +18635,8 @@ function createCourseTable($courseCode)
                         status: session ? 'active' : 'offline',
                         violationCount: session ? parseInt(session.violations || 0) : 0,
                         lastActivity: session ? session.last_activity : null,
+                        snapshot: session ? (session.snapshot || '') : '',
+                        latestSnapshotAt: session ? (session.latest_snapshot_at || '') : '',
                         screenLocked: session ? !!parseInt(session.screen_locked || 0) : false,
                         isSubmitted: isSubmittedProctorRecord(session),
                         submissionStatus: session ? (session.submission_status || '') : '',
@@ -18657,7 +18677,7 @@ function createCourseTable($courseCode)
                 'N/A';
 
             return `
-            <div class="student-proctor-card" data-student-id="${student.id}" style="
+            <div class="student-proctor-card" id="proctorCard_${student.id}" data-student-id="${student.id}" style="
                 background: var(--panel);
                 border-radius: 16px;
                 overflow: hidden;
@@ -18669,7 +18689,8 @@ function createCourseTable($courseCode)
                 <div class="screen-preview-container" style="
                     position: relative;
                     background: #1e1e1e;
-                    height: 220px;
+                    aspect-ratio: 16 / 9;
+                    min-height: 170px;
                     overflow: hidden;
                 ">
                     <div id="screenPreview_${student.id}" style="
@@ -18689,7 +18710,7 @@ function createCourseTable($courseCode)
                                 <small>${escapeHTML(student.full_name || 'Student')}</small>
                         </div>
                     </div>
-                    ${sharingStatus ? '<div class="live-badge" style="position: absolute; top: 10px; right: 10px; background: #ef4444; color: white; padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: 600;"><i class="fas fa-circle" style="font-size: 8px; margin-right: 4px;"></i> LIVE</div>' : ''}
+                    <div id="liveBadge_${student.id}" class="live-badge" style="position: absolute; top: 10px; right: 10px; background: #ef4444; color: white; padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; ${sharingStatus ? '' : 'display:none;'}"><i class="fas fa-circle" style="font-size: 8px; margin-right: 4px;"></i> LIVE</div>
                     ${student.screenLocked ? '<div style="position:absolute;bottom:10px;right:10px;background:#111827;color:#fbbf24;border:1px solid #fbbf24;padding:5px 9px;border-radius:8px;font-size:11px;font-weight:800;"><i class="fas fa-lock"></i> LOCKED</div>' : ''}
                     ${student.violationCount > 0 ? `<div class="violation-badge" style="position: absolute; top: 10px; left: 10px; background: #ef4444; color: white; padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: 600;"><i class="fas fa-exclamation-triangle"></i> ${student.violationCount}</div>` : ''}
                 </div>
@@ -18701,7 +18722,7 @@ function createCourseTable($courseCode)
                             <strong style="font-size: 16px; color: var(--text);">${escapeHTML(student.full_name)}</strong>
                             <div style="font-size: 12px; color: var(--muted); margin-top: 2px;">ID: ${escapeHTML(student.student_id)}</div>
                         </div>
-                        <span class="tag" style="background: ${statusColor}; color: white;">
+                        <span class="tag" id="screenStatusTag_${student.id}" style="background: ${statusColor}; color: white;">
                             <i class="fas ${sharingStatus ? 'fa-desktop' : 'fa-eye-slash'}"></i> ${statusText}
                         </span>
                     </div>
@@ -18804,6 +18825,8 @@ function createCourseTable($courseCode)
                         student.status = student.screenSharing ? 'active' : student.status;
                         student.lastActivity = update.captured_at || student.lastActivity;
                         student.violationCount = parseInt(update.violations || student.violationCount || 0);
+                        student.snapshot = update.snapshot || student.snapshot || '';
+                        updateProctorCardLiveState(student);
                     }
                     const screenImg = document.getElementById(`screenImg_${update.student_id}`);
                     if (screenImg && update.snapshot) {
@@ -18842,6 +18865,33 @@ function createCourseTable($courseCode)
             }
         } catch (error) {
             console.error('Error fetching screen updates:', error);
+        }
+    }
+
+    function updateProctorCardLiveState(student) {
+        const card = document.getElementById(`proctorCard_${student.id}`);
+        const statusTag = document.getElementById(`screenStatusTag_${student.id}`);
+        const liveBadge = document.getElementById(`liveBadge_${student.id}`);
+        const placeholder = document.getElementById(`screenPlaceholder_${student.id}`);
+        const screenImg = document.getElementById(`screenImg_${student.id}`);
+        const isSharing = !!student.screenSharing;
+
+        if (card) {
+            card.style.border = `2px solid ${isSharing ? '#10b981' : '#ef4444'}`;
+        }
+        if (statusTag) {
+            statusTag.style.background = isSharing ? '#10b981' : '#ef4444';
+            statusTag.innerHTML = `<i class="fas ${isSharing ? 'fa-desktop' : 'fa-eye-slash'}"></i> ${isSharing ? 'Sharing Screen' : 'Not Sharing'}`;
+        }
+        if (liveBadge) {
+            liveBadge.style.display = isSharing ? 'block' : 'none';
+        }
+        if (screenImg && student.snapshot) {
+            screenImg.src = `data:image/jpeg;base64,${student.snapshot}`;
+            screenImg.style.display = 'block';
+        }
+        if (placeholder && student.snapshot) {
+            placeholder.style.display = 'none';
         }
     }
 
