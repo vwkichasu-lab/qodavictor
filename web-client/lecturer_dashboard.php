@@ -13820,6 +13820,10 @@ SELECT * FROM table_name;`
                     semester,
                     level: examDetail.level || 'N/A',
                     academicYear: examDetail.academic_year || '',
+                    programme: examDetail.programme || examDetail.department || 'BIT',
+                    schoolType: examDetail.school_type || examDetail.school || 'Weekend',
+                    schoolName: examDetail.school_name || 'PENTECOST UNIVERSITY',
+                    intake: examDetail.intake || '0',
                     examIds: [],
                     submissions: []
                 };
@@ -13885,31 +13889,10 @@ SELECT * FROM table_name;`
     function renderCourseResultSheet(group) {
         const safeSheetName = `${group.courseName}_${group.courseCode}_${group.semester}`.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 31);
         const keyToken = encodeURIComponent(group.key);
-        const rows = group.submissions.map((result, index) => {
-            const gradeInfo = getGradeInfo(result.totalScore);
-            const gradeClass = gradeInfo.class || 'grade-e';
-            const scoreColor = result.totalScore >= 70 ? '#10b981' : (result.totalScore >= 50 ? '#f59e0b' : '#ef4444');
-            return `
-                <tr data-submission-id="${result.id}">
-                    <td style="border: 1px solid #000; padding: 10px; text-align: center;">${index + 1}</td>
-                    <td style="border: 1px solid #000; padding: 10px; text-align: center;"><code style="background: #f5f5f5; padding: 4px 8px; border-radius: 4px;">${escapeHTML(result.studentId)}</code></td>
-                    <td style="border: 1px solid #000; padding: 10px;"><strong>${escapeHTML(result.studentName)}</strong></td>
-                    <td style="border: 1px solid #000; padding: 10px; text-align: center;"><strong style="color: #f59e0b;">${result.classScore}</strong></td>
-                    <td style="border: 1px solid #000; padding: 10px; text-align: center;"><strong>${result.examScore}</strong></td>
-                    <td style="border: 1px solid #000; padding: 10px; text-align: center;"><strong style="font-size: 18px; color: ${scoreColor};">${result.totalScore}</strong></td>
-                    <td style="border: 1px solid #000; padding: 10px; text-align: center;"><span class="tag ${gradeClass}">${escapeHTML(result.grade)}</span></td>
-                    <td style="border: 1px solid #000; padding: 10px; text-align: center;"><strong>${Number(result.gradePoint || 0).toFixed(1)}</strong></td>
-                    <td class="result-actions" style="border: 1px solid #000; padding: 10px; text-align: center; white-space: nowrap;">
-                        <button class="btn primary small" onclick="openQuestionReview(${result.id})"><i class="fas fa-eye"></i> Review</button>
-                        <button class="btn danger small" onclick="deleteStudentSubmission(${result.id})"><i class="fas fa-trash"></i> Delete</button>
-                    </td>
-                </tr>
-            `;
-        }).join('');
 
         return `
             <section class="course-score-sheet" data-result-key="${escapeHTML(group.key)}" data-sheet-name="${escapeHTML(safeSheetName)}" style="margin-bottom: 32px;">
-                <div style="background: linear-gradient(135deg, #1e3a5f, #3b82f6); color: white; border-radius: 16px; padding: 20px; margin-bottom: 16px;">
+                <div class="result-sheet-actions" style="background: linear-gradient(135deg, #1e3a5f, #3b82f6); color: white; border-radius: 16px; padding: 20px; margin-bottom: 16px;">
                     <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap;">
                         <div>
                             <h2 style="margin: 0 0 8px 0;">${escapeHTML(group.courseName)}</h2>
@@ -13925,25 +13908,210 @@ SELECT * FROM table_name;`
                         </div>
                     </div>
                 </div>
-                <div style="overflow-x: auto; border-radius: 12px; border: 1px solid #000; background: white;">
-                    <table class="course-result-table" style="width: 100%; border-collapse: collapse; font-family: Arial, sans-serif;">
-                        <thead>
-                            <tr style="background-color: #f0f0f0;">
-                                <th style="border: 1px solid #000; padding: 12px; text-align: center;">S/N</th>
-                                <th style="border: 1px solid #000; padding: 12px; text-align: center;">STUDENT ID</th>
-                                <th style="border: 1px solid #000; padding: 12px; text-align: center;">STUDENT NAME</th>
-                                <th style="border: 1px solid #000; padding: 12px; text-align: center;">CLASS SCORE (40)</th>
-                                <th style="border: 1px solid #000; padding: 12px; text-align: center;">EXAM SCORE (60)</th>
-                                <th style="border: 1px solid #000; padding: 12px; text-align: center;">TOTAL SCORE (100)</th>
-                                <th style="border: 1px solid #000; padding: 12px; text-align: center;">GRADE</th>
-                                <th style="border: 1px solid #000; padding: 12px; text-align: center;">GP</th>
-                                <th style="border: 1px solid #000; padding: 12px; text-align: center;">ACTIONS</th>
-                            </tr>
-                        </thead>
-                        <tbody>${rows}</tbody>
-                    </table>
-                </div>
+                ${renderPuScoreSheetTemplate(group, true)}
             </section>
+        `;
+    }
+
+    function normalizePuSemester(semester) {
+        const value = String(semester || '').toLowerCase();
+        if (value.includes('first') || value === '1') return '1';
+        if (value.includes('second') || value === '2') return '2';
+        return String(semester || '');
+    }
+
+    function getTemplateGrade(result) {
+        if (Number(result.classScore || 0) === 0 && Number(result.examScore || 0) === 0 && Number(result.totalScore || 0) === 0) {
+            return 'X';
+        }
+        return result.grade || getGradeInfo(result.totalScore).grade;
+    }
+
+    function getGradeRemark(grade) {
+        const remarks = {
+            A: 'Excellent',
+            'B+': 'Very Good',
+            B: 'Good',
+            'C+': 'Average',
+            C: 'Fair',
+            'D+': 'Barely Satisfactory',
+            D: 'Weak Pass',
+            E: 'Fail',
+            X: 'Absent'
+        };
+        return remarks[grade] || '';
+    }
+
+    function buildGradeAnalysis(group) {
+        const counts = {};
+        group.submissions.forEach(result => {
+            const grade = getTemplateGrade(result);
+            counts[grade] = (counts[grade] || 0) + 1;
+        });
+        const order = ['D+', 'B', 'A', 'B+', 'X', 'C+', 'C', 'D', 'E'];
+        return order
+            .filter(grade => counts[grade])
+            .map(grade => ({
+                grade,
+                count: counts[grade],
+                percentage: group.submissions.length > 0 ? ((counts[grade] / group.submissions.length) * 100).toFixed(1) : '0.0',
+                remark: getGradeRemark(grade)
+            }));
+    }
+
+    function renderPuScoreSheetTemplate(group, includeActions = false) {
+        const rows = group.submissions.map((result, index) => {
+            const grade = getTemplateGrade(result);
+            return `
+                <tr data-submission-id="${result.id}">
+                    <td>${index + 1}</td>
+                    <td>${escapeHTML(result.studentId)}</td>
+                    <td class="student-name-cell">${escapeHTML(result.studentName)}</td>
+                    <td>${result.classScore}</td>
+                    <td>${result.examScore}</td>
+                    <td>${result.totalScore}</td>
+                    <td>${escapeHTML(grade)}</td>
+                    ${includeActions ? `<td class="result-actions no-print"><button class="btn primary small" onclick="openQuestionReview(${result.id})"><i class="fas fa-eye"></i> Review</button> <button class="btn danger small" onclick="deleteStudentSubmission(${result.id})"><i class="fas fa-trash"></i> Delete</button></td>` : ''}
+                </tr>
+            `;
+        }).join('');
+
+        const gradeRows = buildGradeAnalysis(group).map(item => `
+            <tr>
+                <td>${escapeHTML(item.grade)}</td>
+                <td>${item.count}</td>
+                <td>${item.percentage}</td>
+                <td class="remark-cell">${escapeHTML(item.remark)}</td>
+            </tr>
+        `).join('');
+
+        return `
+            <div class="pu-score-template">
+                <style>
+                    .pu-score-template {
+                        background: #fff;
+                        color: #000;
+                        font-family: Arial, Helvetica, sans-serif;
+                        width: 100%;
+                        max-width: 1180px;
+                        margin: 0 auto;
+                        padding: 16px 20px;
+                        overflow-x: auto;
+                    }
+                    .pu-score-template .score-title {
+                        text-align: center;
+                        font-weight: 700;
+                        line-height: 1.22;
+                    }
+                    .pu-score-template .score-title h1 {
+                        font-size: 18px;
+                        margin: 0 0 4px;
+                        letter-spacing: 0;
+                    }
+                    .pu-score-template .score-title h2 {
+                        font-size: 16px;
+                        margin: 0 0 6px;
+                        letter-spacing: 0;
+                    }
+                    .pu-score-template .score-meta {
+                        text-align: center;
+                        font-size: 12px;
+                        line-height: 1.35;
+                        margin-bottom: 8px;
+                    }
+                    .pu-score-template table {
+                        border-collapse: collapse;
+                        width: 100%;
+                        font-size: 11px;
+                    }
+                    .pu-score-template th,
+                    .pu-score-template td {
+                        border: 1px solid #111;
+                        padding: 4px 5px;
+                        text-align: center;
+                        vertical-align: middle;
+                    }
+                    .pu-score-template th {
+                        font-weight: 700;
+                        background: #fff;
+                    }
+                    .pu-score-template .student-name-cell,
+                    .pu-score-template .remark-cell {
+                        text-align: left;
+                    }
+                    .pu-score-template .main-score-table .col-no { width: 34px; }
+                    .pu-score-template .main-score-table .col-student-no { width: 118px; }
+                    .pu-score-template .main-score-table .col-name { min-width: 245px; }
+                    .pu-score-template .main-score-table .col-score { width: 78px; }
+                    .pu-score-template .grade-analysis-title {
+                        font-size: 12px;
+                        font-weight: 700;
+                        margin: 12px 0 4px;
+                    }
+                    .pu-score-template .grade-analysis-table {
+                        width: 430px;
+                        max-width: 100%;
+                    }
+                    .pu-score-template .result-actions {
+                        min-width: 150px;
+                        white-space: nowrap;
+                    }
+                    @media print {
+                        @page { size: A4 landscape; margin: 9mm; }
+                        body { background: #fff !important; }
+                        .no-print, .result-sheet-actions, .result-actions { display: none !important; }
+                        .pu-score-template {
+                            max-width: none;
+                            padding: 0;
+                            overflow: visible;
+                        }
+                        .pu-score-template table { font-size: 10.5px; }
+                        .pu-score-template th,
+                        .pu-score-template td { padding: 3px 4px; }
+                    }
+                </style>
+                <div class="score-title">
+                    <h1>${escapeHTML(String(group.schoolName || 'PENTECOST UNIVERSITY').toUpperCase())}</h1>
+                    <h2>SCORE SHEET</h2>
+                </div>
+                <div class="score-meta">
+                    <div><strong>${escapeHTML(group.programme || 'BIT')}&nbsp;-&nbsp;${escapeHTML(group.schoolType || 'Weekend')}</strong></div>
+                    <div>
+                        Level ${escapeHTML(group.level || '')}&nbsp;&nbsp;
+                        Semester ${escapeHTML(normalizePuSemester(group.semester))}&nbsp;&nbsp;
+                        ${escapeHTML(group.academicYear || '')}&nbsp;&nbsp;
+                        Intake: ${escapeHTML(group.intake || '0')}
+                    </div>
+                    <div><strong>${escapeHTML(group.courseName)} - ${escapeHTML(group.courseCode)}</strong></div>
+                </div>
+                <table class="main-score-table">
+                    <thead>
+                        <tr>
+                            <th class="col-no">No</th>
+                            <th class="col-student-no">Student No</th>
+                            <th class="col-name">Student Name</th>
+                            <th class="col-score">Class<br>Score<br>40</th>
+                            <th class="col-score">Exam<br>Score<br>60</th>
+                            <th class="col-score">Total<br>Score<br>100</th>
+                            <th class="col-score">Grade</th>
+                            ${includeActions ? '<th class="result-actions no-print">Actions</th>' : ''}
+                        </tr>
+                    </thead>
+                    <tbody>${rows}</tbody>
+                </table>
+                <div class="grade-analysis-title">GRADE ANALYSIS</div>
+                <table class="grade-analysis-table">
+                    <thead>
+                        <tr>
+                            <th>Grade</th>
+                            <th>No. of Students</th>
+                            <th>Percentage(%)</th>
+                            <th>Remark</th>
+                        </tr>
+                    </thead>
+                    <tbody>${gradeRows}</tbody>
+                </table>
+            </div>
         `;
     }
 
@@ -13968,18 +14136,61 @@ SELECT * FROM table_name;`
 
     function exportCourseResultsToExcel(groupKey) {
         const group = getResultGroup(groupKey);
-        const sheet = getResultSheetElement(groupKey);
-        if (!group || !sheet) {
+        if (!group) {
             toast('No score sheet to export');
             return;
         }
 
-        const table = sheet.querySelector('table').cloneNode(true);
-        table.querySelectorAll('.result-actions').forEach(cell => cell.remove());
-        table.querySelectorAll('thead tr').forEach(row => row.lastElementChild?.remove());
+        const gradeAnalysis = buildGradeAnalysis(group);
+        const rows = [
+            [String(group.schoolName || 'PENTECOST UNIVERSITY').toUpperCase()],
+            ['SCORE SHEET'],
+            [`${group.programme || 'BIT'} - ${group.schoolType || 'Weekend'}`],
+            [`Level ${group.level || ''}`, `Semester ${normalizePuSemester(group.semester)}`, group.academicYear || '', `Intake: ${group.intake || '0'}`],
+            [`${group.courseName} - ${group.courseCode}`],
+            [],
+            ['No', 'Student No', 'Student Name', 'Class Score 40', 'Exam Score 60', 'Total Score 100', 'Grade']
+        ];
+
+        group.submissions.forEach((result, index) => {
+            rows.push([
+                index + 1,
+                result.studentId,
+                result.studentName,
+                result.classScore,
+                result.examScore,
+                result.totalScore,
+                getTemplateGrade(result)
+            ]);
+        });
+
+        rows.push([]);
+        rows.push(['GRADE ANALYSIS']);
+        rows.push(['Grade', 'No. of Students', 'Percentage(%)', 'Remark']);
+        gradeAnalysis.forEach(item => {
+            rows.push([item.grade, item.count, item.percentage, item.remark]);
+        });
+
         const wb = XLSX.utils.book_new();
-        const ws = XLSX.utils.table_to_sheet(table, { raw: true });
-        XLSX.utils.book_append_sheet(wb, ws, (sheet.dataset.sheetName || 'ScoreSheet').slice(0, 31));
+        const ws = XLSX.utils.aoa_to_sheet(rows);
+        ws['!cols'] = [
+            { wch: 6 },
+            { wch: 18 },
+            { wch: 36 },
+            { wch: 14 },
+            { wch: 14 },
+            { wch: 15 },
+            { wch: 10 }
+        ];
+        ws['!merges'] = [
+            { s: { r: 0, c: 0 }, e: { r: 0, c: 6 } },
+            { s: { r: 1, c: 0 }, e: { r: 1, c: 6 } },
+            { s: { r: 2, c: 0 }, e: { r: 2, c: 6 } },
+            { s: { r: 4, c: 0 }, e: { r: 4, c: 6 } },
+            { s: { r: rows.length - gradeAnalysis.length - 2, c: 0 }, e: { r: rows.length - gradeAnalysis.length - 2, c: 3 } }
+        ];
+        const sheetName = `${group.courseName}_${group.courseCode}_${group.semester}`.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 31) || 'ScoreSheet';
+        XLSX.utils.book_append_sheet(wb, ws, sheetName);
         const filename = `${group.courseCode}_${group.semester}_scoresheet_${new Date().toISOString().slice(0, 10)}.xlsx`.replace(/[^A-Za-z0-9_.-]/g, '_');
         XLSX.writeFile(wb, filename);
         toast(`Exported ${group.courseName} (${group.courseCode}) score sheet`);
@@ -13993,38 +14204,19 @@ SELECT * FROM table_name;`
             return;
         }
 
-        const printContent = sheet.cloneNode(true);
-        printContent.querySelectorAll('.result-sheet-actions, .result-actions').forEach(el => el.remove());
-        printContent.querySelectorAll('thead tr').forEach(row => row.lastElementChild?.remove());
+        const printContent = renderPuScoreSheetTemplate(group, false);
         const printWindow = window.open('', '_blank');
         printWindow.document.write(`
             <html>
                 <head>
                     <title>${escapeHTML(group.courseCode)} ${escapeHTML(group.semester)} Score Sheet</title>
                     <style>
-                        body { font-family: Arial, sans-serif; padding: 20px; }
-                        table { width: 100%; border-collapse: collapse; }
-                        th, td { border: 1px solid #000; padding: 8px; }
-                        th { background: #f0f0f0; }
-                        .tag { padding: 4px 8px; border-radius: 4px; color: white; font-weight: 700; }
-                        .grade-a { background: #10b981; }
-                        .grade-bplus { background: #34d399; }
-                        .grade-b { background: #3b82f6; }
-                        .grade-cplus { background: #f59e0b; }
-                        .grade-c { background: #fbbf24; }
-                        .grade-dplus { background: #f97316; }
-                        .grade-d { background: #ef4444; }
-                        .grade-e { background: #6b7280; }
+                        @page { size: A4 landscape; margin: 9mm; }
+                        body { margin: 0; background: #fff; }
                     </style>
                 </head>
                 <body>
-                    <div style="text-align: center; margin-bottom: 24px;">
-                        <h1>${escapeHTML(group.courseName)}</h1>
-                        <h2>SCORE SHEET</h2>
-                        <p>Course Code: ${escapeHTML(group.courseCode)} | Semester: ${escapeHTML(group.semester)}</p>
-                        <p>Generated: ${new Date().toLocaleString()}</p>
-                    </div>
-                    ${printContent.innerHTML}
+                    ${printContent}
                 </body>
             </html>
         `);
