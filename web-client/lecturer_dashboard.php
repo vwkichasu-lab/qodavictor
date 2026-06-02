@@ -9250,8 +9250,8 @@ function createCourseTable($courseCode)
     ];
 
     const codingLanguagesList = [
-        "C", "C++", "C#", "Java", "Advanced Java", "HTML", "CSS",
-        "JavaScript", "PHP", "VB.NET", "Python", "Linux Bash", "SQL"
+        "Python", "JavaScript", "PHP", "Java", "C", "C++",
+        "C#", "VB.NET", "SQL", "HTML", "CSS"
     ];
 
     const starterCodeTemplates = {

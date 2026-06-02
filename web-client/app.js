@@ -26,8 +26,8 @@ let essaySchemes = [];
 let codingSchemes = [];
 let shortSchemes = [];
 
-// Programming languages
-const programmingLanguages = ["cpp", "c", "java", "python", "javascript", "typescript", "csharp", "php", "ruby", "go", "rust", "swift", "kotlin", "scala", "r", "matlab", "sql", "html", "css", "bash", "perl", "lua", "dart", "julia", "haskell", "clojure", "elixir", "erlang", "groovy", "objectivec", "vbnet", "fsharp", "cobol", "fortran", "pascal", "lisp", "prolog", "assembly", "vhdl", "verilog", "arduino", "racket", "scheme", "ocaml", "smalltalk", "apex", "solidity", "vyper", "move", "cairo"];
+// Programming languages supported by the live compiler/runtime.
+const programmingLanguages = ["python", "javascript", "php", "java", "c", "cpp", "csharp", "vbnet", "sql", "html", "css"];
 
 // PU Grading System
 function calculateGrade(score, total) {
