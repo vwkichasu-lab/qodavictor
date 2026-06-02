@@ -37,4 +37,4 @@ RUN mkdir -p runtime/code-execution uploads web-client/uploads \
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "php -S 0.0.0.0:${PORT:-8080} -t /var/www/html"]
+CMD ["sh", "-c", "php -S 0.0.0.0:${PORT:-8080} -t /var/www/html /var/www/html/server_router.php"]

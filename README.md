@@ -23,6 +23,19 @@ A focused PHP/MySQL system where lecturers create **coding exams** and students 
 - Keep the full project schema updated in `backend-php/database.sql`.
 - When a feature needs a database change, update the SQL file in VS Code and also provide the exact SQL snippet that can be pasted into phpMyAdmin.
 - Use phpMyAdmin for live database updates, then keep `backend-php/database.sql` as the source of truth for fresh installs or resets.
+- Project upgrades should also be added to `database/migrations/` and applied with `php scripts/migrate.php`.
+
+## Upgrade Checks
+
+Before deploying or after pulling updates, run:
+
+```bash
+php scripts/migrate.php
+php scripts/preflight.php
+php scripts/smoke_grade.php
+```
+
+The longer upgrade roadmap is in `PROJECT_UPGRADE_PLAN.md`.
 
 ## Demo accounts (password: `password123`)
 - Lecturer: `lecturer@qoda.test`

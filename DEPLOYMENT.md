@@ -43,6 +43,16 @@ Railway and Render configuration files are included:
 - `railway.json`
 - `render.yaml`
 
+Before deploying an upgrade, run:
+
+```bash
+php scripts/migrate.php
+php scripts/preflight.php
+php scripts/smoke_grade.php
+```
+
+`server_router.php` is used by the Docker start command to block runtime, upload, debug, and repair paths from being served publicly.
+
 For Railway, create a project from the GitHub repo, add a MySQL service, and set:
 
 ```bash

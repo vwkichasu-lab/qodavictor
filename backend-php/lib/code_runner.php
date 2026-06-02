@@ -118,7 +118,12 @@ if (!function_exists('qodaFindExecutable')) {
     function qodaNormalizeProjectFiles(array $postedFiles): array
     {
         $safeFiles = [];
+        $maxFiles = (int)(getenv('QODA_MAX_PROJECT_FILES') ?: 40);
+        $maxFileBytes = (int)(getenv('QODA_MAX_PROJECT_FILE_BYTES') ?: 200000);
         foreach ($postedFiles as $file) {
+            if (count($safeFiles) >= $maxFiles) {
+                break;
+            }
             $name = trim((string)($file['name'] ?? ''));
             if ($name === '') continue;
             $name = str_replace('\\', '/', $name);
@@ -126,9 +131,13 @@ if (!function_exists('qodaFindExecutable')) {
             $name = preg_replace('/[^A-Za-z0-9_\-\.\/]/', '_', $name);
             $name = trim($name, '/');
             if ($name === '') continue;
+            $content = (string)($file['content'] ?? '');
+            if (strlen($content) > $maxFileBytes) {
+                $content = substr($content, 0, $maxFileBytes);
+            }
             $safeFiles[] = [
                 'name' => $name,
-                'content' => (string)($file['content'] ?? ''),
+                'content' => $content,
                 'language' => strtolower((string)($file['language'] ?? '')),
                 'active' => !empty($file['active']),
             ];
@@ -225,6 +234,26 @@ if (!function_exists('qodaFindExecutable')) {
     {
         qodaBootstrapLocalCompilers();
         $language = qodaNormalizeLanguage($language);
+        $maxCodeBytes = (int)(getenv('QODA_MAX_CODE_BYTES') ?: 500000);
+        $maxInputBytes = (int)(getenv('QODA_MAX_INPUT_BYTES') ?: 100000);
+
+        if (strlen($code) > $maxCodeBytes) {
+            return [
+                'success' => false,
+                'ok' => false,
+                'output' => '',
+                'error' => 'Code is too large for the exam runner.',
+            ];
+        }
+
+        if (strlen($input) > $maxInputBytes) {
+            return [
+                'success' => false,
+                'ok' => false,
+                'output' => '',
+                'error' => 'Program input is too large for the exam runner.',
+            ];
+        }
 
         if (trim($code) === '' && empty($postedFiles)) {
             return ['success' => false, 'ok' => false, 'output' => '', 'error' => 'No code received.'];
