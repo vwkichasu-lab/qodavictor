@@ -166,6 +166,28 @@ function dotnetProject(string $tmpBase, string $language, string $code): array
     return $run;
 }
 
+function usesWindowsDesktopGui(string $code): bool
+{
+    return (bool)preg_match('/System\.Windows\.Forms|Application\.Run\s*\(|WindowsForms|<UseWindowsForms>\s*true/i', $code);
+}
+
+function usesJavaDesktopGui(string $code): bool
+{
+    return (bool)preg_match('/javax\.swing|java\.awt|JFrame|JDialog|JWindow|SwingUtilities|Application\.launch\s*\(/i', $code);
+}
+
+function runSqlScript(string $tmpBase, string $code): array
+{
+    $sqlite = findExecutable(['sqlite3', 'C:\\sqlite\\sqlite3.exe']);
+    if (!$sqlite) {
+        return ['ok' => false, 'output' => '', 'error' => 'SQLite is not installed on this server.'];
+    }
+
+    $dbPath = $tmpBase . DIRECTORY_SEPARATOR . 'qoda_sql_workspace.db';
+    $script = ".headers on\n.mode box\n" . $code . "\n";
+    return runProcess('"' . $sqlite . '" "' . $dbPath . '"', $tmpBase, $script, 8);
+}
+
 $code = (string)($_POST['code'] ?? '');
 $language = strtolower(trim((string)($_POST['language'] ?? '')));
 $input = (string)($_POST['input'] ?? '');
@@ -192,6 +214,12 @@ $languageAliases = [
     'vb' => 'vbnet',
     'visualbasic' => 'vbnet',
     'visual-basic' => 'vbnet',
+    'vb.net' => 'vbnet',
+    'mssql' => 'sql',
+    'mysql' => 'sql',
+    'postgres' => 'sql',
+    'postgresql' => 'sql',
+    'sqlite' => 'sql',
 ];
 $language = $languageAliases[$language] ?? $language;
 
@@ -242,6 +270,7 @@ try {
             $javac = findExecutable(['javac', 'C:\\Program Files\\Java\\jdk-21\\bin\\javac.exe', 'C:\\Program Files\\Java\\jdk-25\\bin\\javac.exe']);
             $java = findExecutable(['java', 'C:\\Program Files\\Java\\jdk-21\\bin\\java.exe', 'C:\\Program Files\\Java\\jdk-25\\bin\\java.exe']);
             if (!$javac || !$java) respond(false, '', 'Java JDK is not installed on this server.');
+            $isJavaGui = usesJavaDesktopGui($code);
             $className = publicClassName($code);
             if (!$safeFiles) {
                 $safeFiles[] = ['name' => $className . '.java', 'content' => $code];
@@ -272,6 +301,14 @@ try {
                 $result = $compile;
                 break;
             }
+            if ($isJavaGui) {
+                $result = [
+                    'ok' => true,
+                    'output' => "Java GUI code compiled successfully.\nDesktop JFrame/AWT windows cannot be displayed inside the Railway Linux server. Use the UI tab for web/canvas output, or grade this Java GUI question by source review and screenshots.",
+                    'error' => '',
+                ];
+                break;
+            }
             $result = runProcess('"' . $java . '" -cp "' . $tmpBase . '" ' . $className, $tmpBase, $input, 8);
             break;
 
@@ -296,7 +333,19 @@ try {
 
         case 'csharp':
         case 'vbnet':
+            if (usesWindowsDesktopGui($code)) {
+                $result = [
+                    'ok' => false,
+                    'output' => '',
+                    'error' => 'Windows Forms requires a Windows desktop runtime. This Railway server runs Linux, so C#/VB console apps are supported, but Windows Forms cannot be displayed here.',
+                ];
+                break;
+            }
             $result = dotnetProject($tmpBase, $language, $code);
+            break;
+
+        case 'sql':
+            $result = runSqlScript($tmpBase, $code);
             break;
 
         default:

@@ -2,15 +2,29 @@ FROM php:8.3-cli
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
         default-jdk \
         g++ \
         gcc \
+        gnupg \
+        libsqlite3-dev \
         nodejs \
         npm \
         python3 \
+        sqlite3 \
         unzip \
+        wget \
         zip \
-    && docker-php-ext-install pdo_mysql mysqli \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+        | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg \
+    && chmod go+r /etc/apt/keyrings/microsoft.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" \
+        > /etc/apt/sources.list.d/microsoft-prod.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends dotnet-sdk-8.0 \
+    && docker-php-ext-install pdo_mysql mysqli pdo_sqlite \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /var/www/html

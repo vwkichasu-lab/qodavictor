@@ -3411,7 +3411,7 @@ endif;
                 <iframe id="webPreview" class="web-preview-frame" title="Live Preview" sandbox="allow-same-origin allow-scripts allow-popups allow-forms"></iframe>
                 <div id="uiOutput" class="ui-output-area" style="display:none;">
                     <i class="fas fa-window-maximize" style="font-size:34px;color:#888;"></i>
-                    <span>UI output for JFrame, Window Forms, and graphical programs will appear here when supported by the local runtime.</span>
+                    <span>Desktop GUI windows cannot open inside the cloud exam server. Use Browser for web UI output; Java Swing and Windows Forms are checked as source/compile tasks.</span>
                 </div>
             </div>
         </div>
@@ -3469,7 +3469,8 @@ endif;
             'php': 'php',
             'python': 'py',
             'py': 'py',
-            'vbnet': 'vb'
+            'vbnet': 'vb',
+            'sql': 'sql'
         };
         return extensions[language.toLowerCase()] || 'txt';
     }
@@ -3483,7 +3484,6 @@ endif;
     function preferredOutputTab(language) {
         const lang = String(language || '').toLowerCase();
         if (['html', 'css', 'javascript', 'js', 'php'].includes(lang)) return 'browser';
-        if (['java', 'csharp', 'vbnet'].includes(lang)) return 'ui';
         return 'console';
     }
 
