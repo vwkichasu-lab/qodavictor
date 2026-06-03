@@ -16,6 +16,7 @@ $code = (string)($input['code'] ?? '');
 $language = (string)($input['language'] ?? 'java');
 $files = $input['files'] ?? [];
 $programInput = (string)($input['input'] ?? '');
+$questionText = (string)($input['question_text'] ?? '');
 $testCases = $input['test_cases'] ?? [];
 if (is_string($testCases)) {
     $decoded = json_decode($testCases, true);
@@ -57,6 +58,12 @@ try {
         exit;
     }
 
+    $generatedInput = '';
+    if ($programInput === '') {
+        $generatedInput = qodaInferSampleInput($code, $language, $questionText);
+        $programInput = $generatedInput;
+    }
+
     $run = executeQodaCode($code, $language, $programInput, is_array($files) ? $files : []);
     echo json_encode([
         'success' => !empty($run['success']),
@@ -64,6 +71,8 @@ try {
         'error' => $run['error'] ?? '',
         'execution_time_ms' => $run['execution_time_ms'] ?? null,
         'memory' => 'N/A',
+        'generated_input' => $generatedInput,
+        'input_used' => $programInput,
     ]);
 } catch (Throwable $e) {
     echo json_encode(['success' => false, 'error' => $e->getMessage()]);

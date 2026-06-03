@@ -1310,6 +1310,10 @@ foreach ($questions as $q) {
         const browserFrame = document.getElementById('browserFrame');
         const testCases = getCurrentTestCases();
         const stdin = document.getElementById('programInput')?.value || '';
+        const questionText = currentQuestions[currentQuestionIndex]?.text ||
+            currentQuestions[currentQuestionIndex]?.prompt ||
+            currentQuestions[currentQuestionIndex]?.title ||
+            '';
 
         if (['html', 'css', 'javascript', 'js', 'web'].includes(normalizedLanguage) && testCases.length === 0) {
             const projectFiles = getCurrentProjectFiles();
@@ -1351,14 +1355,21 @@ foreach ($questions as $q) {
                     language: language,
                     input: stdin,
                     test_cases: testCases,
+                    question_text: questionText,
                     files: getCurrentProjectFiles()
                 })
             });
             const data = await response.json();
             const execTime = ((performance.now() - startTime) / 1000).toFixed(2);
+            if (data.generated_input && document.getElementById('programInput')) {
+                document.getElementById('programInput').value = data.generated_input;
+            }
 
             if (data.success) {
                 let outputHtml = `<div style="margin-bottom:12px;"><strong>Program Output:</strong></div>`;
+                if (data.generated_input) {
+                    outputHtml += `<div style="margin-bottom:10px; color:#93c5fd;"><strong>Auto stdin used:</strong><pre style="margin-top:6px; background:#101827; padding:8px; border-radius:6px;">${escapeHtml(data.generated_input.trim())}</pre></div>`;
+                }
                 outputHtml += `<pre style="background:#0f0f1a; padding:12px; border-radius:6px;">${escapeHtml(data.output || 'No output')}</pre>`;
                 if (terminalDiv) terminalDiv.innerHTML = escapeHtml(data.output || 'No terminal output.');
 
@@ -1385,7 +1396,8 @@ foreach ($questions as $q) {
                 document.getElementById('compilationStatus').innerHTML = '<span style="color:#22c55e;">Success ✓</span>';
             } else {
                 const message = data.error || data.output || 'Execution failed.';
-                outputDiv.innerHTML = `<span style="color:#ef4444;">Error:</span><pre style="margin-top:10px;">${escapeHtml(message)}</pre>`;
+                const generatedInputHtml = data.generated_input ? `<div style="margin:8px 0; color:#93c5fd;"><strong>Auto stdin used:</strong><pre style="margin-top:6px; background:#101827; padding:8px; border-radius:6px;">${escapeHtml(data.generated_input.trim())}</pre></div>` : '';
+                outputDiv.innerHTML = `${generatedInputHtml}<span style="color:#ef4444;">Error:</span><pre style="margin-top:10px;">${escapeHtml(message)}</pre>`;
                 if (terminalDiv) terminalDiv.innerHTML = escapeHtml(message);
                 document.getElementById('compilationStatus').innerHTML = '<span style="color:#ef4444;">Failed ✗</span>';
             }
@@ -1401,6 +1413,11 @@ foreach ($questions as $q) {
         const maxMarks = currentQuestions[currentQuestionIndex]?.marks || 20;
         const markingScheme = document.getElementById('markingSchemeText').value;
         const testCases = getCurrentTestCases();
+        const stdin = document.getElementById('programInput')?.value || '';
+        const questionText = currentQuestions[currentQuestionIndex]?.text ||
+            currentQuestions[currentQuestionIndex]?.prompt ||
+            currentQuestions[currentQuestionIndex]?.title ||
+            '';
 
         showModal('Auto Grading in Progress', `
             <div class="progress-bar-container"><div class="progress-fill" id="aiProgressFill"></div></div>
@@ -1429,10 +1446,11 @@ foreach ($questions as $q) {
                     code: code,
                     language: language,
                     test_cases: testCases,
+                    input: stdin,
                     files: getCurrentProjectFiles(),
                     marking_scheme: markingScheme,
                     max_marks: maxMarks,
-                    question_text: <?= json_encode($question_text) ?>
+                    question_text: questionText
                 })
             });
             const data = await response.json();

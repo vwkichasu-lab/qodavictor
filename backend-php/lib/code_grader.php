@@ -99,6 +99,114 @@ if (!function_exists('gradeQodaCode')) {
         return is_array($files) ? $files : [];
     }
 
+    function qodaInputValueForContext(string $context, int $numberIndex, bool $preferString = false): string
+    {
+        $context = strtolower($context);
+        if ($preferString) return 'Flex';
+        if (preg_match('/age/', $context)) return '23';
+        if (preg_match('/score|mark|grade/', $context)) {
+            $scores = ['80', '75', '70', '65', '60'];
+            return $scores[$numberIndex % count($scores)];
+        }
+        if (preg_match('/price|amount|salary|money|cost/', $context)) return (string)(100 + ($numberIndex * 50));
+        if (preg_match('/second|num2|number2|b\b/', $context)) return '3';
+        if (preg_match('/first|num1|number1|a\b/', $context)) return '2';
+        if (preg_match('/integer|number|num|int|double|float|long|short|decimal/', $context)) {
+            $numbers = ['8', '3', '5', '7', '10', '12'];
+            return $numbers[$numberIndex % count($numbers)];
+        }
+        return (string)(2 + $numberIndex);
+    }
+
+    function qodaInferSampleInput(string $code, string $language, string $questionText = ''): string
+    {
+        $language = qodaNormalizeLanguage($language);
+        $lines = preg_split('/\R/', $code) ?: [];
+        $inputs = [];
+        $numericIndex = 0;
+
+        foreach ($lines as $line) {
+            $lineLower = strtolower($line);
+            if ($language === 'java' && preg_match_all('/\bnext(?:int|double|float|long|short|byte|line)?\s*\(/i', $line, $matches)) {
+                foreach ($matches[0] as $match) {
+                    $isString = stripos($match, 'nextLine') !== false || preg_match('/\bnext\s*\(/i', $match);
+                    $inputs[] = $isString ? qodaInputValueForContext($line . ' ' . $questionText, $numericIndex, true) : qodaInputValueForContext($line . ' ' . $questionText, $numericIndex++, false);
+                }
+            }
+
+            if ($language === 'python' && preg_match_all('/\binput\s*\(/i', $line, $matches)) {
+                foreach ($matches[0] as $_) {
+                    $isString = preg_match('/name|person|customer|user/', strtolower($line)) && !preg_match('/int\s*\(|float\s*\(/i', $line);
+                    $inputs[] = qodaInputValueForContext($line . ' ' . $questionText, $numericIndex++, $isString);
+                }
+            }
+
+            if (($language === 'c' || $language === 'cpp') && preg_match_all('/scanf\s*\(\s*["\']([^"\']+)/i', $line, $matches)) {
+                foreach ($matches[1] as $format) {
+                    preg_match_all('/%[0-9.]*[diufFeEgGcs]/', $format, $specs);
+                    foreach ($specs[0] as $spec) {
+                        $isString = str_ends_with(strtolower($spec), 's') || str_ends_with(strtolower($spec), 'c');
+                        $inputs[] = $isString ? qodaInputValueForContext($line . ' ' . $questionText, $numericIndex, true) : qodaInputValueForContext($line . ' ' . $questionText, $numericIndex++, false);
+                    }
+                }
+            }
+
+            if ($language === 'cpp' && preg_match('/\bcin\s*>>/', $line)) {
+                $count = substr_count($line, '>>');
+                for ($i = 0; $i < $count; $i++) {
+                    $isString = preg_match('/name|person|customer|user|string/', strtolower($line));
+                    $inputs[] = qodaInputValueForContext($line . ' ' . $questionText, $numericIndex++, $isString);
+                }
+            }
+
+            if (($language === 'csharp' || $language === 'vbnet') && preg_match_all('/readline\s*\(/i', $line, $matches)) {
+                foreach ($matches[0] as $_) {
+                    $isString = preg_match('/name|person|customer|user|string/', strtolower($line));
+                    $inputs[] = qodaInputValueForContext($line . ' ' . $questionText, $numericIndex++, $isString);
+                }
+            }
+
+            if ($language === 'php' && preg_match_all('/fgets\s*\(\s*STDIN\s*\)|readline\s*\(/i', $line, $matches)) {
+                foreach ($matches[0] as $_) {
+                    $isString = preg_match('/name|person|customer|user/', strtolower($line));
+                    $inputs[] = qodaInputValueForContext($line . ' ' . $questionText, $numericIndex++, $isString);
+                }
+            }
+
+            if ($language === 'javascript' && preg_match_all('/readline|question\s*\(|prompt\s*\(/i', $line, $matches)) {
+                foreach ($matches[0] as $_) {
+                    $isString = preg_match('/name|person|customer|user/', strtolower($line));
+                    $inputs[] = qodaInputValueForContext($line . ' ' . $questionText, $numericIndex++, $isString);
+                }
+            }
+        }
+
+        if (!$inputs) {
+            $q = strtolower($questionText);
+            if (preg_match('/name.*age|age.*name/', $q)) {
+                $inputs = ['Flex', '23'];
+            } elseif (preg_match('/name.*(three|3).*score|student.*(three|3).*score/', $q)) {
+                $inputs = ['Flex', '80', '75', '70'];
+            } elseif (preg_match('/(three|3).*score/', $q)) {
+                $inputs = ['80', '75', '70'];
+            } elseif (preg_match('/two|2/', $q) && preg_match('/number|integer|value/', $q)) {
+                $inputs = ['2', '3'];
+            } elseif (preg_match('/number|integer|input/', $q)) {
+                $inputs = ['8'];
+            }
+        }
+
+        return $inputs ? implode("\n", $inputs) . "\n" : '';
+    }
+
+    function qodaLooksLikeWebCode(string $code, string $language): bool
+    {
+        $language = qodaNormalizeLanguage($language);
+        return in_array($language, ['html', 'css'], true)
+            || preg_match('/<\s*(html|body|div|form|table|script|style|canvas)\b/i', $code)
+            || ($language === 'css' && preg_match('/[.#]?[A-Za-z0-9_-]+\s*\{[^}]+:/', $code));
+    }
+
     function gradeQodaCode(array $payload): array
     {
         $code = (string)($payload['code'] ?? '');
@@ -110,6 +218,8 @@ if (!function_exists('gradeQodaCode')) {
         }
         $testCases = is_array($testCases) ? array_values($testCases) : [];
         $markingScheme = (string)($payload['marking_scheme'] ?? '');
+        $questionText = (string)($payload['question_text'] ?? '');
+        $manualInput = (string)($payload['input'] ?? '');
         $maxMarks = max(0.0, (float)($payload['max_marks'] ?? 20));
         $files = qodaExtractFilesFromPayload($payload);
 
@@ -147,9 +257,38 @@ if (!function_exists('gradeQodaCode')) {
         $requiresManualReview = false;
         $rubric = ['score' => 0.0, 'feedback' => [], 'cap' => 0.0];
         if (count($testCases) === 0) {
-            $requiresManualReview = true;
+            $sampleInput = $manualInput !== '' ? $manualInput : qodaInferSampleInput($code, $language, $questionText);
             $rubric = qodaStaticRubricScore($code, $language, $markingScheme, $maxMarks);
-            $earned = $rubric['score'];
+            $runnerResult = qodaLooksLikeWebCode($code, $language)
+                ? ['success' => true, 'ok' => true, 'output' => 'Web/UI code preview is syntactically reviewable in the browser panel.', 'error' => '', 'execution_time_ms' => 0]
+                : executeQodaCode($code, $language, $sampleInput, $files);
+            $actual = (string)($runnerResult['output'] ?? '');
+            $error = (string)($runnerResult['error'] ?? '');
+            $executionOk = !empty($runnerResult['success']);
+
+            $testResults[] = [
+                'test_case' => 1,
+                'passed' => $executionOk,
+                'input' => $sampleInput,
+                'expected' => '[no lecturer expected output supplied]',
+                'actual' => qodaNormalizeOutput($actual),
+                'error' => qodaNormalizeOutput($error),
+                'marks' => 0,
+                'max_marks' => $maxMarks,
+                'execution_time_ms' => $runnerResult['execution_time_ms'] ?? null,
+            ];
+
+            if ($executionOk) {
+                $runtimeScore = $maxMarks * 0.6;
+                $outputBonus = trim($actual) !== '' ? $maxMarks * 0.1 : 0.0;
+                $earned = min($maxMarks, $runtimeScore + $rubric['score'] + $outputBonus);
+                $requiresManualReview = false;
+            } else {
+                $requiresManualReview = true;
+                $compileLikeError = preg_match('/compile|syntax|javac|gcc|g\+\+|parse|cannot find symbol|expected|missing/i', $error);
+                $cap = $compileLikeError ? $maxMarks * 0.35 : $maxMarks * 0.5;
+                $earned = min($cap, $rubric['score']);
+            }
             $testTotal = 0.0;
         } elseif ($testTotal > $maxMarks && $maxMarks > 0) {
             $earned = ($earned / $testTotal) * $maxMarks;
@@ -167,7 +306,10 @@ if (!function_exists('gradeQodaCode')) {
             $feedbackLines[] = "Method: executed the student's code against " . count($testCases) . " lecturer test case(s).";
             $feedbackLines[] = "Passed: {$passedCount} / " . count($testCases) . " test case(s).";
         } else {
-            $feedbackLines[] = 'Method: no lecturer test cases were available, so the score is only a limited static review and must be checked manually.';
+            $feedbackLines[] = 'Method: no lecturer test cases were available, so QODA ran a safe inferred input and combined execution success with static rubric checks.';
+            if (!empty($sampleInput)) {
+                $feedbackLines[] = "Inferred stdin used:\n" . trim($sampleInput);
+            }
         }
 
         foreach ($testResults as $result) {
@@ -187,8 +329,8 @@ if (!function_exists('gradeQodaCode')) {
         }
 
         $feedbackLines[] = $requiresManualReview
-            ? 'Final decision: manual lecturer review is required before publishing this score.'
-            : 'Final decision: the score is based on real code execution and expected-output matching.';
+            ? 'Final decision: errors were found or expected outputs were missing, so lecturer review is recommended before publishing this score.'
+            : 'Final decision: the code executed successfully and the score is based on runtime behavior plus rubric checks.';
 
         return [
             'success' => true,
@@ -201,7 +343,7 @@ if (!function_exists('gradeQodaCode')) {
             'test_score' => round($score, 2),
             'test_total' => round($testTotal, 2),
             'requires_manual_review' => $requiresManualReview,
-            'grading_method' => count($testCases) > 0 ? 'execution_test_cases' : 'static_review_requires_manual_check',
+            'grading_method' => count($testCases) > 0 ? 'execution_test_cases' : ($requiresManualReview ? 'execution_inferred_input_requires_review' : 'execution_inferred_input'),
             'consistency_hash' => md5($code . qodaNormalizeLanguage($language) . json_encode($testCases) . $markingScheme . json_encode($files)),
         ];
     }

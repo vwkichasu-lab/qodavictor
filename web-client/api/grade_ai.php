@@ -18,7 +18,10 @@ $testCases = $input['test_cases'] ?? [];
 $markingScheme = (string)($input['marking_scheme'] ?? '');
 $files = $input['files'] ?? [];
 $maxMarks = (float)($input['max_marks'] ?? 20);
-$consistencyHash = md5($code . qodaNormalizeLanguage($language) . json_encode($testCases) . $markingScheme . json_encode($files));
+$questionText = (string)($input['question_text'] ?? '');
+$manualInput = (string)($input['input'] ?? '');
+$inferredInput = $manualInput !== '' ? $manualInput : qodaInferSampleInput($code, $language, $questionText);
+$consistencyHash = md5($code . qodaNormalizeLanguage($language) . json_encode($testCases) . $markingScheme . json_encode($files) . $questionText . $inferredInput . 'v2_execution_fallback');
 
 $pdo->exec("
     CREATE TABLE IF NOT EXISTS ai_grading_cache (
