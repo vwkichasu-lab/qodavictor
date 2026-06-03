@@ -1130,6 +1130,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                                (SELECT COUNT(*) FROM suspicious_logs sl WHERE sl.exam_id = sc.exam_id AND sl.student_id = sc.student_id) AS violations
                         FROM screen_captures sc
                         WHERE sc.exam_id = ? AND sc.student_id = ?
+                          AND sc.capture_type = 'live'
                         ORDER BY sc.id DESC
                         LIMIT 1
                     ");
@@ -1143,6 +1144,13 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
             case 'get_violation_evidence':
                 try {
                     $examId = intval($_POST['exam_id'] ?? 0);
+                    $studentId = intval($_POST['student_id'] ?? 0);
+                    $where = "sl.exam_id = ?";
+                    $params = [$examId];
+                    if ($studentId > 0) {
+                        $where .= " AND sl.student_id = ?";
+                        $params[] = $studentId;
+                    }
                     $stmt = $pdo->prepare("
                         SELECT sl.id, sl.student_id, s.student_id AS student_identifier, s.full_name,
                                sl.event_type, sl.details, sl.severity, sl.created_at,
@@ -1157,11 +1165,11 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                                ) AS snapshot
                         FROM suspicious_logs sl
                         LEFT JOIN students s ON s.id = sl.student_id
-                        WHERE sl.exam_id = ?
+                        WHERE {$where}
                         ORDER BY sl.created_at DESC
                         LIMIT 80
                     ");
-                    $stmt->execute([$examId]);
+                    $stmt->execute($params);
                     echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -1236,18 +1244,47 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                 try {
                     $examId = intval($_POST['exam_id'] ?? 0);
                     $studentId = intval($_POST['student_id'] ?? 0);
-                    $stmt = $pdo->prepare("SELECT image_data FROM screen_captures WHERE exam_id = ? AND student_id = ? ORDER BY id DESC LIMIT 1");
+                    $stmt = $pdo->prepare("
+                        SELECT image_data
+                        FROM screen_captures
+                        WHERE exam_id = ?
+                          AND student_id = ?
+                          AND capture_type = 'live'
+                          AND captured_at >= (NOW() - INTERVAL 15 SECOND)
+                        ORDER BY id DESC
+                        LIMIT 1
+                    ");
                     $stmt->execute([$examId, $studentId]);
                     $snapshot = $stmt->fetchColumn();
                     if (!$snapshot) {
-                        echo json_encode(['success' => false, 'error' => 'No screen snapshot available']);
+                        echo json_encode(['success' => false, 'error' => 'No fresh live screen frame is available for this student. Ask the student to share their screen, then try again.']);
                         break;
                     }
-                    $ins = $pdo->prepare("INSERT INTO screen_captures (exam_id, student_id, image_path, image_data, capture_type, notes, captured_at) VALUES (?, ?, '', ?, 'evidence', 'Saved by lecturer from proctoring dashboard', NOW())");
-                    $ins->execute([$examId, $studentId, $snapshot]);
+                    $imagePath = '';
+                    $studentStmt = $pdo->prepare("SELECT student_id FROM students WHERE id = ? LIMIT 1");
+                    $studentStmt->execute([$studentId]);
+                    $studentIdentifier = $studentStmt->fetchColumn() ?: ('student_' . $studentId);
+                    $safeStudentFolder = preg_replace('/[^A-Za-z0-9_-]+/', '_', $studentIdentifier);
+                    $evidenceRoot = dirname(__DIR__) . DIRECTORY_SEPARATOR . 'storage' . DIRECTORY_SEPARATOR . 'proctoring_evidence';
+                    $evidenceDir = $evidenceRoot . DIRECTORY_SEPARATOR . $safeStudentFolder . DIRECTORY_SEPARATOR . 'exam_' . $examId;
+                    if (!is_dir($evidenceDir)) {
+                        @mkdir($evidenceDir, 0775, true);
+                    }
+                    $fileBase = date('Ymd_His') . '_lecturer_shot_' . bin2hex(random_bytes(3));
+                    $absoluteImagePath = $evidenceDir . DIRECTORY_SEPARATOR . $fileBase . '.jpg';
+                    $absoluteNotePath = $evidenceDir . DIRECTORY_SEPARATOR . $fileBase . '.txt';
+                    $binary = base64_decode($snapshot, true);
+                    if ($binary !== false && is_dir($evidenceDir)) {
+                        @file_put_contents($absoluteImagePath, $binary);
+                        $imagePath = 'storage/proctoring_evidence/' . $safeStudentFolder . '/exam_' . $examId . '/' . $fileBase . '.jpg';
+                        $noteText = "Student: {$studentIdentifier}\nExam ID: {$examId}\nCapture type: evidence\nTime: " . date('Y-m-d H:i:s') . "\nReason: Saved by lecturer from proctoring dashboard\n";
+                        @file_put_contents($absoluteNotePath, $noteText);
+                    }
+                    $ins = $pdo->prepare("INSERT INTO screen_captures (exam_id, student_id, image_path, image_data, capture_type, notes, captured_at) VALUES (?, ?, ?, ?, 'evidence', 'Saved by lecturer from proctoring dashboard', NOW())");
+                    $ins->execute([$examId, $studentId, $imagePath, $snapshot]);
                     $log = $pdo->prepare("INSERT INTO suspicious_logs (student_id, exam_id, event_type, details, severity) VALUES (?, ?, 'SCREENSHOT_EVIDENCE', 'Lecturer saved screenshot evidence', 'high')");
                     $log->execute([$studentId, $examId]);
-                    echo json_encode(['success' => true, 'data' => ['snapshot' => $snapshot]]);
+                    echo json_encode(['success' => true, 'data' => ['snapshot' => $snapshot, 'image_path' => $imagePath]]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
                 }
@@ -18548,7 +18585,20 @@ function createCourseTable($courseCode)
         'AUTO_GRADED',
         'MANUALLY_GRADED'
     ]);
+    const PROCTOR_LIVE_FRAME_MAX_AGE_MS = 12000;
     const proctorSubmittedRemovalTimers = {};
+
+    function proctorFrameAgeMs(timestamp) {
+        if (!timestamp) return null;
+        const normalized = String(timestamp).includes('T') ? String(timestamp) : String(timestamp).replace(' ', 'T');
+        const frameTime = new Date(normalized).getTime();
+        return Number.isFinite(frameTime) ? Date.now() - frameTime : null;
+    }
+
+    function isFreshProctorFrame(timestamp) {
+        const ageMs = proctorFrameAgeMs(timestamp);
+        return ageMs !== null && ageMs >= 0 && ageMs <= PROCTOR_LIVE_FRAME_MAX_AGE_MS;
+    }
 
     function isSubmittedProctorRecord(record) {
         if (!record) return false;
@@ -18638,18 +18688,19 @@ function createCourseTable($courseCode)
 
                 activeProctoringStudents = studentsResult.data.map(student => {
                     const session = activeSessions.find(s => s.student_id == student.id);
+                    const hasFreshFrame = !!(session && session.snapshot && isFreshProctorFrame(session.latest_snapshot_at));
                     return {
                         id: student.id,
                         student_id: student.student_id,
                         full_name: student.full_name,
                         level: student.level,
                         programme: student.programme,
-                        screenSharing: session ? parseInt(session.screen_sharing_active || 0) === 1 : false,
-                        status: session ? 'active' : 'offline',
+                        screenSharing: hasFreshFrame && parseInt(session.screen_sharing_active || 0) === 1,
+                        status: hasFreshFrame ? 'active' : 'offline',
                         violationCount: session ? parseInt(session.violations || 0) : 0,
-                        lastActivity: session ? session.last_activity : null,
-                        snapshot: session ? (session.snapshot || '') : '',
-                        snapshotId: session ? (session.snapshot_id || '') : '',
+                        lastActivity: session ? (session.latest_snapshot_at || session.last_activity) : null,
+                        snapshot: hasFreshFrame ? (session.snapshot || '') : '',
+                        snapshotId: hasFreshFrame ? (session.snapshot_id || '') : '',
                         lastRenderedSnapshotId: '',
                         latestSnapshotAt: session ? (session.latest_snapshot_at || '') : '',
                         screenLocked: session ? !!parseInt(session.screen_locked || 0) : false,
@@ -18686,6 +18737,7 @@ function createCourseTable($courseCode)
 
         grid.innerHTML = students.map(student => {
             const sharingStatus = student.screenSharing;
+            const hasFreshFrame = sharingStatus && !!student.snapshot;
             const statusColor = sharingStatus ? '#10b981' : '#ef4444';
             const statusText = sharingStatus ? 'Sharing Screen' : 'Not Sharing';
             const activityTime = student.lastActivity ? new Date(student.lastActivity).toLocaleTimeString() :
@@ -18716,12 +18768,12 @@ function createCourseTable($courseCode)
                         justify-content: center;
                         background: #1e1e1e;
                     ">
-                        <img id="screenImg_${student.id}" src="${student.snapshot ? `data:image/jpeg;base64,${student.snapshot}` : ''}" alt="Screen stream" style="width: 100%; height: 100%; object-fit: contain; ${student.snapshot || sharingStatus ? '' : 'display:none;'}">
-                        <div id="screenPlaceholder_${student.id}" style="text-align: center; color: #666; ${student.snapshot || sharingStatus ? 'display:none;' : ''}">
+                        <img id="screenImg_${student.id}" src="${hasFreshFrame ? `data:image/jpeg;base64,${student.snapshot}` : ''}" alt="Screen stream" style="width: 100%; height: 100%; object-fit: contain; ${hasFreshFrame ? '' : 'display:none;'}">
+                        <div id="screenPlaceholder_${student.id}" style="text-align: center; color: #9ca3af; ${hasFreshFrame ? 'display:none;' : ''}">
                                 <div style="width:72px;height:72px;border-radius:50%;background:linear-gradient(135deg,#2563eb,#14b8a6);display:flex;align-items:center;justify-content:center;margin:0 auto 12px;color:white;font-size:28px;font-weight:800;">
                                     ${escapeHTML((student.full_name || '?').trim().charAt(0).toUpperCase())}
                                 </div>
-                                <p style="margin:0 0 4px;">Screen not shared</p>
+                                <p style="margin:0 0 4px;">${student.latestSnapshotAt ? 'Live feed paused' : 'Screen not shared'}</p>
                                 <small>${escapeHTML(student.full_name || 'Student')}</small>
                         </div>
                     </div>
@@ -18748,21 +18800,24 @@ function createCourseTable($courseCode)
                 </div>
                 
                 <!-- Action Buttons -->
-                <div style="padding: 12px 15px; border-top: 1px solid var(--border); display: flex; gap: 8px;">
-                    <button class="btn small" onclick="event.stopPropagation(); viewFullScreenProctor(${student.id})" style="flex: 1; padding: 6px 12px;">
+                <div style="padding: 12px 15px; border-top: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 8px;">
+                    <button class="btn small" onclick="event.stopPropagation(); viewFullScreenProctor(${student.id})" style="flex: 1 1 120px; padding: 6px 12px;">
                         <i class="fas fa-expand"></i> Full Screen
                     </button>
-                    <button class="btn warn small" onclick="event.stopPropagation(); sendWarningToStudentById(${student.id})" style="flex: 1; padding: 6px 12px;">
+                    <button class="btn warn small" onclick="event.stopPropagation(); sendWarningToStudentById(${student.id})" style="flex: 1 1 120px; padding: 6px 12px;">
                         <i class="fas fa-exclamation-triangle"></i> Warn
                     </button>
-                    <button class="btn danger small" onclick="event.stopPropagation(); lockStudentScreenById(${student.id})" style="flex: 1; padding: 6px 12px;">
+                    <button class="btn danger small" onclick="event.stopPropagation(); lockStudentScreenById(${student.id})" style="flex: 1 1 120px; padding: 6px 12px;">
                         <i class="fas fa-lock"></i> Lock
                     </button>
-                    <button class="btn ok small" onclick="event.stopPropagation(); unlockStudentScreenById(${student.id})" style="flex: 1; padding: 6px 12px;">
+                    <button class="btn ok small" onclick="event.stopPropagation(); unlockStudentScreenById(${student.id})" style="flex: 1 1 120px; padding: 6px 12px;">
                         <i class="fas fa-unlock"></i> Unlock
                     </button>
-                    <button class="btn primary small" onclick="event.stopPropagation(); takeSnapshot(${student.id})" style="flex: 1; padding: 6px 12px;">
+                    <button class="btn primary small" onclick="event.stopPropagation(); takeSnapshot(${student.id})" style="flex: 1 1 120px; padding: 6px 12px;">
                         <i class="fas fa-camera"></i> Shot
+                    </button>
+                    <button class="btn small" onclick="event.stopPropagation(); viewViolationEvidence(${student.id})" style="flex: 1 1 120px; padding: 6px 12px;">
+                        <i class="fas fa-folder-open"></i> Evidence
                     </button>
                 </div>
             </div>
@@ -18835,13 +18890,14 @@ function createCourseTable($courseCode)
 
                     const student = activeProctoringStudents.find(s => String(s.id) === String(update.student_id));
                     if (student) {
-                        const ageMs = update.captured_at ? Date.now() - new Date(update.captured_at).getTime() : 0;
-                        student.screenSharing = !!update.snapshot && (!ageMs || ageMs < 12000);
-                        student.status = student.screenSharing ? 'active' : student.status;
+                        const hasFreshFrame = !!update.snapshot && isFreshProctorFrame(update.captured_at);
+                        student.screenSharing = hasFreshFrame;
+                        student.status = student.screenSharing ? 'active' : 'offline';
                         student.lastActivity = update.captured_at || student.lastActivity;
                         student.violationCount = parseInt(update.violations || student.violationCount || 0);
-                        student.snapshot = update.snapshot || student.snapshot || '';
-                        student.snapshotId = update.snapshot_id || student.snapshotId || '';
+                        student.snapshot = hasFreshFrame ? (update.snapshot || '') : '';
+                        student.snapshotId = hasFreshFrame ? (update.snapshot_id || '') : '';
+                        student.latestSnapshotAt = update.captured_at || student.latestSnapshotAt || '';
                         updateProctorCardLiveState(student);
                     }
 
@@ -18903,6 +18959,7 @@ function createCourseTable($courseCode)
             }
             screenImg.style.display = 'block';
         } else if (screenImg && !isSharing) {
+            screenImg.removeAttribute('src');
             screenImg.style.display = 'none';
         }
         if (placeholder) {
@@ -18938,27 +18995,28 @@ function createCourseTable($courseCode)
         if (violationCountEl) violationCountEl.textContent = violations;
     }
 
-    async function viewViolationEvidence() {
+    async function viewViolationEvidence(studentId = null) {
         if (!currentProctoringExam) {
             toast('Please select an exam first');
             return;
         }
         try {
-            const result = await apiRequest('get_violation_evidence', {
-                exam_id: currentProctoringExam
-            });
+            const payload = { exam_id: currentProctoringExam };
+            if (studentId) payload.student_id = studentId;
+            const result = await apiRequest('get_violation_evidence', payload);
             if (!result.success) {
                 toast('Failed to load evidence');
                 return;
             }
             const rows = result.data || [];
+            const selectedStudent = studentId ? activeProctoringStudents.find(s => String(s.id) === String(studentId)) : null;
             const modal = document.createElement('div');
             modal.className = 'modal';
             modal.style.display = 'flex';
             modal.innerHTML = `
                 <div class="modal-content" style="width:min(1100px,96vw);max-height:90vh;overflow:auto;">
                     <div class="modal-header">
-                        <h3><i class="fas fa-folder-open"></i> Violation Evidence</h3>
+                        <h3><i class="fas fa-folder-open"></i> ${selectedStudent ? `${escapeHTML(selectedStudent.full_name)} Evidence` : 'Violation Evidence'}</h3>
                         <button class="btn" onclick="this.closest('.modal').remove()"><i class="fas fa-times"></i> Close</button>
                     </div>
                     ${rows.length ? `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;">
@@ -19020,9 +19078,14 @@ function createCourseTable($courseCode)
                 contentDiv.innerHTML = `
                 <div style="display: flex; justify-content: center; align-items: center; height: 100%; position: relative;">
                     <div id="fullScreenStreamContainer" style="width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; background: #000;">
-                        <img id="fullScreenImg" src="" alt="Screen stream" style="max-width: 100%; max-height: 100%; object-fit: contain;">
+                        <img id="fullScreenImg" src="" alt="Screen stream" style="max-width: 100%; max-height: 100%; object-fit: contain; display:none;">
+                        <div id="fullScreenPlaceholder" style="text-align:center;color:#9ca3af;padding:30px;">
+                            <i class="fas fa-desktop" style="font-size:44px;margin-bottom:12px;"></i>
+                            <p style="margin:0;font-weight:700;">Waiting for a fresh live screen frame</p>
+                            <small>The student must keep screen sharing active.</small>
+                        </div>
                     </div>
-                    <div class="live-indicator-full" style="position: absolute; top: 20px; right: 20px; background: #ef4444; color: white; padding: 8px 16px; border-radius: 8px; font-weight: 600;">
+                    <div id="fullLiveIndicator" class="live-indicator-full" style="position: absolute; top: 20px; right: 20px; background: #ef4444; color: white; padding: 8px 16px; border-radius: 8px; font-weight: 600; display:none;">
                         <i class="fas fa-circle" style="font-size: 10px; animation: blink 1s infinite;"></i> LIVE STREAM
                     </div>
                 </div>
@@ -19047,10 +19110,20 @@ function createCourseTable($courseCode)
                     exam_id: currentProctoringExam
                 });
 
-                if (result.success && result.data && result.data.snapshot) {
+                const hasFreshFrame = result.success && result.data && result.data.snapshot && isFreshProctorFrame(result.data.captured_at);
+                if (hasFreshFrame) {
                     const fullScreenImg = document.getElementById('fullScreenImg');
+                    const placeholder = document.getElementById('fullScreenPlaceholder');
+                    const liveIndicator = document.getElementById('fullLiveIndicator');
                     if (fullScreenImg) {
                         fullScreenImg.src = `data:image/jpeg;base64,${result.data.snapshot}`;
+                        fullScreenImg.style.display = 'block';
+                    }
+                    if (placeholder) {
+                        placeholder.style.display = 'none';
+                    }
+                    if (liveIndicator) {
+                        liveIndicator.style.display = 'block';
                     }
 
                     // Update violation count if needed
@@ -19073,11 +19146,25 @@ function createCourseTable($courseCode)
                             }
                         }
                     }
+                } else {
+                    const fullScreenImg = document.getElementById('fullScreenImg');
+                    const placeholder = document.getElementById('fullScreenPlaceholder');
+                    const liveIndicator = document.getElementById('fullLiveIndicator');
+                    if (fullScreenImg) {
+                        fullScreenImg.removeAttribute('src');
+                        fullScreenImg.style.display = 'none';
+                    }
+                    if (placeholder) {
+                        placeholder.style.display = 'block';
+                    }
+                    if (liveIndicator) {
+                        liveIndicator.style.display = 'none';
+                    }
                 }
             } catch (error) {
                 console.error('Error fetching student screen:', error);
             }
-        }, 2000);
+        }, 800);
     }
 
     function closeFullScreenProctorModal() {
@@ -19235,6 +19322,8 @@ function createCourseTable($courseCode)
             if (result.success) {
                 toast(`📸 Snapshot captured for student - saved to evidence log`);
 
+                fetchScreenUpdates();
+
                 // Show snapshot preview
                 if (result.data && result.data.snapshot) {
                     const snapshotModal = document.createElement('div');
@@ -19259,7 +19348,7 @@ function createCourseTable($courseCode)
                     }, 5000);
                 }
             } else {
-                toast('❌ Failed to take snapshot');
+                toast('❌ ' + (result.error || 'Failed to take snapshot'));
             }
         } catch (error) {
             toast('❌ Network error');
