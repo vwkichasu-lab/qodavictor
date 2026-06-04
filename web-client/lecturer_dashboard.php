@@ -209,6 +209,42 @@ if (!function_exists('ensureLecturerColumn')) {
     }
 }
 
+if (!function_exists('qodaPruneLiveScreenCaptures')) {
+    function qodaPruneLiveScreenCaptures(PDO $pdo, bool $force = false): void
+    {
+        static $lastRun = 0;
+        if (!$force && time() - $lastRun < 20) {
+            return;
+        }
+        $lastRun = time();
+
+        try {
+            $pdo->exec("
+                DELETE FROM screen_captures
+                WHERE capture_type IN ('live', 'heartbeat')
+                  AND captured_at < (NOW() - INTERVAL 2 MINUTE)
+                ORDER BY captured_at ASC
+                LIMIT 5000
+            ");
+        } catch (Throwable $error) {
+            error_log('Live screen prune failed: ' . $error->getMessage());
+        }
+
+        if ($force) {
+            try {
+                $pdo->exec("
+                    DELETE FROM screen_captures
+                    WHERE capture_type IN ('live', 'heartbeat')
+                    ORDER BY captured_at ASC
+                    LIMIT 5000
+                ");
+            } catch (Throwable $error) {
+                error_log('Forced live screen prune failed: ' . $error->getMessage());
+            }
+        }
+    }
+}
+
 try {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS screen_captures (
@@ -265,21 +301,7 @@ try {
         ALTER TABLE proctor_commands
         MODIFY command_type ENUM('warning', 'lock', 'unlock') NOT NULL
     ");
-    $pdo->exec("
-        CREATE TABLE IF NOT EXISTS proctor_screen_status (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            exam_id INT NOT NULL,
-            student_id INT NOT NULL,
-            sharing_active TINYINT(1) NOT NULL DEFAULT 0,
-            last_heartbeat_at DATETIME NULL,
-            last_frame_at DATETIME NULL,
-            last_status VARCHAR(40) NOT NULL DEFAULT 'offline',
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            UNIQUE KEY uq_exam_student (exam_id, student_id),
-            INDEX idx_heartbeat (last_heartbeat_at),
-            INDEX idx_frame (last_frame_at)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    ");
+    qodaPruneLiveScreenCaptures($pdo, true);
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS exam_question_grading (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -1023,10 +1045,10 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $stmt = $pdo->prepare("
                         SELECT
                             active.student_id,
-                            MAX(COALESCE(pss.last_frame_at, pss.last_heartbeat_at, sc.captured_at, es.updated_at, es.started_at, es.created_at)) AS last_activity,
+                            MAX(COALESCE(live_sc.captured_at, hb_sc.captured_at, es.updated_at, es.started_at, es.created_at)) AS last_activity,
                             CASE
-                                WHEN MAX(CASE WHEN sc.capture_type = 'live' THEN sc.captured_at ELSE NULL END) >= (NOW() - INTERVAL 45 SECOND)
-                                  OR MAX(CASE WHEN COALESCE(pss.sharing_active, 0) = 1 AND pss.last_heartbeat_at >= (NOW() - INTERVAL 15 SECOND) THEN 1 ELSE 0 END) = 1
+                                WHEN MAX(live_sc.captured_at) >= (NOW() - INTERVAL 45 SECOND)
+                                  OR MAX(hb_sc.captured_at) >= (NOW() - INTERVAL 15 SECOND)
                                 THEN 1 ELSE 0
                             END AS screen_sharing_active,
                             COUNT(DISTINCT sl.id) AS violations,
@@ -1073,12 +1095,10 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             SELECT student_id FROM exam_submissions WHERE exam_id = ?
                             UNION
                             SELECT student_id FROM screen_captures WHERE exam_id = ?
-                            UNION
-                            SELECT student_id FROM proctor_screen_status WHERE exam_id = ?
                         ) active
                         LEFT JOIN exam_submissions es ON es.exam_id = ? AND es.student_id = active.student_id
-                        LEFT JOIN screen_captures sc ON sc.exam_id = ? AND sc.student_id = active.student_id
-                        LEFT JOIN proctor_screen_status pss ON pss.exam_id = ? AND pss.student_id = active.student_id
+                        LEFT JOIN screen_captures live_sc ON live_sc.exam_id = ? AND live_sc.student_id = active.student_id AND live_sc.capture_type = 'live'
+                        LEFT JOIN screen_captures hb_sc ON hb_sc.exam_id = ? AND hb_sc.student_id = active.student_id AND hb_sc.capture_type = 'heartbeat'
                         LEFT JOIN suspicious_logs sl ON sl.exam_id = ? AND sl.student_id = active.student_id
                         LEFT JOIN proctor_commands pc ON pc.id = (
                             SELECT pc2.id
@@ -1091,7 +1111,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         )
                         GROUP BY active.student_id
                     ");
-                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId]);
+                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId]);
                     echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -1106,10 +1126,10 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                                sc.id AS snapshot_id,
                                sc.image_data AS snapshot,
                                sc.captured_at,
-                               pss.last_heartbeat_at,
+                               hb.captured_at AS last_heartbeat_at,
                                CASE
                                    WHEN sc.captured_at >= (NOW() - INTERVAL 45 SECOND)
-                                     OR (COALESCE(pss.sharing_active, 0) = 1 AND pss.last_heartbeat_at >= (NOW() - INTERVAL 15 SECOND))
+                                     OR hb.captured_at >= (NOW() - INTERVAL 15 SECOND)
                                    THEN 1 ELSE 0
                                END AS screen_sharing_active,
                                COUNT(DISTINCT sl.id) AS violations,
@@ -1128,8 +1148,6 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             SELECT student_id FROM screen_captures WHERE exam_id = ?
                             UNION
                             SELECT student_id FROM exam_submissions WHERE exam_id = ?
-                            UNION
-                            SELECT student_id FROM proctor_screen_status WHERE exam_id = ?
                         ) active
                         LEFT JOIN screen_captures sc ON sc.id = (
                             SELECT sc2.id
@@ -1141,11 +1159,19 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             LIMIT 1
                         )
                         LEFT JOIN exam_submissions es ON es.exam_id = ? AND es.student_id = active.student_id
-                        LEFT JOIN proctor_screen_status pss ON pss.exam_id = ? AND pss.student_id = active.student_id
+                        LEFT JOIN screen_captures hb ON hb.id = (
+                            SELECT hb2.id
+                            FROM screen_captures hb2
+                            WHERE hb2.exam_id = ?
+                              AND hb2.student_id = active.student_id
+                              AND hb2.capture_type = 'heartbeat'
+                            ORDER BY hb2.id DESC
+                            LIMIT 1
+                        )
                         LEFT JOIN suspicious_logs sl ON sl.exam_id = ? AND sl.student_id = active.student_id
-                        GROUP BY active.student_id, sc.id, sc.image_data, sc.captured_at, pss.sharing_active, pss.last_heartbeat_at
+                        GROUP BY active.student_id, sc.id, sc.image_data, sc.captured_at, hb.captured_at
                     ");
-                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId, $examId]);
+                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId]);
                     echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -1160,10 +1186,10 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         SELECT active.student_id,
                                sc.image_data AS snapshot,
                                sc.captured_at,
-                               pss.last_heartbeat_at,
+                               hb.captured_at AS last_heartbeat_at,
                                CASE
                                    WHEN sc.captured_at >= (NOW() - INTERVAL 45 SECOND)
-                                     OR (COALESCE(pss.sharing_active, 0) = 1 AND pss.last_heartbeat_at >= (NOW() - INTERVAL 15 SECOND))
+                                     OR hb.captured_at >= (NOW() - INTERVAL 15 SECOND)
                                    THEN 1 ELSE 0
                                END AS screen_sharing_active,
                                (SELECT COUNT(*) FROM suspicious_logs sl WHERE sl.exam_id = ? AND sl.student_id = active.student_id) AS violations
@@ -1177,7 +1203,15 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             ORDER BY sc2.id DESC
                             LIMIT 1
                         )
-                        LEFT JOIN proctor_screen_status pss ON pss.exam_id = ? AND pss.student_id = active.student_id
+                        LEFT JOIN screen_captures hb ON hb.id = (
+                            SELECT hb2.id
+                            FROM screen_captures hb2
+                            WHERE hb2.exam_id = ?
+                              AND hb2.student_id = active.student_id
+                              AND hb2.capture_type = 'heartbeat'
+                            ORDER BY hb2.id DESC
+                            LIMIT 1
+                        )
                     ");
                     $stmt->execute([$examId, $studentId, $examId, $examId]);
                     echo json_encode(['success' => true, 'data' => $stmt->fetch(PDO::FETCH_ASSOC)]);

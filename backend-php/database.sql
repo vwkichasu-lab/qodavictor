@@ -755,20 +755,6 @@ CREATE TABLE proctor_commands (
     INDEX idx_created_at (created_at)
 );
 
-CREATE TABLE proctor_screen_status (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    exam_id INT NOT NULL,
-    student_id INT NOT NULL,
-    sharing_active TINYINT(1) NOT NULL DEFAULT 0,
-    last_heartbeat_at DATETIME NULL,
-    last_frame_at DATETIME NULL,
-    last_status VARCHAR(40) NOT NULL DEFAULT 'offline',
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uq_exam_student (exam_id, student_id),
-    INDEX idx_heartbeat (last_heartbeat_at),
-    INDEX idx_frame (last_frame_at)
-);
-
 CREATE TABLE submission_question_scores (
     id INT AUTO_INCREMENT PRIMARY KEY,
     submission_id INT NOT NULL,
@@ -1082,17 +1068,3 @@ CREATE TABLE IF NOT EXISTS proctor_commands (
 
 ALTER TABLE proctor_commands
 MODIFY command_type ENUM('warning', 'lock', 'unlock') NOT NULL;
-
-CREATE TABLE IF NOT EXISTS proctor_screen_status (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    exam_id INT NOT NULL,
-    student_id INT NOT NULL,
-    sharing_active TINYINT(1) NOT NULL DEFAULT 0,
-    last_heartbeat_at DATETIME NULL,
-    last_frame_at DATETIME NULL,
-    last_status VARCHAR(40) NOT NULL DEFAULT 'offline',
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uq_exam_student (exam_id, student_id),
-    INDEX idx_heartbeat (last_heartbeat_at),
-    INDEX idx_frame (last_frame_at)
-);

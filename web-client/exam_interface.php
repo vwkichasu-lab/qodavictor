@@ -41,6 +41,56 @@ function qodaProctorSignature($examId, $studentRowId, $studentIdentifier): strin
     ]), qodaProctorSecret());
 }
 
+function qodaPruneLiveScreenCaptures(PDO $pdo, bool $force = false): void
+{
+    static $lastRun = 0;
+    if (!$force && time() - $lastRun < 20) {
+        return;
+    }
+    $lastRun = time();
+
+    try {
+        $pdo->exec("
+            DELETE FROM screen_captures
+            WHERE capture_type IN ('live', 'heartbeat')
+              AND captured_at < (NOW() - INTERVAL 2 MINUTE)
+            ORDER BY captured_at ASC
+            LIMIT 5000
+        ");
+    } catch (Throwable $error) {
+        error_log('Live screen prune failed: ' . $error->getMessage());
+    }
+
+    if ($force) {
+        try {
+            $pdo->exec("
+                DELETE FROM screen_captures
+                WHERE capture_type IN ('live', 'heartbeat')
+                ORDER BY captured_at ASC
+                LIMIT 5000
+            ");
+        } catch (Throwable $error) {
+            error_log('Forced live screen prune failed: ' . $error->getMessage());
+        }
+    }
+}
+
+function qodaRunProctorStorageSave(PDO $pdo, callable $operation, string $label)
+{
+    try {
+        return $operation();
+    } catch (Throwable $error) {
+        error_log($label . ' failed: ' . $error->getMessage());
+        qodaPruneLiveScreenCaptures($pdo, true);
+        try {
+            return $operation();
+        } catch (Throwable $retryError) {
+            error_log($label . ' retry failed: ' . $retryError->getMessage());
+            throw $retryError;
+        }
+    }
+}
+
 try {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS screen_captures (
@@ -90,21 +140,6 @@ try {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ");
     $pdo->exec("ALTER TABLE proctor_commands MODIFY command_type ENUM('warning', 'lock', 'unlock') NOT NULL");
-    $pdo->exec("
-        CREATE TABLE IF NOT EXISTS proctor_screen_status (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            exam_id INT NOT NULL,
-            student_id INT NOT NULL,
-            sharing_active TINYINT(1) NOT NULL DEFAULT 0,
-            last_heartbeat_at DATETIME NULL,
-            last_frame_at DATETIME NULL,
-            last_status VARCHAR(40) NOT NULL DEFAULT 'offline',
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            UNIQUE KEY uq_exam_student (exam_id, student_id),
-            INDEX idx_heartbeat (last_heartbeat_at),
-            INDEX idx_frame (last_frame_at)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    ");
 } catch (Exception $e) {
     error_log('Exam interface schema upgrade failed: ' . $e->getMessage());
 }
@@ -297,17 +332,39 @@ if (isset($_POST['action'])) {
     if ($_POST['action'] === 'screen_heartbeat') {
         $active = (int)($_POST['active'] ?? 1) === 1 ? 1 : 0;
         $status = $active ? 'sharing' : 'offline';
+        qodaPruneLiveScreenCaptures($pdo);
 
-        $stmt = $pdo->prepare("
-            INSERT INTO proctor_screen_status (exam_id, student_id, sharing_active, last_heartbeat_at, last_status)
-            VALUES (?, ?, ?, NOW(), ?)
-            ON DUPLICATE KEY UPDATE
-                sharing_active = VALUES(sharing_active),
-                last_heartbeat_at = VALUES(last_heartbeat_at),
-                last_status = VALUES(last_status),
-                updated_at = CURRENT_TIMESTAMP
-        ");
-        $stmt->execute([$ajaxExamId, $studentRowId, $active, $status]);
+        try {
+            qodaRunProctorStorageSave($pdo, function () use ($pdo, $ajaxExamId, $studentRowId, $status) {
+            $existingHeartbeat = $pdo->prepare("
+                SELECT id
+                FROM screen_captures
+                WHERE exam_id = ? AND student_id = ? AND capture_type = 'heartbeat'
+                ORDER BY id DESC
+                LIMIT 1
+            ");
+            $existingHeartbeat->execute([$ajaxExamId, $studentRowId]);
+            $heartbeatId = $existingHeartbeat->fetchColumn();
+
+            if ($heartbeatId) {
+                $stmt = $pdo->prepare("
+                    UPDATE screen_captures
+                    SET captured_at = NOW(), notes = ?, image_data = NULL, image_path = ''
+                    WHERE id = ?
+                ");
+                $stmt->execute([$status, $heartbeatId]);
+            } else {
+                $stmt = $pdo->prepare("
+                    INSERT INTO screen_captures (exam_id, student_id, image_path, image_data, capture_type, notes, captured_at)
+                    VALUES (?, ?, '', NULL, 'heartbeat', ?, NOW())
+                ");
+                $stmt->execute([$ajaxExamId, $studentRowId, $status]);
+            }
+            }, 'Screen heartbeat save');
+        } catch (Throwable $heartbeatError) {
+            echo json_encode(['success' => false, 'error' => 'Screen heartbeat could not be saved because proctoring storage is full.']);
+            exit;
+        }
 
         if ($active) {
             $session = $pdo->prepare("SELECT id FROM exam_submissions WHERE exam_id = ? AND student_id = ? LIMIT 1");
@@ -543,23 +600,68 @@ if (isset($_POST['action'])) {
                 @file_put_contents($absoluteNotePath, $noteText);
             }
         }
-        $stmt = $pdo->prepare("
-            INSERT INTO screen_captures (exam_id, student_id, image_path, image_data, capture_type, notes, captured_at)
-            VALUES (?, ?, ?, ?, ?, ?, NOW())
-        ");
-        $stmt->execute([$ajaxExamId, $studentRowId, $imagePath, $snapshot, $captureType, $notes]);
-        $captureId = $pdo->lastInsertId();
-        $status = $pdo->prepare("
-            INSERT INTO proctor_screen_status (exam_id, student_id, sharing_active, last_heartbeat_at, last_frame_at, last_status)
-            VALUES (?, ?, 1, NOW(), NOW(), 'sharing')
-            ON DUPLICATE KEY UPDATE
-                sharing_active = 1,
-                last_heartbeat_at = NOW(),
-                last_frame_at = NOW(),
-                last_status = 'sharing',
-                updated_at = CURRENT_TIMESTAMP
-        ");
-        $status->execute([$ajaxExamId, $studentRowId]);
+        qodaPruneLiveScreenCaptures($pdo);
+        $captureId = null;
+        try {
+            qodaRunProctorStorageSave($pdo, function () use ($pdo, $ajaxExamId, $studentRowId, $captureType, $snapshot, $notes, $imagePath, &$captureId) {
+            if ($captureType === 'live') {
+                $existingLive = $pdo->prepare("
+                    SELECT id
+                    FROM screen_captures
+                    WHERE exam_id = ? AND student_id = ? AND capture_type = 'live'
+                    ORDER BY id DESC
+                    LIMIT 1
+                ");
+                $existingLive->execute([$ajaxExamId, $studentRowId]);
+                $captureId = $existingLive->fetchColumn();
+
+                if ($captureId) {
+                    $stmt = $pdo->prepare("
+                        UPDATE screen_captures
+                        SET image_path = '', image_data = ?, notes = ?, captured_at = NOW()
+                        WHERE id = ?
+                    ");
+                    $stmt->execute([$snapshot, $notes, $captureId]);
+                } else {
+                    $stmt = $pdo->prepare("
+                        INSERT INTO screen_captures (exam_id, student_id, image_path, image_data, capture_type, notes, captured_at)
+                        VALUES (?, ?, '', ?, 'live', ?, NOW())
+                    ");
+                    $stmt->execute([$ajaxExamId, $studentRowId, $snapshot, $notes]);
+                    $captureId = $pdo->lastInsertId();
+                }
+
+                $heartbeat = $pdo->prepare("
+                    SELECT id
+                    FROM screen_captures
+                    WHERE exam_id = ? AND student_id = ? AND capture_type = 'heartbeat'
+                    ORDER BY id DESC
+                    LIMIT 1
+                ");
+                $heartbeat->execute([$ajaxExamId, $studentRowId]);
+                $heartbeatId = $heartbeat->fetchColumn();
+                if ($heartbeatId) {
+                    $pdo->prepare("UPDATE screen_captures SET captured_at = NOW(), notes = 'sharing' WHERE id = ?")
+                        ->execute([$heartbeatId]);
+                } else {
+                    $pdo->prepare("
+                        INSERT INTO screen_captures (exam_id, student_id, image_path, image_data, capture_type, notes, captured_at)
+                        VALUES (?, ?, '', NULL, 'heartbeat', 'sharing', NOW())
+                    ")->execute([$ajaxExamId, $studentRowId]);
+                }
+            } else {
+                $stmt = $pdo->prepare("
+                    INSERT INTO screen_captures (exam_id, student_id, image_path, image_data, capture_type, notes, captured_at)
+                    VALUES (?, ?, ?, ?, ?, ?, NOW())
+                ");
+                $stmt->execute([$ajaxExamId, $studentRowId, $imagePath, $snapshot, $captureType, $notes]);
+                $captureId = $pdo->lastInsertId();
+            }
+            }, 'Screen snapshot save');
+        } catch (Throwable $captureError) {
+            echo json_encode(['success' => false, 'error' => 'Live screen frame could not be saved because proctoring storage is full.']);
+            exit;
+        }
         if ($captureType === 'live') {
             try {
                 $cleanup = $pdo->prepare("
@@ -3115,7 +3217,7 @@ endif;
         screenVideoEl.srcObject = screenStream;
         screenVideoEl.play().catch(() => {});
         if (screenCaptureInterval) clearInterval(screenCaptureInterval);
-        screenCaptureInterval = setInterval(sendScreenSnapshot, 500);
+        screenCaptureInterval = setInterval(sendScreenSnapshot, 1500);
         screenVideoEl.onloadedmetadata = () => sendScreenSnapshot();
         setTimeout(sendScreenSnapshot, 250);
         setTimeout(sendScreenSnapshot, 900);
@@ -3194,15 +3296,15 @@ endif;
         if (!screenSharingActive || !screenCanvasEl) return;
         if (captureType === 'live' && screenSnapshotInFlight) return;
         if (captureType === 'live') screenSnapshotInFlight = true;
-        const frameWidth = captureType === 'live' ? 800 : 1280;
-        const frameHeight = captureType === 'live' ? 450 : 720;
+        const frameWidth = captureType === 'live' ? 640 : 1280;
+        const frameHeight = captureType === 'live' ? 360 : 720;
         const ctx = screenCanvasEl.getContext('2d');
         screenCanvasEl.width = frameWidth;
         screenCanvasEl.height = frameHeight;
         try {
             const drewFrame = await drawScreenFrame(ctx, frameWidth, frameHeight);
             if (!drewFrame) return;
-            const snapshot = screenCanvasEl.toDataURL('image/jpeg', captureType === 'live' ? 0.42 : 0.72);
+            const snapshot = screenCanvasEl.toDataURL('image/jpeg', captureType === 'live' ? 0.34 : 0.72);
             const formData = new FormData();
             formData.append('action', 'screen_snapshot');
             formData.append('exam_id', examId);
