@@ -123,8 +123,9 @@ if (isset($_POST['action'])) {
 
         if ($_POST['action'] === 'finalize_grades') {
             $submissionId = intval($_POST['submission_id'] ?? 0);
-            $totalScore = floatval($_POST['total_score'] ?? 0);
-            $percentage = floatval($_POST['percentage'] ?? 0);
+            $rawTotalScore = max(0, floatval($_POST['total_score'] ?? 0));
+            $percentage = min(100, max(0, floatval($_POST['percentage'] ?? 0)));
+            $examScore60 = min(60, max(0, round(($percentage * 60) / 100)));
             $scores = json_decode($_POST['scores'] ?? '{}', true);
             if (!is_array($scores)) $scores = [];
 
@@ -139,12 +140,25 @@ if (isset($_POST['action'])) {
 
             $answers = json_decode($submission['answers'] ?? '[]', true);
             if (!is_array($answers)) $answers = [];
+            $existingGrading = $answers['grading'] ?? $answers['_grading'] ?? [];
+            $classScore40 = min(40, max(0, round((float)($existingGrading['class_score'] ?? 0))));
+            $finalTotalScore = min(100, max(0, $examScore60 + $classScore40));
             $answers['_scores'] = $scores;
             $answers['_finalized'] = true;
             $answers['_finalized_at'] = date('Y-m-d H:i:s');
             $answers['_finalized_by'] = $_SESSION['user_id'];
             $answers['_exam_percentage'] = $percentage;
-            $answers['_exam_score_60'] = round(($percentage * 60) / 100, 2);
+            $answers['_exam_score_60'] = $examScore60;
+            $answers['grading'] = [
+                'raw_question_score' => $rawTotalScore,
+                'class_score' => $classScore40,
+                'exam_score' => $examScore60,
+                'total_score' => $finalTotalScore,
+                'percentage' => $percentage,
+                'grade' => null,
+                'grade_point' => null,
+                'graded_at' => date('Y-m-d H:i:s')
+            ];
 
             $upd = $pdo->prepare("
                 UPDATE exam_submissions
@@ -158,7 +172,7 @@ if (isset($_POST['action'])) {
                     updated_at = NOW()
                 WHERE id = ?
             ");
-            $upd->execute([json_encode($answers), $totalScore, $totalScore, $percentage, $_SESSION['user_id'], $submissionId]);
+            $upd->execute([json_encode($answers), $finalTotalScore, $rawTotalScore, $percentage, $_SESSION['user_id'], $submissionId]);
 
             echo json_encode(['success' => true]);
             exit;

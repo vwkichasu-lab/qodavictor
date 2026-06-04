@@ -116,6 +116,19 @@ function qodaAnswerCodeAndFiles(array $answer, array $question): array
     return [$code, $files, $language];
 }
 
+function qodaStudentSafeQuestions(array $questions): array
+{
+    return array_map(function ($question) {
+        if (!is_array($question)) return $question;
+        if (!empty($question['testCases']) && is_array($question['testCases'])) {
+            $question['testCases'] = array_values(array_filter($question['testCases'], function ($case) {
+                return empty($case['hidden']);
+            }));
+        }
+        return $question;
+    }, $questions);
+}
+
 function qodaAutoGradeExamAnswers(array $examRow, string $answersJson): array
 {
     $answers = json_decode($answersJson, true);
@@ -150,6 +163,8 @@ function qodaAutoGradeExamAnswers(array $examRow, string $answersJson): array
                 'files' => $files,
                 'test_cases' => $question['testCases'] ?? [],
                 'marking_scheme' => (string)($question['markingScheme'] ?? $examRow['marking_scheme'] ?? ''),
+                'expected_output' => (string)($question['expectedOutput'] ?? ''),
+                'model_solution' => (string)($question['modelSolution'] ?? ''),
                 'question_text' => (string)($question['text'] ?? $question['question_text'] ?? ''),
                 'max_marks' => $maxMarks,
             ]);
@@ -715,7 +730,7 @@ if ($examData) {
     $examData['runtime_status'] = ($startTs && $startTs > $nowTs) ? 'upcoming' : (($endTs && $endTs <= $nowTs) ? 'expired' : 'active');
 }
 $examJson = $examData ? json_encode($examData) : 'null';
-$questionsJson = json_encode($questions);
+$questionsJson = json_encode(qodaStudentSafeQuestions($questions));
 $studentNameJson = json_encode($studentName);
 $studentIdJson = json_encode($studentId);
 $previewJson = json_encode($preview ?? false);
@@ -961,6 +976,36 @@ endif;
 
     .submit-exam-top:hover {
         background: #b91c1c;
+    }
+
+    .exam-top-action {
+        background: transparent;
+        border: 1px solid #4b5563;
+        color: #f9fafb;
+        border-radius: 10px;
+        padding: 9px 12px;
+        font-size: 12px;
+        font-weight: 800;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+    }
+
+    .exam-top-action.save {
+        border-color: #14b8a6;
+        color: #5eead4;
+    }
+
+    body.light .exam-top-action {
+        color: #111827;
+        border-color: #111827;
+        background: #ffffff;
+    }
+
+    body.light .exam-top-action.save {
+        color: #0f766e;
+        border-color: #0f766e;
     }
 
     body.light .submit-exam-top {
@@ -2309,6 +2354,12 @@ endif;
                     class="fas fa-share-alt"></i></button>
             <button class="exam-theme-toggle" id="examThemeToggle" onclick="toggleExamTheme()" title="Toggle theme"><span id="examThemeIcon"
                     aria-hidden="true">&#9790;</span></button>
+            <button class="exam-top-action" onclick="showInstructionsModal()" title="View instructions">
+                <i class="fas fa-list-ol"></i> Instructions
+            </button>
+            <button class="exam-top-action save" onclick="saveCurrentAnswer()" title="Save work">
+                <i class="fas fa-save"></i> Save
+            </button>
             <button class="submit-exam-top" id="submitExamTopBtn" onclick="submitExam(false)" title="Submit exam">
                 <i class="fas fa-paper-plane"></i> Submit Exam
             </button>
@@ -2619,7 +2670,7 @@ endif;
         // Start countdown
         console.log("Starting new timer interval...");
         timerInterval = setInterval(function() {
-            if (timeLeft > 0 && !examLocked) {
+            if (timeLeft > 0) {
                 timeLeft--;
                 localStorage.setItem('exam_timeLeft_' + examId, timeLeft);
                 updateTimerDisplay();
@@ -2671,8 +2722,6 @@ endif;
         examLocked = true;
         screenSharingLocked = true;
 
-        // Stop timer
-        if (timerInterval) clearInterval(timerInterval);
         if (window.forceUpdateInterval) clearInterval(window.forceUpdateInterval);
 
         // Store lock state
@@ -2697,7 +2746,6 @@ endif;
         examLocked = true;
         examLockedByViolation = false;
         screenSharingLocked = true;
-        if (timerInterval) clearInterval(timerInterval);
         localStorage.setItem('screen_locked_' + examId, 'true');
         localStorage.setItem('exam_lock_reason_' + examId, 'lecturer_lock');
         showLockedScreen(message);
@@ -5288,7 +5336,8 @@ endif;
     }
     async function runTestCases() {
         const q = mainQuestions[currentQuestionIndex];
-        if (!q.testCases || q.testCases.length === 0) return;
+        const visibleTestCases = (q.testCases || []).filter(tc => !tc.hidden);
+        if (visibleTestCases.length === 0) return;
 
         const activeFile = openFiles[activeFileIndex];
         if (!activeFile) {
@@ -5305,8 +5354,8 @@ endif;
         let totalMarks = 0;
         let earnedMarks = 0;
 
-        for (let i = 0; i < q.testCases.length; i++) {
-            const tc = q.testCases[i];
+        for (let i = 0; i < visibleTestCases.length; i++) {
+            const tc = visibleTestCases[i];
             consoleOutput.textContent += `\nTest Case ${i + 1}: Input: ${tc.input || '(none)'}\n`;
             consoleOutput.textContent += `Expected: ${tc.expected}\n`;
 
@@ -5349,18 +5398,18 @@ endif;
         }
 
         consoleOutput.textContent += '\n' + '='.repeat(50) + '\n';
-        consoleOutput.textContent += `Test Results: ${passedCount}/${q.testCases.length} passed\n`;
+        consoleOutput.textContent += `Test Results: ${passedCount}/${visibleTestCases.length} passed\n`;
         consoleOutput.textContent += `Score: ${earnedMarks}/${totalMarks} marks\n`;
 
         const resultStatus = document.getElementById('testResultStatus');
         if (resultStatus) {
-            if (passedCount === q.testCases.length) {
+            if (passedCount === visibleTestCases.length) {
                 resultStatus.innerHTML =
                     '<i class="fas fa-check-circle" style="color:#4ec9b0;"></i> All tests passed!';
                 resultStatus.style.color = '#4ec9b0';
             } else {
                 resultStatus.innerHTML =
-                    `<i class="fas fa-times-circle" style="color:#f48771;"></i> ${passedCount}/${q.testCases.length} tests passed`;
+                    `<i class="fas fa-times-circle" style="color:#f48771;"></i> ${passedCount}/${visibleTestCases.length} tests passed`;
                 resultStatus.style.color = '#f48771';
             }
         }
@@ -5469,6 +5518,39 @@ endif;
     // ============================================
     // ANSWER SAVING
     // ============================================
+    function formatStructuredInstructions(text) {
+        const lines = String(text || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+        if (lines.length === 0) return '<p>No instructions were provided for this exam.</p>';
+        const isBulletList = lines.some(line => /^[-*]\s+/.test(line));
+        const tag = isBulletList ? 'ul' : 'ol';
+        const items = lines.map(line => {
+            const clean = line
+                .replace(/^\d+[.)]\s+/, '')
+                .replace(/^[a-zA-Z][.)]\s+/, '')
+                .replace(/^(i|ii|iii|iv|v|vi|vii|viii|ix|x)[.)]\s+/i, '')
+                .replace(/^[-*]\s+/, '');
+            return `<li>${escapeHtml(clean)}</li>`;
+        }).join('');
+        return `<${tag} style="text-align:left;line-height:1.7;margin:0;padding-left:28px;">${items}</${tag}>`;
+    }
+
+    function showInstructionsModal() {
+        const existing = document.getElementById('instructionsModal');
+        if (existing) existing.remove();
+        const modal = document.createElement('div');
+        modal.id = 'instructionsModal';
+        modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:10060;display:flex;align-items:center;justify-content:center;padding:22px;';
+        modal.innerHTML = `
+            <div style="width:min(640px,96vw);max-height:86vh;overflow:auto;background:var(--panel-bg,#252526);color:var(--text,#fff);border:1px solid var(--border,#3e3e42);border-radius:18px;box-shadow:0 30px 80px rgba(0,0,0,.38);padding:28px;">
+                <h2 style="margin:0 0 18px;text-align:center;font-weight:900;letter-spacing:.06em;">INSTRUCTIONS</h2>
+                <div>${formatStructuredInstructions(dbExam?.instructions || '')}</div>
+                <div style="display:flex;justify-content:center;margin-top:24px;">
+                    <button class="submit-exam-top" type="button" onclick="document.getElementById('instructionsModal')?.remove()">Close</button>
+                </div>
+            </div>`;
+        document.body.appendChild(modal);
+    }
+
     function saveCurrentAnswer() {
         saveCurrentAnswerToStorage();
         updateProgress();

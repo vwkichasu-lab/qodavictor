@@ -97,6 +97,26 @@ if (!function_exists('gradeQodaCode')) {
         return ['score' => round(min($earned, $cap), 2), 'feedback' => $notes, 'cap' => round($cap, 2)];
     }
 
+    function qodaModelSolutionSimilarityScore(string $code, string $modelSolution, float $maxMarks): float
+    {
+        $student = strtolower(preg_replace('/\s+/', ' ', trim($code)));
+        $model = strtolower(preg_replace('/\s+/', ' ', trim($modelSolution)));
+        if ($student === '' || $model === '' || $maxMarks <= 0) {
+            return 0.0;
+        }
+
+        similar_text($student, $model, $percent);
+        $studentTokens = array_unique(preg_split('/[^a-z0-9_]+/', $student, -1, PREG_SPLIT_NO_EMPTY));
+        $modelTokens = array_unique(preg_split('/[^a-z0-9_]+/', $model, -1, PREG_SPLIT_NO_EMPTY));
+        $shared = count(array_intersect($studentTokens, $modelTokens));
+        $tokenRatio = count($modelTokens) > 0 ? $shared / count($modelTokens) : 0.0;
+        $similarity = max($percent / 100, $tokenRatio);
+
+        if ($similarity >= 0.75) return $maxMarks * 0.8;
+        if ($similarity >= 0.5) return $maxMarks * 0.55;
+        return $maxMarks * 0.25;
+    }
+
     function qodaExtractFilesFromPayload(array $payload): array
     {
         $files = $payload['files'] ?? [];
@@ -226,6 +246,8 @@ if (!function_exists('gradeQodaCode')) {
         }
         $testCases = is_array($testCases) ? array_values($testCases) : [];
         $markingScheme = (string)($payload['marking_scheme'] ?? '');
+        $expectedOutput = (string)($payload['expected_output'] ?? $payload['expectedOutput'] ?? '');
+        $modelSolution = (string)($payload['model_solution'] ?? $payload['modelSolution'] ?? '');
         $questionText = (string)($payload['question_text'] ?? '');
         $manualInput = (string)($payload['input'] ?? '');
         $maxMarks = max(0.0, (float)($payload['max_marks'] ?? 20));
@@ -279,11 +301,14 @@ if (!function_exists('gradeQodaCode')) {
             $error = (string)($runnerResult['error'] ?? '');
             $executionOk = !empty($runnerResult['success']);
 
+            $expectedLabel = trim($expectedOutput) !== '' ? $expectedOutput : '[no lecturer expected output supplied]';
+            $matchesExpectedOutput = trim($expectedOutput) !== '' && $executionOk && qodaOutputsMatch($actual, $expectedOutput, null);
+
             $testResults[] = [
                 'test_case' => 1,
-                'passed' => $executionOk,
+                'passed' => trim($expectedOutput) !== '' ? $matchesExpectedOutput : $executionOk,
                 'input' => $sampleInput,
-                'expected' => '[no lecturer expected output supplied]',
+                'expected' => qodaNormalizeOutput($expectedLabel),
                 'actual' => qodaNormalizeOutput($actual),
                 'error' => qodaNormalizeOutput($error),
                 'marks' => 0,
@@ -291,7 +316,10 @@ if (!function_exists('gradeQodaCode')) {
                 'execution_time_ms' => $runnerResult['execution_time_ms'] ?? null,
             ];
 
-            if ($executionOk) {
+            if ($matchesExpectedOutput) {
+                $earned = $maxMarks;
+                $requiresManualReview = false;
+            } elseif ($executionOk) {
                 $runtimeScore = $maxMarks * 0.6;
                 $outputBonus = trim($actual) !== '' ? $maxMarks * 0.1 : 0.0;
                 $earned = min($maxMarks, $runtimeScore + $rubric['score'] + $outputBonus);
@@ -308,6 +336,12 @@ if (!function_exists('gradeQodaCode')) {
             $testTotal = $maxMarks;
         }
 
+        if (trim($modelSolution) !== '' && $maxMarks > 0) {
+            $modelScore = qodaModelSolutionSimilarityScore($code, $modelSolution, $maxMarks);
+            $earned = max($earned, min($maxMarks, $modelScore));
+            $rubric['feedback'][] = 'Model solution reference used as an additional similarity check.';
+        }
+
         $score = round(min($maxMarks, max(0.0, $earned)), 2);
         $percentage = $maxMarks > 0 ? round(($score / $maxMarks) * 100, 1) : 0;
         $passedCount = count(array_filter($testResults, fn($r) => !empty($r['passed'])));
@@ -320,6 +354,9 @@ if (!function_exists('gradeQodaCode')) {
             $feedbackLines[] = "Passed: {$passedCount} / " . count($testCases) . " test case(s).";
         } else {
             $feedbackLines[] = 'Method: no lecturer test cases were available, so QODA ran a safe inferred input and combined execution success with static rubric checks.';
+            if (trim($expectedOutput) !== '') {
+                $feedbackLines[] = 'Expected output supplied by lecturer was checked separately from the model solution.';
+            }
             if (!empty($sampleInput)) {
                 $feedbackLines[] = "Inferred stdin used:\n" . trim($sampleInput);
             }
@@ -357,7 +394,7 @@ if (!function_exists('gradeQodaCode')) {
             'test_total' => round($testTotal, 2),
             'requires_manual_review' => $requiresManualReview,
             'grading_method' => count($testCases) > 0 ? 'execution_test_cases' : ($requiresManualReview ? 'execution_inferred_input_requires_review' : 'execution_inferred_input'),
-            'consistency_hash' => md5($code . qodaNormalizeLanguage($language) . json_encode($testCases) . $markingScheme . json_encode($files)),
+            'consistency_hash' => md5($code . qodaNormalizeLanguage($language) . json_encode($testCases) . $markingScheme . $expectedOutput . $modelSolution . json_encode($files)),
         ];
     }
 }

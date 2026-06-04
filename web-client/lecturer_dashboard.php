@@ -1454,10 +1454,9 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                 try {
                     $submissionId = intval($_POST['submission_id'] ?? 0);
                     $status = $_POST['status'] ?? 'GRADED';
-                    // Round to nearest whole number
-                    $totalScore = roundToInt($_POST['total_score'] ?? 0);
-                    $classScore = roundToInt($_POST['class_score'] ?? 0);
-                    $examScore = roundToInt($_POST['exam_score'] ?? 0);
+                    $classScore = min(40, max(0, roundToInt($_POST['class_score'] ?? 0)));
+                    $examScore = min(60, max(0, roundToInt($_POST['exam_score'] ?? 0)));
+                    $totalScore = min(100, max(0, $examScore + $classScore));
                     $grade = $_POST['grade'] ?? '';
                     $gradePoint = round(floatval($_POST['grade_point'] ?? 0), 1);
 
@@ -1498,7 +1497,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $updateStmt->execute([
                         $status,
                         $totalScore,
-                        roundToInt(($totalScore / 100) * 100),
+                        $totalScore,
                         json_encode($answers),
                         $submissionId
                     ]);
@@ -1822,8 +1821,9 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
             case 'update_submission_scores':
                 try {
                     $submissionId = intval($_POST['submission_id'] ?? 0);
-                    $totalScore = floatval($_POST['total_score'] ?? 0);
-                    $percentage = floatval($_POST['percentage'] ?? 0);
+                    $rawTotalScore = max(0, floatval($_POST['total_score'] ?? 0));
+                    $percentage = min(100, max(0, floatval($_POST['percentage'] ?? 0)));
+                    $examScore = min(60, max(0, roundToInt(($percentage * 60) / 100)));
 
                     // Get current submission to update answers
                     $stmt = $pdo->prepare("SELECT answers, student_identifier FROM exam_submissions WHERE id = ?");
@@ -1832,8 +1832,14 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
 
                     if ($submission) {
                         $answers = json_decode($submission['answers'], true) ?? [];
+                        $existingGrading = $answers['grading'] ?? $answers['_grading'] ?? [];
+                        $classScore = min(40, max(0, roundToInt($existingGrading['class_score'] ?? 0)));
+                        $finalTotalScore = min(100, max(0, $examScore + $classScore));
                         $answers['_grading'] = [
-                            'total_score' => $totalScore,
+                            'raw_question_score' => $rawTotalScore,
+                            'class_score' => $classScore,
+                            'exam_score' => $examScore,
+                            'total_score' => $finalTotalScore,
                             'percentage' => $percentage,
                             'graded_at' => date('Y-m-d H:i:s'),
                             'graded_by' => $lecturerId
@@ -1849,7 +1855,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
             ");
 
                         $updateStmt->execute([
-                            $totalScore,
+                            $finalTotalScore,
                             $percentage,
                             json_encode($answers),
                             $submissionId
@@ -7537,6 +7543,47 @@ function createCourseTable($courseCode)
             font-size: 12px;
         }
     }
+    .password-field-wrap {
+        position: relative;
+    }
+
+    .password-field-wrap input {
+        padding-right: 46px;
+    }
+
+    .password-toggle-btn {
+        position: absolute;
+        right: 8px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 34px;
+        height: 34px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--panel);
+        color: var(--text);
+        cursor: pointer;
+    }
+
+    .structured-toolbar {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 6px 0 8px;
+    }
+
+    body.dark input[type="date"]::-webkit-calendar-picker-indicator,
+    body.dark input[type="datetime-local"]::-webkit-calendar-picker-indicator,
+    body.dark input[type="time"]::-webkit-calendar-picker-indicator {
+        filter: invert(1);
+    }
+
+    body:not(.dark) input[type="date"]::-webkit-calendar-picker-indicator,
+    body:not(.dark) input[type="datetime-local"]::-webkit-calendar-picker-indicator,
+    body:not(.dark) input[type="time"]::-webkit-calendar-picker-indicator {
+        filter: invert(0);
+    }
+
     </style>
 </head>
 
@@ -8037,14 +8084,14 @@ function createCourseTable($courseCode)
                             <div class="field required">
                                 <label>⏱️ Duration (minutes) <span class="required-star"></span></label>
                                 <input id="bDuration" type="number" min="1" value="180" placeholder="180"
-                                    onchange="updateExamField('durationMins', parseInt(this.value)); syncEndTimeFromDuration();">
+                                    onchange="updateExamField('durationMins', parseInt(this.value) || 180); syncEndTimeFromDuration();">
                             </div>
 
                             <!-- Start Date/Time -->
                             <div class="field">
                                 <label>📅 Start Date/Time</label>
                                 <input id="bStartAt" type="datetime-local"
-                                    onchange="updateExamField('startAtISO', this.value); syncDurationFromStartEnd(); syncEndTimeFromDuration();">
+                                    onchange="updateExamField('startAtISO', this.value); syncDurationFromStartEnd();">
                                 <small>Leave empty for immediate availability</small>
                             </div>
 
@@ -8058,9 +8105,14 @@ function createCourseTable($courseCode)
                             <!-- Exam Password -->
                             <div class="field">
                                 <label>🔐 Exam Password</label>
-                                <input type="password" id="examPassword" placeholder="Create a password for students"
-                                    autocomplete="new-password"
-                                    onchange="updateExamField('exam_password', this.value)">
+                                <div class="password-field-wrap">
+                                    <input type="password" id="examPassword" placeholder="Create a password for students"
+                                        autocomplete="new-password"
+                                        onchange="updateExamField('exam_password', this.value)">
+                                    <button type="button" class="password-toggle-btn" onclick="toggleExamPasswordVisibility()" aria-label="View password">
+                                        <i id="examPasswordEye" class="fas fa-eye"></i>
+                                    </button>
+                                </div>
                                 <small>Students must enter this password to start the exam (optional)</small>
                             </div>
 
@@ -8078,8 +8130,13 @@ function createCourseTable($courseCode)
                         <!-- Instructions -->
                         <div class="field required">
                             <label>📝 Instructions (visible to students) <span class="required-star"></span></label>
+                            <div class="structured-toolbar">
+                                <button type="button" class="btn small" onclick="insertStructuredLine('bInstructions', 'number')"><i class="fas fa-list-ol"></i> Numbering</button>
+                                <button type="button" class="btn small" onclick="insertStructuredLine('bInstructions', 'bullet')"><i class="fas fa-list-ul"></i> Bullets</button>
+                            </div>
                             <textarea id="bInstructions" rows="3"
                                 placeholder="- Answer ALL questions.&#10;- Each question carries equal marks.&#10;- Time management is important."
+                                onkeydown="handleStructuredTextareaKeydown(event, this, 'instructions')"
                                 onchange="updateExamField('instructions', this.value)"></textarea>
                         </div>
                     </div>
@@ -8197,12 +8254,13 @@ function createCourseTable($courseCode)
                         <div class="field" style="max-width: 360px; margin-bottom: 15px;">
                             <label>Grading Mode</label>
                             <select id="gradingMode" onchange="setGradingMode(this.value)">
-                                <option value="auto">Auto-grading with test cases</option>
-                                <option value="manual">Manual grading only</option>
-                                <option value="hybrid">Hybrid: auto-grading plus lecturer review</option>
+                                <option value="auto">Full Auto-grading</option>
+                                <option value="manual">Full Manual grading</option>
+                                <option value="hybrid">Both Auto and Manual</option>
                             </select>
+                            <small>Auto scores submissions, manual leaves marking to the lecturer, and both auto-scores before lecturer review.</small>
                         </div>
-                        <div style="display: flex; gap: 20px; flex-wrap: wrap;">
+                        <div style="display: none;">
                             <label style="display: flex; align-items: center; gap: 8px;">
                                 <input type="checkbox" id="enableAutoGrading"
                                     onchange="toggleAutoGrading(this.checked)">
@@ -9531,6 +9589,80 @@ function createCourseTable($courseCode)
         });
     }
 
+    function toggleExamPasswordVisibility() {
+        const input = document.getElementById('examPassword');
+        const icon = document.getElementById('examPasswordEye');
+        if (!input) return;
+        const showing = input.type === 'text';
+        input.type = showing ? 'password' : 'text';
+        if (icon) {
+            icon.classList.toggle('fa-eye', showing);
+            icon.classList.toggle('fa-eye-slash', !showing);
+        }
+    }
+
+    function insertStructuredLine(fieldId, mode) {
+        const field = document.getElementById(fieldId);
+        if (!field) return;
+        const value = field.value || '';
+        const lines = value.split('\n');
+        const nextNumber = lines.filter(line => /^\s*\d+[.)]\s+/.test(line)).length + 1;
+        const token = mode === 'bullet' ? '- ' : `${nextNumber}. `;
+        field.value = value ? `${value.replace(/\s*$/, '')}\n${token}` : token;
+        field.focus();
+        field.selectionStart = field.selectionEnd = field.value.length;
+        field.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function insertQuestionStructuredLine(questionId, fieldName, mode) {
+        insertStructuredLine(`questionText_${questionId}`, mode);
+        const field = document.getElementById(`questionText_${questionId}`);
+        if (field) updateQuestion(questionId, fieldName, field.value);
+    }
+
+    function insertQuestionFieldStructuredLine(questionId, fieldName, mode) {
+        insertStructuredLine(`${fieldName}_${questionId}`, mode);
+        const field = document.getElementById(`${fieldName}_${questionId}`);
+        if (field) updateQuestion(questionId, fieldName, field.value);
+    }
+
+    function handleStructuredTextareaKeydown(event, field, examFieldName, questionId = null) {
+        if (event.key !== 'Enter') return;
+        const text = field.value;
+        const cursor = field.selectionStart;
+        const lineStart = text.lastIndexOf('\n', Math.max(0, cursor - 1)) + 1;
+        const currentLine = text.slice(lineStart, cursor);
+        let nextPrefix = '';
+        const numbered = currentLine.match(/^(\s*)(\d+)([.)])\s+/);
+        const bullet = currentLine.match(/^(\s*)[-*]\s+/);
+        const lettered = currentLine.match(/^(\s*)([a-zA-Z])([.)])\s+/);
+        const roman = currentLine.match(/^(\s*)(i|ii|iii|iv|v|vi|vii|viii|ix|x)([.)])\s+/i);
+
+        if (numbered) {
+            nextPrefix = `${numbered[1]}${parseInt(numbered[2], 10) + 1}${numbered[3]} `;
+        } else if (roman) {
+            const romans = ['i', 'ii', 'iii', 'iv', 'v', 'vi', 'vii', 'viii', 'ix', 'x', 'xi', 'xii'];
+            const idx = romans.indexOf(roman[2].toLowerCase());
+            nextPrefix = `${roman[1]}${romans[Math.min(idx + 1, romans.length - 1)]}${roman[3]} `;
+        } else if (lettered) {
+            const next = String.fromCharCode(lettered[2].toLowerCase().charCodeAt(0) + 1);
+            nextPrefix = `${lettered[1]}${next}${lettered[3]} `;
+        } else if (bullet) {
+            nextPrefix = `${bullet[1]}- `;
+        }
+
+        if (!nextPrefix) return;
+        event.preventDefault();
+        field.value = `${text.slice(0, cursor)}\n${nextPrefix}${text.slice(field.selectionEnd)}`;
+        const pos = cursor + 1 + nextPrefix.length;
+        field.selectionStart = field.selectionEnd = pos;
+        if (questionId) {
+            updateQuestion(questionId, examFieldName, field.value);
+        } else {
+            updateExamField(examFieldName, field.value);
+        }
+    }
+
     function showLoading(message) {
         let loader = document.getElementById('globalLoader');
         if (!loader) {
@@ -9636,6 +9768,7 @@ function createCourseTable($courseCode)
                     }
                     return {
                         id: exam.id,
+                        exam_code: exam.exam_code || exam.exam_id || '',
                         title: exam.title || '',
                         courseCode: exam.course_code || '',
                         durationMins: exam.duration_minutes || 180,
@@ -10064,6 +10197,7 @@ function createCourseTable($courseCode)
         const exams = getExams().filter(e => parseInt(e.id) > 0);
         const exam = {
             id: tempId,
+            exam_code: `EX-DRAFT-${Math.abs(tempId)}`,
             title: '',
             courseCode: '',
             durationMins: 180,
@@ -10084,7 +10218,7 @@ function createCourseTable($courseCode)
             exam_type: '',
             school_type: '',
             level: '',
-            auto_grading_enabled: 0,
+            auto_grading_enabled: 1,
             partial_grading_enabled: 0,
             show_correct_answers: 0,
             allow_review: 1
@@ -10349,8 +10483,9 @@ function createCourseTable($courseCode)
 
         const builderCrumb = document.getElementById("builderCrumb");
         if (builderCrumb) {
+            const crumbCode = exam.exam_code || exam.examCode || exam.exam_id || exam.examId || exam.code || exam.id;
             builderCrumb.innerHTML =
-                `Home / Create / Edit / <span style="color:var(--blue);font-weight:600">${exam.title || exam.id}</span>`;
+                `Home / Create / Edit / <span style="color:var(--blue);font-weight:600">${escapeHTML(String(crumbCode || 'Draft'))}</span>`;
         }
 
         console.log("Builder form populated, exam has", exam.questions.length, "questions");
@@ -10414,6 +10549,9 @@ function createCourseTable($courseCode)
 
         try {
             const questionsJSON = JSON.stringify(exam.questions || []);
+            const selectedGradingMode = exam.gradingMode || document.getElementById('gradingMode')?.value || 'auto';
+            const autoGradingEnabled = selectedGradingMode === 'manual' ? 0 : 1;
+            const partialGradingEnabled = selectedGradingMode === 'hybrid' ? 1 : 0;
             console.log("Saving questions:", exam.questions.length, "questions");
 
             if (parseInt(currentExamId) < 0) {
@@ -10428,7 +10566,7 @@ function createCourseTable($courseCode)
                     questions: questionsJSON,
                     questions_to_answer: exam.questionsToAnswer || 0,
                     shuffle_enabled: exam.shuffleEnabled ? 1 : 0,
-                    grading_mode: exam.gradingMode || 'auto',
+                    grading_mode: selectedGradingMode,
                     school_name: exam.school_name || '',
                     faculty_name: exam.faculty_name || '',
                     department: exam.department || '',
@@ -10437,10 +10575,10 @@ function createCourseTable($courseCode)
                     school_type: exam.school_type || '',
                     level: exam.level || '',
                     exam_password: exam.exam_password || '',
-                    auto_grading_enabled: exam.auto_grading_enabled || 0,
-                    partial_grading_enabled: exam.partial_grading_enabled || 0,
-                    show_correct_answers: exam.show_correct_answers || 0,
-                    allow_review: exam.allow_review !== undefined ? exam.allow_review : 1
+                    auto_grading_enabled: autoGradingEnabled,
+                    partial_grading_enabled: partialGradingEnabled,
+                    show_correct_answers: 0,
+                    allow_review: 1
                 });
 
                 if (!created.success) {
@@ -10451,6 +10589,7 @@ function createCourseTable($courseCode)
                 const oldId = currentExamId;
                 currentExamId = parseInt(created.exam_id);
                 exam.id = currentExamId;
+                exam.exam_code = created.exam_code || exam.exam_code || '';
                 const tempIndex = exams.findIndex(e => parseInt(e.id) === parseInt(oldId));
                 if (tempIndex >= 0) exams[tempIndex] = exam;
                 setExams(exams);
@@ -10470,7 +10609,7 @@ function createCourseTable($courseCode)
                 questions: questionsJSON,
                 questions_to_answer: exam.questionsToAnswer || 0,
                 shuffle_enabled: exam.shuffleEnabled ? 1 : 0,
-                grading_mode: exam.gradingMode || 'auto',
+                grading_mode: selectedGradingMode,
                 school_name: exam.school_name || '',
                 faculty_name: exam.faculty_name || '',
                 department: exam.department || '',
@@ -10479,10 +10618,10 @@ function createCourseTable($courseCode)
                 school_type: exam.school_type || '',
                 level: exam.level || '',
                 exam_password: exam.exam_password || '',
-                auto_grading_enabled: exam.auto_grading_enabled || 0,
-                partial_grading_enabled: exam.partial_grading_enabled || 0,
-                show_correct_answers: exam.show_correct_answers || 0,
-                allow_review: exam.allow_review !== undefined ? exam.allow_review : 1,
+                auto_grading_enabled: autoGradingEnabled,
+                partial_grading_enabled: partialGradingEnabled,
+                show_correct_answers: 0,
+                allow_review: 1,
                 published: exam.published ? 1 : 0
             });
 
@@ -10667,11 +10806,11 @@ function createCourseTable($courseCode)
         const schoolType = document.getElementById('school_type')?.value || '';
         const level = document.getElementById('level')?.value || '';
 
-        // Grading Options
-        const autoGradingEnabled = document.getElementById('enableAutoGrading')?.checked ? 1 : 0;
-        const partialGradingEnabled = document.getElementById('enablePartialGrading')?.checked ? 1 : 0;
-        const showCorrectAnswers = document.getElementById('showCorrectAnswers')?.checked ? 1 : 0;
-        const allowReview = document.getElementById('allowReview')?.checked !== false ? 1 : 0;
+        const selectedGradingMode = document.getElementById('gradingMode')?.value || exam?.gradingMode || 'auto';
+        const autoGradingEnabled = selectedGradingMode === 'manual' ? 0 : 1;
+        const partialGradingEnabled = selectedGradingMode === 'hybrid' ? 1 : 0;
+        const showCorrectAnswers = 0;
+        const allowReview = 1;
 
         // Get questions
         const exams = getExams();
@@ -10718,7 +10857,7 @@ function createCourseTable($courseCode)
             questions: JSON.stringify(questions),
             questions_to_answer: questionsToAnswer,
             shuffle_enabled: exam?.shuffleEnabled ? 1 : 0,
-            grading_mode: exam?.gradingMode || 'auto',
+            grading_mode: selectedGradingMode,
             school_name: '',
             faculty_name: '',
             department: '',
@@ -11437,6 +11576,8 @@ function createCourseTable($courseCode)
             language: "Python",
             testCases: [],
             expectedOutput: "",
+            modelSolution: "",
+            subQuestionStyle: "letters",
             gradingMode: "auto"
         };
     }
@@ -11569,7 +11710,11 @@ function createCourseTable($courseCode)
                 <label style="display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
                     <i class="fas fa-question-circle"></i> Question
                 </label>
-                <textarea onchange="updateQuestion('${q.id}', 'text', this.value)" rows="4" 
+                <div class="structured-toolbar">
+                    <button type="button" class="btn small" onclick="insertQuestionStructuredLine('${q.id}', 'text', 'number')"><i class="fas fa-list-ol"></i> Numbering</button>
+                    <button type="button" class="btn small" onclick="insertQuestionStructuredLine('${q.id}', 'text', 'bullet')"><i class="fas fa-list-ul"></i> Bullets</button>
+                </div>
+                <textarea id="questionText_${q.id}" onchange="updateQuestion('${q.id}', 'text', this.value)" onkeydown="handleStructuredTextareaKeydown(event, this, 'text', '${q.id}')" rows="4"
                     style="width: 100%; padding: 12px; border-radius: 12px; border: 2px solid var(--border); background: var(--input-bg); color: var(--text); font-size: 14px;"
                     placeholder="Enter the coding question here...">${escapeHTML(q.text || '')}</textarea>
             </div>
@@ -11667,13 +11812,23 @@ function createCourseTable($courseCode)
         }
 
         html += `
-            <div class="field" style="margin-bottom: 20px;">
-                <label style="display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
-                    <i class="fas fa-file-alt"></i> Expected Output / Model Solution
-                </label>
-                <textarea onchange="updateQuestion('${q.id}', 'expectedOutput', this.value)" rows="6" 
-                    style="width: 100%; padding: 12px; border-radius: 12px; border: 2px solid var(--border); background: var(--input-bg); color: var(--text); font-family: monospace;" 
-                    placeholder="Enter the expected output or model solution...">${escapeHTML(q.expectedOutput || '')}</textarea>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 20px;">
+                <div class="field">
+                    <label style="display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
+                        <i class="fas fa-terminal"></i> Expected Output
+                    </label>
+                    <textarea onchange="updateQuestion('${q.id}', 'expectedOutput', this.value)" rows="6"
+                        style="width: 100%; padding: 12px; border-radius: 12px; border: 2px solid var(--border); background: var(--input-bg); color: var(--text); font-family: monospace;"
+                        placeholder="Only enter the expected console/browser output here.">${escapeHTML(q.expectedOutput || '')}</textarea>
+                </div>
+                <div class="field">
+                    <label style="display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
+                        <i class="fas fa-code"></i> Model Solution
+                    </label>
+                    <textarea onchange="updateQuestion('${q.id}', 'modelSolution', this.value)" rows="6"
+                        style="width: 100%; padding: 12px; border-radius: 12px; border: 2px solid var(--border); background: var(--input-bg); color: var(--text); font-family: monospace;"
+                        placeholder="Enter a correct reference solution for AI/autograding review.">${escapeHTML(q.modelSolution || '')}</textarea>
+                </div>
             </div>
             
             <div class="field" style="margin-bottom: 0;">
@@ -11692,7 +11847,11 @@ function createCourseTable($courseCode)
         <label style="display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
             <i class="fas fa-clipboard-list"></i> Marking Scheme
         </label>
-        <textarea onchange="updateQuestion('${q.id}', 'markingScheme', this.value)" rows="4"
+        <div class="structured-toolbar">
+            <button type="button" class="btn small" onclick="insertQuestionFieldStructuredLine('${q.id}', 'markingScheme', 'number')"><i class="fas fa-list-ol"></i> Numbering</button>
+            <button type="button" class="btn small" onclick="insertQuestionFieldStructuredLine('${q.id}', 'markingScheme', 'bullet')"><i class="fas fa-list-ul"></i> Bullets</button>
+        </div>
+        <textarea id="markingScheme_${q.id}" onchange="updateQuestion('${q.id}', 'markingScheme', this.value)" onkeydown="handleStructuredTextareaKeydown(event, this, 'markingScheme', '${q.id}')" rows="4"
             style="width: 100%; padding: 12px; border-radius: 12px; border: 2px solid var(--border); background: var(--input-bg); color: var(--text);"
             placeholder="Enter marking scheme criteria (one per line)...
 - Correct syntax (2 marks)
@@ -11790,7 +11949,7 @@ function createCourseTable($courseCode)
                         style="width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--input-bg); color: var(--text);">
                 </div>
                 <div style="flex: 2; min-width: 150px;">
-                    <input type="text" placeholder="Expected Output" value="${escapeHTML(tc.expected || '')}" 
+                    <input type="text" placeholder="Expected Output" value="${escapeHTML(tc.expected || tc.expectedOutput || '')}"
                         onchange="updateTestCase('${q.id}', ${idx}, 'expected', this.value)"
                         style="width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--input-bg); color: var(--text);">
                 </div>
@@ -11799,6 +11958,10 @@ function createCourseTable($courseCode)
                         onchange="updateTestCase('${q.id}', ${idx}, 'marks', parseFloat(this.value))"
                         style="width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--input-bg); color: var(--text);">
                 </div>
+                <label style="display:flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:var(--text);">
+                    <input type="checkbox" ${tc.hidden ? 'checked' : ''} onchange="updateTestCase('${q.id}', ${idx}, 'hidden', this.checked)">
+                    ${tc.hidden ? 'Hidden Test Case' : 'Visible Test Case'}
+                </label>
                 <button class="btn danger small" onclick="removeTestCase('${q.id}', ${idx})" style="padding: 6px 12px;">
                     <i class="fas fa-times"></i> Remove
                 </button>
@@ -11933,7 +12096,8 @@ function createCourseTable($courseCode)
         q.testCases.push({
             input: "",
             expected: "",
-            marks: 5
+            marks: 5,
+            hidden: false
         });
 
         setExams(exams);
@@ -11968,6 +12132,7 @@ function createCourseTable($courseCode)
         q.testCases[testCaseIndex][field] = value;
         setExams(exams);
         saveExamToDatabase();
+        if (field === 'hidden') renderQuestions();
     }
 
     function updateCodeLanguage(questionId, language) {
@@ -12229,6 +12394,8 @@ function createCourseTable($courseCode)
         delete q.subQuestions;
         delete q.hasSubQuestions;
         delete q.expectedOutput;
+        delete q.modelSolution;
+        delete q.subQuestionStyle;
         delete q.gradingMode;
 
         q.type = newType;
@@ -12237,6 +12404,8 @@ function createCourseTable($courseCode)
         q.hasSubQuestions = false;
         q.subQuestions = [];
         q.expectedOutput = "";
+        q.modelSolution = "";
+        q.subQuestionStyle = "letters";
         q.gradingMode = "auto";
 
         setExams(exams);
@@ -12742,10 +12911,7 @@ function createCourseTable($courseCode)
             let totalStudents = courseSubmissions.length;
 
             courseSubmissions.forEach(sub => {
-                const examScore = roundToWholeNumber(convertTo60Scale(parseFloat(sub.percentage) || 0));
-                const classScore = studentClassScores[sub.student_identifier] || 0;
-                const finalScore = roundToWholeNumber(convertTo100Scale(examScore, classScore));
-                totalScore += finalScore;
+                totalScore += getSubmissionScoreParts(sub).totalScore;
             });
 
             const averageScore = totalStudents > 0 ? roundToWholeNumber(totalScore / totalStudents) : 0;
@@ -12856,9 +13022,7 @@ function createCourseTable($courseCode)
         };
 
         courseSubmissions.forEach(sub => {
-            const examScore = roundToWholeNumber(convertTo60Scale(parseFloat(sub.percentage) || 0));
-            const classScore = studentClassScores[sub.student_identifier] || 0;
-            const totalScore = roundToWholeNumber(convertTo100Scale(examScore, classScore));
+            const { totalScore } = getSubmissionScoreParts(sub);
             totalScoreSum += totalScore;
 
             if (totalScore >= 50) passed++;
@@ -13088,10 +13252,7 @@ function createCourseTable($courseCode)
             const studentId = sub.student_identifier || 'N/A';
             const status = sub.status || 'SUBMITTED';
 
-            let examScoreRaw = parseFloat(sub.percentage) || 0;
-            let examScore = roundToWholeNumber(convertTo60Scale(examScoreRaw));
-            const classScore = studentClassScores[studentId] || 0;
-            const totalScore = roundToWholeNumber(convertTo100Scale(examScore, classScore));
+            const { classScore, examScore, totalScore } = getSubmissionScoreParts(sub);
             const gradeInfo = getGradeInfo(totalScore);
 
             let statusClass = 'status-pending';
@@ -13463,9 +13624,7 @@ function createCourseTable($courseCode)
         if (!course) return;
 
         const exportData = course.submissions.map(sub => {
-            const examScore = roundToWholeNumber(convertTo60Scale(parseFloat(sub.percentage) || 0));
-            const classScore = studentClassScores[sub.student_identifier] || 0;
-            const totalScore = roundToWholeNumber(convertTo100Scale(examScore, classScore));
+            const { classScore, examScore, totalScore } = getSubmissionScoreParts(sub);
             const gradeInfo = getGradeInfo(totalScore);
 
             return {
@@ -13696,6 +13855,32 @@ function createCourseTable($courseCode)
         }
     }
 
+    function clampScore(value, min, max) {
+        const n = roundToWholeNumber(value);
+        return Math.max(min, Math.min(max, n));
+    }
+
+    function getSubmissionScoreParts(sub) {
+        const grading = getSubmissionGrading(sub);
+        const classSource = grading.class_score ?? studentClassScores[sub.student_identifier] ?? 0;
+        const classScore = clampScore(classSource, 0, 40);
+
+        let examScore;
+        if (grading.exam_score !== undefined && grading.exam_score !== null && grading.exam_score !== '') {
+            examScore = clampScore(grading.exam_score, 0, 60);
+        } else if (sub.exam_score !== undefined && sub.exam_score !== null && sub.exam_score !== '') {
+            examScore = clampScore(sub.exam_score, 0, 60);
+        } else {
+            examScore = clampScore(convertTo60Scale(parseFloat(sub.percentage) || 0), 0, 60);
+        }
+
+        const totalScore = clampScore(examScore + classScore, 0, 100);
+        const fallbackGradeInfo = getGradeInfo(totalScore);
+        const grade = grading.grade || fallbackGradeInfo.grade;
+        const gradePoint = parseFloat(grading.grade_point ?? fallbackGradeInfo.gradePoint);
+        return { classScore, examScore, totalScore, grade, gradePoint };
+    }
+
     function buildResultGroups() {
         let filteredSubmissions = [...originalSubmissionsData];
 
@@ -13748,14 +13933,7 @@ function createCourseTable($courseCode)
 
             if (!groups[key].examIds.includes(sub.exam_id)) groups[key].examIds.push(sub.exam_id);
 
-            const grading = getSubmissionGrading(sub);
-            const hasStoredTotal = grading.total_score !== undefined && grading.total_score !== null && grading.total_score !== '';
-            const totalScore = roundToWholeNumber(hasStoredTotal ? grading.total_score : (parseFloat(sub.percentage) || 0));
-            const classScore = roundToWholeNumber(grading.class_score ?? studentClassScores[sub.student_identifier] ?? 0);
-            const examScore = roundToWholeNumber(grading.exam_score ?? Math.max(0, totalScore - classScore));
-            const fallbackGradeInfo = getGradeInfo(totalScore);
-            const grade = grading.grade || fallbackGradeInfo.grade;
-            const gradePoint = parseFloat(grading.grade_point ?? fallbackGradeInfo.gradePoint);
+            const { classScore, examScore, totalScore, grade, gradePoint } = getSubmissionScoreParts(sub);
 
             groups[key].submissions.push({
                 id: sub.id,
@@ -15622,13 +15800,23 @@ function createCourseTable($courseCode)
     function getSubmissionGrading(submission) {
         try {
             const answers = typeof submission.answers === 'string' ? JSON.parse(submission.answers || '{}') : (submission.answers || {});
-            return answers.grading || answers._grading || {};
+            if (answers.grading || answers._grading) return answers.grading || answers._grading;
+            if (answers._auto_grading) {
+                return {
+                    raw_question_score: answers._auto_grading.total_score,
+                    exam_score: answers._auto_grading.exam_score_60,
+                    total_score: answers._auto_grading.exam_score_60,
+                    percentage: answers._auto_grading.percentage
+                };
+            }
+            return {};
         } catch (error) {
             return {};
         }
     }
 
     async function persistClassScore(submission, classScore) {
+        classScore = clampScore(classScore, 0, 40);
         const examScore = roundToWholeNumber(convertTo60Scale(parseFloat(submission.percentage) || 0));
         const totalScore = roundToWholeNumber(convertTo100Scale(examScore, classScore));
         const gradeInfo = getGradeInfo(totalScore);
@@ -15741,7 +15929,7 @@ function createCourseTable($courseCode)
         originalSubmissionsData.forEach(sub => {
             const grading = getSubmissionGrading(sub);
             if (sub.student_identifier && grading.class_score !== undefined) {
-                studentClassScores[sub.student_identifier] = roundToWholeNumber(grading.class_score);
+                studentClassScores[sub.student_identifier] = clampScore(grading.class_score, 0, 40);
             }
         });
 
@@ -15750,7 +15938,7 @@ function createCourseTable($courseCode)
             const fallbackScores = JSON.parse(saved);
             Object.keys(fallbackScores).forEach(studentId => {
                 if (studentClassScores[studentId] === undefined) {
-                    studentClassScores[studentId] = fallbackScores[studentId];
+                    studentClassScores[studentId] = clampScore(fallbackScores[studentId], 0, 40);
                 }
             });
         }
@@ -15817,11 +16005,11 @@ function createCourseTable($courseCode)
     }
 
     function convertTo60Scale(percentage) {
-        return roundToWholeNumber(Math.min(60, (percentage * 60) / 100));
+        return clampScore((percentage * 60) / 100, 0, 60);
     }
 
     function convertTo100Scale(exam60, class40) {
-        return roundToWholeNumber(Math.min(100, (exam60 || 0) + (class40 || 0)));
+        return clampScore(clampScore(exam60 || 0, 0, 60) + clampScore(class40 || 0, 0, 40), 0, 100);
     }
 
     function getGradeInfo(totalScore) {
@@ -20636,6 +20824,7 @@ function createCourseTable($courseCode)
     function captureAllExamFormData() {
         console.log("===== CAPTURING ALL FORM DATA =====");
 
+        const selectedGradingMode = document.getElementById('gradingMode')?.value || 'auto';
         const formData = {
             title: document.getElementById('bTitle')?.value || '',
             courseCode: document.getElementById('bCode')?.value || '',
@@ -20652,10 +20841,11 @@ function createCourseTable($courseCode)
             exam_type: document.getElementById('examType')?.value || '',
             level: document.getElementById('examLevel')?.value || '',
             exam_code: document.getElementById('examCode')?.value || '',
-            auto_grading_enabled: document.getElementById('enableAutoGrading')?.checked ? 1 : 0,
-            partial_grading_enabled: document.getElementById('enablePartialGrading')?.checked ? 1 : 0,
-            show_correct_answers: document.getElementById('showCorrectAnswers')?.checked ? 1 : 0,
-            allow_review: document.getElementById('allowReview')?.checked !== false ? 1 : 0,
+            gradingMode: selectedGradingMode,
+            auto_grading_enabled: selectedGradingMode === 'manual' ? 0 : 1,
+            partial_grading_enabled: selectedGradingMode === 'hybrid' ? 1 : 0,
+            show_correct_answers: 0,
+            allow_review: 1,
             questions: []
         };
 

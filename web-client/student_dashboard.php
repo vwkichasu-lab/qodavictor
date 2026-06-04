@@ -202,11 +202,18 @@ if (isset($_POST['action'])) {
                     $answers = json_decode($exam['answers'], true);
                     if (is_array($answers)) {
                         $grading = $answers['grading'] ?? $answers['_grading'] ?? [];
+                        if (empty($grading) && isset($answers['_auto_grading']) && is_array($answers['_auto_grading'])) {
+                            $grading = [
+                                'exam_score' => $answers['_auto_grading']['exam_score_60'] ?? null,
+                                'total_score' => $answers['_auto_grading']['exam_score_60'] ?? null,
+                                'percentage' => $answers['_auto_grading']['percentage'] ?? null
+                            ];
+                        }
                     }
                 }
 
-                $classScore = isset($grading['class_score']) ? round((float)$grading['class_score']) : null;
-                $examScore = isset($grading['exam_score']) ? round((float)$grading['exam_score']) : null;
+                $classScore = isset($grading['class_score']) ? min(40, max(0, round((float)$grading['class_score']))) : null;
+                $examScore = isset($grading['exam_score']) ? min(60, max(0, round((float)$grading['exam_score']))) : null;
                 $grade = $grading['grade'] ?? null;
                 $gradePoint = isset($grading['grade_point']) ? round((float)$grading['grade_point'], 1) : null;
 
@@ -217,7 +224,11 @@ if (isset($_POST['action'])) {
                 if (($score === null || $score === '') && !empty($grading)) {
                     $score = $grading['total_score'] ?? null;
                 }
-                $score = ($score === null || $score === '') ? null : round((float)$score);
+                if ($examScore !== null || $classScore !== null) {
+                    $score = min(100, max(0, (int)($examScore ?? 0) + (int)($classScore ?? 0)));
+                } else {
+                    $score = ($score === null || $score === '') ? null : min(100, max(0, round((float)$score)));
+                }
                 if ($grade === null && $score !== null) {
                     if ($score >= 80) { $grade = 'A'; $gradePoint = 4.0; }
                     elseif ($score >= 75) { $grade = 'B+'; $gradePoint = 3.5; }
