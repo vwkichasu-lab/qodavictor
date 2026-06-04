@@ -18,6 +18,29 @@ function ensureExamInterfaceColumn(PDO $pdo, string $table, string $column, stri
     }
 }
 
+function qodaProctorSecret(): string
+{
+    $parts = [
+        getenv('QODA_PROCTOR_SECRET') ?: '',
+        getenv('APP_KEY') ?: '',
+        getenv('RAILWAY_ENVIRONMENT_ID') ?: '',
+        getenv('DB_NAME') ?: '',
+        getenv('DB_USER') ?: '',
+        getenv('DB_PASS') ?: '',
+        __DIR__,
+    ];
+    return implode('|', array_filter($parts, fn($part) => $part !== ''));
+}
+
+function qodaProctorSignature($examId, $studentRowId, $studentIdentifier): string
+{
+    return hash_hmac('sha256', implode('|', [
+        (string)$examId,
+        (string)$studentRowId,
+        (string)$studentIdentifier,
+    ]), qodaProctorSecret());
+}
+
 try {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS screen_captures (
@@ -246,16 +269,30 @@ if (isset($_POST['action'])) {
         exit;
     }
 
-    $ajaxExamId   = $_POST['exam_id']  ?? null;
+    $ajaxExamId = $_POST['exam_id'] ?? null;
     $ajaxStudentId = $_SESSION['user_id'];
+    $postedStudentRowId = isset($_POST['proctor_student_id']) ? (int)$_POST['proctor_student_id'] : 0;
+    $postedStudentIdentifier = trim((string)($_POST['proctor_student_identifier'] ?? ''));
+    $postedSignature = (string)($_POST['proctor_signature'] ?? '');
+    $postedSignatureValid = $postedStudentRowId > 0
+        && $postedStudentIdentifier !== ''
+        && hash_equals(
+            qodaProctorSignature($ajaxExamId, $postedStudentRowId, $postedStudentIdentifier),
+            $postedSignature
+        );
 
-    // Resolve student row id (FK to students.id)
-    $studRow = $pdo->prepare("SELECT id, full_name, student_id FROM students WHERE user_id = ? OR id = ? LIMIT 1");
-    $studRow->execute([$ajaxStudentId, $ajaxStudentId]);
+    if ($postedSignatureValid) {
+        $studRow = $pdo->prepare("SELECT id, full_name, student_id FROM students WHERE id = ? AND student_id = ? LIMIT 1");
+        $studRow->execute([$postedStudentRowId, $postedStudentIdentifier]);
+    } else {
+        // Resolve student row id (FK to students.id)
+        $studRow = $pdo->prepare("SELECT id, full_name, student_id FROM students WHERE user_id = ? OR id = ? LIMIT 1");
+        $studRow->execute([$ajaxStudentId, $ajaxStudentId]);
+    }
     $sRow = $studRow->fetch();
-    $studentRowId = $sRow ? $sRow['id'] : $ajaxStudentId;
-    $studentNameForSubmission = $sRow['full_name'] ?? ($_SESSION['user_name'] ?? null);
-    $studentIdentifierForSubmission = $sRow['student_id'] ?? ($_SESSION['user_id_value'] ?? null);
+    $studentRowId = $sRow ? (int)$sRow['id'] : ($postedSignatureValid ? $postedStudentRowId : $ajaxStudentId);
+    $studentNameForSubmission = $sRow['full_name'] ?? ($_POST['proctor_student_name'] ?? $_SESSION['user_name'] ?? null);
+    $studentIdentifierForSubmission = $sRow['student_id'] ?? ($postedSignatureValid ? $postedStudentIdentifier : ($_SESSION['user_id_value'] ?? null));
 
     if ($_POST['action'] === 'screen_heartbeat') {
         $active = (int)($_POST['active'] ?? 1) === 1 ? 1 : 0;
@@ -631,8 +668,8 @@ $studentName = $_SESSION['user_name'] ?? 'Student';
 // Get student data if logged in
 $studentData = null;
 if ($studentId && $studentId !== 'test_student') {
-    $stmt = $pdo->prepare("SELECT * FROM students WHERE id = ?");
-    $stmt->execute([$studentId]);
+    $stmt = $pdo->prepare("SELECT * FROM students WHERE user_id = ? OR id = ? OR student_id = ? LIMIT 1");
+    $stmt->execute([$studentId, $studentId, $_SESSION['user_id_value'] ?? '']);
     $studentData = $stmt->fetch(PDO::FETCH_ASSOC);
     if ($studentData) {
         $studentName = $studentData['full_name'];
@@ -2921,6 +2958,7 @@ endif;
         const formData = new URLSearchParams();
         formData.append('action', 'start_exam');
         formData.append('exam_id', examId);
+        appendProctorIdentity(formData);
         try {
             await fetch('', {
                 method: 'POST',
@@ -3107,6 +3145,7 @@ endif;
         formData.append('action', 'screen_heartbeat');
         formData.append('exam_id', examId);
         formData.append('active', active ? '1' : '0');
+        appendProctorIdentity(formData);
         try {
             await fetch('', {
                 method: 'POST',
@@ -3170,6 +3209,7 @@ endif;
             formData.append('snapshot', snapshot);
             formData.append('capture_type', captureType);
             if (notes) formData.append('notes', notes);
+            appendProctorIdentity(formData);
             const response = await fetch('', {
                 method: 'POST',
                 body: formData
@@ -3200,6 +3240,7 @@ endif;
         const formData = new URLSearchParams();
         formData.append('action', 'poll_proctor_commands');
         formData.append('exam_id', examId);
+        appendProctorIdentity(formData);
         try {
             const response = await fetch('', {
                 method: 'POST',
@@ -3262,6 +3303,7 @@ endif;
         formData.append('action', 'report_violation');
         formData.append('exam_id', examId);
         formData.append('reason', reason);
+        appendProctorIdentity(formData);
         fetch('', {
             method: 'POST',
             headers: {
@@ -3374,7 +3416,18 @@ endif;
     const studentId = <?php echo json_encode($studentId); ?>;
     const studentName = <?php echo json_encode($studentName); ?>;
     const studentIdentifier = <?php echo json_encode($studentData['student_id'] ?? $studentId); ?>;
+    const proctorStudentDbId = <?php echo json_encode((int)($studentData['id'] ?? $studentId)); ?>;
+    const proctorSignature = <?php echo json_encode(qodaProctorSignature($examId, (int)($studentData['id'] ?? $studentId), (string)($studentData['student_id'] ?? $studentId))); ?>;
     const CODE_EXECUTOR_URL = '../backend-php/code_executor.php';
+
+    function appendProctorIdentity(payload) {
+        if (!payload || !proctorStudentDbId || !proctorSignature) return payload;
+        payload.append('proctor_student_id', String(proctorStudentDbId));
+        payload.append('proctor_student_identifier', String(studentIdentifier || ''));
+        payload.append('proctor_student_name', String(studentName || ''));
+        payload.append('proctor_signature', String(proctorSignature));
+        return payload;
+    }
 
     function loadQuestions() {
         if (dbQuestions && dbQuestions.length > 0) {
@@ -5910,6 +5963,7 @@ endif;
             formData.append('course_code', dbExam?.course_code || '');
             formData.append('answers', JSON.stringify(buildSubmissionAnswers()));
             if (isAutoSubmit) formData.append('auto_submit', '1');
+            appendProctorIdentity(formData);
 
             const response = await fetch(window.location.href, {
                 method: 'POST',
