@@ -230,6 +230,112 @@ if (!function_exists('qodaFindExecutable')) {
         @rmdir($dir);
     }
 
+    function checkQodaCodeSyntax(string $code, string $language, array $postedFiles = []): array
+    {
+        qodaBootstrapLocalCompilers();
+        $language = qodaNormalizeLanguage($language);
+        $executionRoot = __DIR__ . '/../../runtime/code-execution';
+        if (!is_dir($executionRoot)) {
+            mkdir($executionRoot, 0700, true);
+        }
+        $tmpBase = $executionRoot . DIRECTORY_SEPARATOR . 'qoda_check_' . bin2hex(random_bytes(6));
+        if (!mkdir($tmpBase, 0700, true) && !is_dir($tmpBase)) {
+            return ['success' => false, 'ok' => false, 'output' => '', 'error' => 'Unable to create syntax-check directory.'];
+        }
+
+        $started = microtime(true);
+        try {
+            $safeFiles = qodaNormalizeProjectFiles($postedFiles);
+            qodaWriteProjectFiles($tmpBase, $safeFiles);
+
+            switch ($language) {
+                case 'python':
+                    $exe = qodaFindExecutable(['python', 'python3', 'C:\\Python314\\python.exe']);
+                    if (!$exe) return ['ok' => false, 'output' => '', 'error' => 'Python is not installed on this server.'];
+                    $entry = qodaActiveFile($safeFiles, 'main.py', $code, 'py');
+                    if (!$safeFiles) file_put_contents($tmpBase . DIRECTORY_SEPARATOR . $entry['name'], $entry['content']);
+                    $file = $tmpBase . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $entry['name']);
+                    $result = qodaRunProcess('"' . $exe . '" -m py_compile "' . $file . '"', $tmpBase, '', 8);
+                    break;
+
+                case 'javascript':
+                    $exe = qodaFindExecutable(['node', 'C:\\Program Files\\nodejs\\node.exe']);
+                    if (!$exe) return ['ok' => false, 'output' => '', 'error' => 'Node.js is not installed on this server.'];
+                    $entry = qodaActiveFile($safeFiles, 'main.js', $code, 'js');
+                    if (!$safeFiles) file_put_contents($tmpBase . DIRECTORY_SEPARATOR . $entry['name'], $entry['content']);
+                    $file = $tmpBase . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $entry['name']);
+                    $result = qodaRunProcess('"' . $exe . '" --check "' . $file . '"', $tmpBase, '', 8);
+                    break;
+
+                case 'php':
+                    $exe = qodaFindExecutable(['php', 'C:\\xampp\\php\\php.exe', 'C:\\Program Files\\php-8.5.3\\php.exe']);
+                    if (!$exe) return ['ok' => false, 'output' => '', 'error' => 'PHP CLI is not installed on this server.'];
+                    $entry = qodaActiveFile($safeFiles, 'main.php', $code, 'php');
+                    $file = $tmpBase . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $entry['name']);
+                    $entryContent = str_contains($entry['content'], '<?php') ? $entry['content'] : "<?php\n" . $entry['content'];
+                    file_put_contents($file, $entryContent);
+                    $result = qodaRunProcess('"' . $exe . '" -l "' . $file . '"', $tmpBase, '', 8);
+                    break;
+
+                case 'java':
+                    $javac = qodaFindExecutable(['javac', 'C:\\Program Files\\Java\\jdk-21\\bin\\javac.exe', 'C:\\Program Files\\Java\\jdk-25\\bin\\javac.exe']);
+                    if (!$javac) return ['ok' => false, 'output' => '', 'error' => 'Java JDK is not installed on this server.'];
+                    $className = qodaPublicClassName($code);
+                    if (!$safeFiles) {
+                        $safeFiles[] = ['name' => $className . '.java', 'content' => $code, 'active' => true];
+                        qodaWriteProjectFiles($tmpBase, $safeFiles);
+                    }
+                    foreach ($safeFiles as &$fileInfo) {
+                        if (preg_match('/public\s+(?:final\s+|abstract\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)/', $fileInfo['content'], $match)) {
+                            $fileInfo['name'] = $match[1] . '.java';
+                            file_put_contents($tmpBase . DIRECTORY_SEPARATOR . $fileInfo['name'], $fileInfo['content']);
+                        }
+                    }
+                    unset($fileInfo);
+                    $javaFiles = qodaProjectFilesByExtension($safeFiles, 'java');
+                    $javaArgs = implode(' ', array_map(fn($file) => '"' . str_replace('/', DIRECTORY_SEPARATOR, $file['name']) . '"', $javaFiles));
+                    $result = qodaRunProcess('"' . $javac . '" ' . $javaArgs, $tmpBase, '', 15);
+                    break;
+
+                case 'c':
+                case 'cpp':
+                    $compiler = $language === 'c'
+                        ? qodaFindExecutable(['gcc', __DIR__ . '/../../tools/winlibs-gcc/mingw64/bin/gcc.exe'])
+                        : qodaFindExecutable(['g++', __DIR__ . '/../../tools/winlibs-gcc/mingw64/bin/g++.exe']);
+                    if (!$compiler) return ['ok' => false, 'output' => '', 'error' => strtoupper($language) . ' compiler is not installed on this server.'];
+                    $extension = $language === 'c' ? 'c' : 'cpp';
+                    $entry = qodaActiveFile($safeFiles, 'main.' . $extension, $code, $extension);
+                    if (!$safeFiles) file_put_contents($tmpBase . DIRECTORY_SEPARATOR . $entry['name'], $entry['content']);
+                    $source = $tmpBase . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $entry['name']);
+                    $binary = $tmpBase . DIRECTORY_SEPARATOR . 'syntax_check.exe';
+                    $result = qodaRunProcess('"' . $compiler . '" "' . $source . '" -o "' . $binary . '"', $tmpBase, '', 10);
+                    break;
+
+                case 'csharp':
+                case 'vbnet':
+                case 'sql':
+                case 'html':
+                case 'css':
+                    return ['success' => true, 'ok' => true, 'output' => 'Syntax preflight passed.', 'error' => '', 'execution_time_ms' => 0, 'language' => $language];
+
+                default:
+                    return ['success' => true, 'ok' => true, 'output' => 'Syntax preflight skipped for this language.', 'error' => '', 'execution_time_ms' => 0, 'language' => $language];
+            }
+
+            $time = round((microtime(true) - $started) * 1000);
+            return [
+                'success' => !empty($result['ok']),
+                'ok' => !empty($result['ok']),
+                'output' => (string)($result['output'] ?? ''),
+                'error' => (string)($result['error'] ?? ''),
+                'execution_time_ms' => $time,
+                'language' => $language,
+            ];
+        } finally {
+            qodaRemoveDirectory($tmpBase);
+        }
+    }
+
     function executeQodaCode(string $code, string $language, string $input = '', array $postedFiles = []): array
     {
         qodaBootstrapLocalCompilers();

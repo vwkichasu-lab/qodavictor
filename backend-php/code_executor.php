@@ -6,6 +6,7 @@ require_once __DIR__ . '/lib/code_runner.php';
 $code = (string)($_POST['code'] ?? '');
 $language = (string)($_POST['language'] ?? '');
 $input = (string)($_POST['input'] ?? '');
+$checkOnly = !empty($_POST['check_only']);
 $postedFiles = [];
 
 if (!empty($_POST['files'])) {
@@ -15,7 +16,9 @@ if (!empty($_POST['files'])) {
     }
 }
 
-$result = executeQodaCode($code, $language, $input, $postedFiles);
+$result = $checkOnly
+    ? checkQodaCodeSyntax($code, $language, $postedFiles)
+    : executeQodaCode($code, $language, $input, $postedFiles);
 
 echo json_encode([
     'success' => !empty($result['success']),

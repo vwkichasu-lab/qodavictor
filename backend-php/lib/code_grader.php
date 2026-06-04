@@ -22,7 +22,15 @@ if (!function_exists('gradeQodaCode')) {
         if ($actualNorm === $expectedNorm) {
             return true;
         }
+        if ($expectedNorm !== '' && str_contains($actualNorm, $expectedNorm)) {
+            return true;
+        }
         if (qodaCollapseOutput($actualNorm) === qodaCollapseOutput($expectedNorm)) {
+            return true;
+        }
+        $actualFlat = qodaCollapseOutput($actualNorm);
+        $expectedFlat = qodaCollapseOutput($expectedNorm);
+        if ($expectedFlat !== '' && str_contains($actualFlat, $expectedFlat)) {
             return true;
         }
         if (is_numeric($actualNorm) && is_numeric($expectedNorm)) {
@@ -230,7 +238,12 @@ if (!function_exists('gradeQodaCode')) {
 
         foreach ($testCases as $idx => $tc) {
             $input = (string)($tc['input'] ?? '');
-            $expected = (string)($tc['expected'] ?? '');
+            $expected = (string)($tc['expected']
+                ?? $tc['expectedOutput']
+                ?? $tc['expected_output']
+                ?? $tc['output']
+                ?? $tc['stdout']
+                ?? '');
             $tolerance = isset($tc['tolerance']) && is_numeric($tc['tolerance']) ? (float)$tc['tolerance'] : null;
             $runnerResult = executeQodaCode($code, $language, $input, $files);
             $actual = (string)($runnerResult['output'] ?? '');

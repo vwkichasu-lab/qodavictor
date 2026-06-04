@@ -3,6 +3,7 @@ session_start();
 // exam_interface.php - CODING QUESTIONS ONLY VERSION
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/../backend-php/config/database.php';
+require_once __DIR__ . '/../backend-php/lib/code_grader.php';
 
 function ensureExamInterfaceColumn(PDO $pdo, string $table, string $column, string $definition): void
 {
@@ -46,6 +47,10 @@ try {
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'user_agent', 'TEXT NULL');
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'updated_at', 'DATETIME NULL');
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'submission_folder', 'VARCHAR(255) NULL');
+    ensureExamInterfaceColumn($pdo, 'exam_submissions', 'auto_score', 'DECIMAL(5,2) DEFAULT 0');
+    ensureExamInterfaceColumn($pdo, 'exam_submissions', 'execution_results', 'JSON NULL');
+    ensureExamInterfaceColumn($pdo, 'exam_submissions', 'ai_feedback', 'TEXT NULL');
+    ensureExamInterfaceColumn($pdo, 'exam_submissions', 'auto_graded_at', 'DATETIME NULL');
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS proctor_commands (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -64,6 +69,143 @@ try {
     $pdo->exec("ALTER TABLE proctor_commands MODIFY command_type ENUM('warning', 'lock', 'unlock') NOT NULL");
 } catch (Exception $e) {
     error_log('Exam interface schema upgrade failed: ' . $e->getMessage());
+}
+
+function qodaAnswerHasCode(array $answer): bool
+{
+    $value = $answer['value'] ?? [];
+    if (is_string($value)) {
+        return trim($value) !== '' && strtolower(trim($value)) !== 'unanswered';
+    }
+    if (!is_array($value)) return false;
+    if (trim((string)($value['code'] ?? '')) !== '' && strtolower(trim((string)$value['code'])) !== 'unanswered') {
+        return true;
+    }
+    $files = $value['files'] ?? [];
+    if (!is_array($files)) return false;
+    foreach ($files as $file) {
+        if (trim((string)($file['content'] ?? '')) !== '' && strtolower(trim((string)($file['content'] ?? ''))) !== 'unanswered') {
+            return true;
+        }
+    }
+    return false;
+}
+
+function qodaAnswerCodeAndFiles(array $answer, array $question): array
+{
+    $value = $answer['value'] ?? [];
+    if (is_string($value)) {
+        return [$value, [], (string)($question['language'] ?? 'python')];
+    }
+    $files = is_array($value['files'] ?? null) ? $value['files'] : [];
+    $language = (string)($value['language'] ?? $question['language'] ?? 'python');
+    $code = (string)($value['code'] ?? '');
+    if ($code === '' && $files) {
+        foreach ($files as $file) {
+            if (!empty($file['active'])) {
+                $code = (string)($file['content'] ?? '');
+                $language = (string)($file['language'] ?? $language);
+                break;
+            }
+        }
+    }
+    if ($code === '' && $files) {
+        $code = (string)($files[0]['content'] ?? '');
+        $language = (string)($files[0]['language'] ?? $language);
+    }
+    return [$code, $files, $language];
+}
+
+function qodaAutoGradeExamAnswers(array $examRow, string $answersJson): array
+{
+    $answers = json_decode($answersJson, true);
+    if (!is_array($answers)) $answers = [];
+    $questions = json_decode((string)($examRow['questions'] ?? '[]'), true);
+    if (!is_array($questions)) $questions = [];
+
+    $rows = [];
+    $feedback = [];
+    foreach (array_values($questions) as $index => $question) {
+        if (!is_array($question)) continue;
+        $qid = (string)($question['id'] ?? ('Q' . $index));
+        $answer = is_array($answers[$qid] ?? null) ? $answers[$qid] : [];
+        $maxMarks = max(0.0, (float)($question['marks'] ?? 0));
+        $score = 0.0;
+        $result = [
+            'success' => true,
+            'score' => 0,
+            'max_marks' => $maxMarks,
+            'percentage' => 0,
+            'feedback' => 'No answer submitted. Score: 0.',
+            'results' => [],
+            'requires_manual_review' => true,
+            'grading_method' => 'unanswered',
+        ];
+
+        if (qodaAnswerHasCode($answer)) {
+            [$code, $files, $language] = qodaAnswerCodeAndFiles($answer, $question);
+            $result = gradeQodaCode([
+                'code' => $code,
+                'language' => $language,
+                'files' => $files,
+                'test_cases' => $question['testCases'] ?? [],
+                'marking_scheme' => (string)($question['markingScheme'] ?? $examRow['marking_scheme'] ?? ''),
+                'question_text' => (string)($question['text'] ?? $question['question_text'] ?? ''),
+                'max_marks' => $maxMarks,
+            ]);
+            $score = (float)($result['score'] ?? 0);
+        }
+
+        if (isset($answers[$qid]) && is_array($answers[$qid])) {
+            $answers[$qid]['score'] = $score;
+            $answers[$qid]['auto_score'] = $score;
+            $answers[$qid]['auto_feedback'] = $result['feedback'] ?? '';
+            $answers[$qid]['auto_graded_at'] = date('Y-m-d H:i:s');
+        }
+
+        $rows[] = [
+            'index' => $index,
+            'question_id' => $qid,
+            'question_number' => $index + 1,
+            'score' => $score,
+            'max_marks' => $maxMarks,
+            'compulsory' => !empty($question['compulsory']),
+            'result' => $result,
+        ];
+        $feedback[] = 'Q' . ($index + 1) . ': ' . round($score, 2) . '/' . round($maxMarks, 2) . ' - ' . (($result['grading_method'] ?? 'auto') ?: 'auto');
+    }
+
+    $limit = (int)($examRow['questions_to_answer'] ?? 0);
+    if ($limit <= 0 || $limit > count($rows)) $limit = count($rows);
+    $compulsory = array_values(array_filter($rows, fn($row) => !empty($row['compulsory'])));
+    $optionalSlots = max(0, $limit - count($compulsory));
+    $optional = array_values(array_filter($rows, fn($row) => empty($row['compulsory'])));
+    usort($optional, fn($a, $b) => ($b['score'] <=> $a['score']) ?: ($b['max_marks'] <=> $a['max_marks']));
+    $included = array_merge($compulsory, array_slice($optional, 0, $optionalSlots));
+
+    $totalScore = array_reduce($included, fn($sum, $row) => $sum + (float)$row['score'], 0.0);
+    $totalPossible = array_reduce($included, fn($sum, $row) => $sum + (float)$row['max_marks'], 0.0);
+    if ($totalPossible <= 0) $totalPossible = max(0.0, (float)($examRow['total_marks'] ?? 0));
+    $percentage = $totalPossible > 0 ? round(($totalScore / $totalPossible) * 100, 2) : 0.0;
+
+    $answers['_auto_grading'] = [
+        'total_score' => round($totalScore, 2),
+        'total_marks' => round($totalPossible, 2),
+        'percentage' => $percentage,
+        'exam_score_60' => round(($percentage * 60) / 100, 2),
+        'included_questions' => array_map(fn($row) => $row['question_number'], $included),
+        'graded_at' => date('Y-m-d H:i:s'),
+        'status' => 'pending_lecturer_review',
+    ];
+
+    return [
+        'answers_json' => json_encode($answers),
+        'total_score' => round($totalScore, 2),
+        'total_marks' => round($totalPossible, 2),
+        'percentage' => $percentage,
+        'execution_results' => json_encode($rows),
+        'ai_feedback' => implode("\n", $feedback),
+    ];
 }
 
 // ---- AJAX handlers ----
@@ -155,10 +297,23 @@ if (isset($_POST['action'])) {
         $submittedStatus = !empty($_POST['auto_submit']) ? 'timed_out' : 'submitted';
         $submissionFolder = preg_replace('/[^A-Za-z0-9_\-]/', '_', ($studentIdentifierForSubmission ?: 'student') . '_' . ($_POST['course_code'] ?? 'course'));
 
-        $examStmt = $pdo->prepare("SELECT total_marks FROM exams WHERE id = ? LIMIT 1");
+        $examStmt = $pdo->prepare("SELECT total_marks, questions, questions_to_answer, marking_scheme FROM exams WHERE id = ? LIMIT 1");
         $examStmt->execute([$ajaxExamId]);
         $examRow = $examStmt->fetch(PDO::FETCH_ASSOC);
         $totalMarks = $examRow ? floatval($examRow['total_marks'] ?? 0) : 0;
+        $autoGrade = $examRow ? qodaAutoGradeExamAnswers($examRow, $answers) : [
+            'answers_json' => $answersJson,
+            'total_score' => 0,
+            'total_marks' => $totalMarks,
+            'percentage' => 0,
+            'execution_results' => null,
+            'ai_feedback' => null,
+        ];
+        $answersToStore = $autoGrade['answers_json'] ?: $answers;
+        $answersJsonToStore = (json_decode($answersToStore, true) !== null) ? $answersToStore : $answersJson;
+        $totalMarks = (float)($autoGrade['total_marks'] ?? $totalMarks);
+        $autoTotalScore = (float)($autoGrade['total_score'] ?? 0);
+        $autoPercentage = (float)($autoGrade['percentage'] ?? 0);
 
         $check = $pdo->prepare(
             "SELECT id FROM exam_submissions WHERE exam_id = ? AND student_id = ? LIMIT 1"
@@ -171,7 +326,13 @@ if (isset($_POST['action'])) {
                 UPDATE exam_submissions
                 SET answers = ?,
                     answers_json = ?,
+                    total_score = ?,
                     total_marks = ?,
+                    percentage = ?,
+                    auto_score = ?,
+                    execution_results = ?,
+                    ai_feedback = ?,
+                    auto_graded_at = NOW(),
                     student_name = ?,
                     student_identifier = ?,
                     status = ?,
@@ -183,9 +344,14 @@ if (isset($_POST['action'])) {
                 WHERE id = ?
             ");
             $upd->execute([
-                $answers,
-                $answersJson,
+                $answersToStore,
+                $answersJsonToStore,
+                $autoTotalScore,
                 $totalMarks,
+                $autoPercentage,
+                $autoTotalScore,
+                $autoGrade['execution_results'] ?? null,
+                $autoGrade['ai_feedback'] ?? null,
                 $studentNameForSubmission,
                 $studentIdentifierForSubmission,
                 $submittedStatus,
@@ -196,17 +362,22 @@ if (isset($_POST['action'])) {
         } else {
             $ins = $pdo->prepare("
                 INSERT INTO exam_submissions
-                    (exam_id, student_id, student_name, student_identifier, answers, answers_json, total_marks, status, submitted, started_at, submitted_at, submittedAt, ip_address, user_agent, submission_folder)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW(), NOW(), ?, ?, ?)
+                    (exam_id, student_id, student_name, student_identifier, answers, answers_json, total_score, total_marks, percentage, auto_score, execution_results, ai_feedback, auto_graded_at, status, submitted, started_at, submitted_at, submittedAt, ip_address, user_agent, submission_folder)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, 1, NOW(), NOW(), NOW(), ?, ?, ?)
             ");
             $ins->execute([
                 $ajaxExamId,
                 $studentRowId,
                 $studentNameForSubmission,
                 $studentIdentifierForSubmission,
-                $answers,
-                $answersJson,
+                $answersToStore,
+                $answersJsonToStore,
+                $autoTotalScore,
                 $totalMarks,
+                $autoPercentage,
+                $autoTotalScore,
+                $autoGrade['execution_results'] ?? null,
+                $autoGrade['ai_feedback'] ?? null,
                 $submittedStatus,
                 $_SERVER['REMOTE_ADDR'] ?? null,
                 $_SERVER['HTTP_USER_AGENT'] ?? null,
@@ -215,7 +386,13 @@ if (isset($_POST['action'])) {
             $submissionId = $pdo->lastInsertId();
         }
 
-        echo json_encode(['success' => true, 'submission_id' => $submissionId]);
+        echo json_encode([
+            'success' => true,
+            'submission_id' => $submissionId,
+            'auto_score' => $autoTotalScore,
+            'percentage' => $autoPercentage,
+            'exam_score_60' => round(($autoPercentage * 60) / 100, 2),
+        ]);
         exit;
     }
 
@@ -258,6 +435,31 @@ if (isset($_POST['action'])) {
             VALUES (?, ?, ?, ?, ?, ?, NOW())
         ");
         $stmt->execute([$ajaxExamId, $studentRowId, $imagePath, $snapshot, $captureType, $notes]);
+        $captureId = $pdo->lastInsertId();
+        if ($captureType === 'live') {
+            try {
+                $cleanup = $pdo->prepare("
+                    DELETE FROM screen_captures
+                    WHERE exam_id = ?
+                      AND student_id = ?
+                      AND capture_type = 'live'
+                      AND id NOT IN (
+                          SELECT id FROM (
+                              SELECT id
+                              FROM screen_captures
+                              WHERE exam_id = ?
+                                AND student_id = ?
+                                AND capture_type = 'live'
+                              ORDER BY id DESC
+                              LIMIT 12
+                          ) keep_rows
+                      )
+                ");
+                $cleanup->execute([$ajaxExamId, $studentRowId, $ajaxExamId, $studentRowId]);
+            } catch (Throwable $cleanupError) {
+                error_log('Live screen cleanup failed: ' . $cleanupError->getMessage());
+            }
+        }
         $session = $pdo->prepare("SELECT id FROM exam_submissions WHERE exam_id = ? AND student_id = ? LIMIT 1");
         $session->execute([$ajaxExamId, $studentRowId]);
         $sessionId = $session->fetchColumn();
@@ -282,7 +484,7 @@ if (isset($_POST['action'])) {
                 $_SERVER['HTTP_USER_AGENT'] ?? null
             ]);
         }
-        echo json_encode(['success' => true]);
+        echo json_encode(['success' => true, 'capture_id' => $captureId, 'captured_at' => date('Y-m-d H:i:s')]);
         exit;
     }
 
@@ -742,6 +944,30 @@ endif;
         gap: 12px;
     }
 
+    .submit-exam-top {
+        background: #dc2626;
+        border: 1px solid #f87171;
+        color: #ffffff;
+        border-radius: 10px;
+        padding: 10px 14px;
+        font-size: 12px;
+        font-weight: 800;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        box-shadow: 0 10px 22px rgba(220, 38, 38, 0.22);
+    }
+
+    .submit-exam-top:hover {
+        background: #b91c1c;
+    }
+
+    body.light .submit-exam-top {
+        color: #ffffff;
+        border-color: #991b1b;
+    }
+
     .share-screen {
         background: transparent;
         border: 0;
@@ -947,16 +1173,16 @@ endif;
     }
 
     .q-nav-btn.unanswered {
-        background: #34343a;
-        border-color: #5f6368;
-        color: #d1d5db;
+        background: #3b1f24;
+        border-color: #ef4444;
+        color: #fecaca;
     }
 
     .q-nav-btn.active {
-        background: #007acc;
-        border-color: #007acc;
-        color: white;
-        box-shadow: 0 0 0 3px rgba(0, 122, 204, 0.28);
+        background: #f59e0b;
+        border-color: #fbbf24;
+        color: #111827;
+        box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.28);
     }
 
     .q-nav-btn.answered {
@@ -966,8 +1192,8 @@ endif;
     }
 
     .q-nav-btn.answered.active {
-        background: #0ea5e9;
-        border-color: #7dd3fc;
+        background: #2563eb;
+        border-color: #93c5fd;
         color: #ffffff;
     }
 
@@ -1447,6 +1673,25 @@ endif;
         background: #1177bb;
     }
 
+    .run-btn {
+        background: #dc2626 !important;
+        border-color: #f87171 !important;
+        color: #ffffff !important;
+        font-weight: 900;
+        min-width: 118px;
+        justify-content: center;
+        box-shadow: 0 0 0 1px rgba(248,113,113,.35), 0 10px 22px rgba(220,38,38,.2);
+    }
+
+    .run-btn:hover:not(:disabled) {
+        background: #b91c1c !important;
+        color: #ffffff !important;
+    }
+
+    body.light .run-btn {
+        border-color: #991b1b !important;
+    }
+
     .page-indicator {
         font-size: 12px;
         color: #888;
@@ -1730,12 +1975,12 @@ endif;
 
     .terminal-session {
         min-height: 100%;
-        padding: 16px;
+        padding: 12px;
         background: #111;
         color: #f8fafc;
         font-family: Consolas, "Courier New", monospace;
         font-size: 14px;
-        line-height: 1.65;
+        line-height: 1.4;
         white-space: pre-wrap;
     }
 
@@ -1758,7 +2003,7 @@ endif;
     }
 
     .terminal-input-field {
-        flex: 1;
+        flex: 0 1 220px;
         min-width: 140px;
         border: 0;
         outline: 0;
@@ -2064,6 +2309,9 @@ endif;
                     class="fas fa-share-alt"></i></button>
             <button class="exam-theme-toggle" id="examThemeToggle" onclick="toggleExamTheme()" title="Toggle theme"><span id="examThemeIcon"
                     aria-hidden="true">&#9790;</span></button>
+            <button class="submit-exam-top" id="submitExamTopBtn" onclick="submitExam(false)" title="Submit exam">
+                <i class="fas fa-paper-plane"></i> Submit Exam
+            </button>
             <div class="timer" id="timerDisplay"><i class="fas fa-clock"></i> <span id="timerText">01:00:00</span></div>
         </div>
     </div>
@@ -2103,18 +2351,6 @@ endif;
                         <div class="progress-fill" id="progressFill"></div>
                     </div>
                     <div class="progress-text" id="progressText">0 of 0 answered</div>
-                </div>
-                <div class="action-buttons">
-                    <button class="action-btn" onclick="saveCurrentAnswer()" data-tooltip="Save your current answer"><i
-                            class="fas fa-save"></i> Save</button>
-                    <button class="action-btn" onclick="saveProgressManual()" data-tooltip="Save all progress"><i
-                            class="fas fa-clock"></i> Progress</button>
-                    <button class="action-btn flag" id="flagBtn" onclick="flagCurrentQuestion()"
-                        data-tooltip="Mark for review"><i class="fas fa-flag"></i> Flag</button>
-                    <button class="action-btn clear-btn" onclick="clearCurrentAnswer()"
-                        data-tooltip="Clear your answer"><i class="fas fa-eraser"></i> Clear</button>
-                    <button class="action-btn finish" onclick="submitExam(false)" data-tooltip="Submit exam"><i
-                            class="fas fa-check-circle"></i> Finish</button>
                 </div>
             </div>
         </div>
@@ -2163,8 +2399,8 @@ endif;
         </div>
         <div class="page-indicator" id="pageIndicator">Question 1 of 1</div>
         <div class="nav-buttons">
-            <button class="bottom-btn" id="testOnlineBtn" onclick="runCode()" style="background: #8b5cf6;">
-                <i class="fas fa-play"></i> Execute
+            <button class="bottom-btn run-btn" id="testOnlineBtn" onclick="runCode()">
+                <i class="fas fa-play"></i> RUN
             </button>
             <button class="bottom-btn" id="resetBtn" onclick="resetCode()"><i class="fas fa-undo-alt"></i>
                 Reset</button>
@@ -2477,6 +2713,7 @@ endif;
     let proctorCommandInterval = null;
     let screenVideoEl = null;
     let screenCanvasEl = null;
+    let screenSnapshotInFlight = false;
     let screenSharePromptActive = false;
     let screenShareStartedThisPage = false;
     let pageIsUnloading = false;
@@ -2711,8 +2948,10 @@ endif;
         screenVideoEl.srcObject = screenStream;
         screenVideoEl.play().catch(() => {});
         if (screenCaptureInterval) clearInterval(screenCaptureInterval);
-        screenCaptureInterval = setInterval(sendScreenSnapshot, 700);
+        screenCaptureInterval = setInterval(sendScreenSnapshot, 500);
+        screenVideoEl.onloadedmetadata = () => sendScreenSnapshot();
         setTimeout(sendScreenSnapshot, 250);
+        setTimeout(sendScreenSnapshot, 900);
     }
 
     function stopScreenCapturePipeline() {
@@ -2722,34 +2961,44 @@ endif;
 
     async function sendScreenSnapshot(captureType = 'live', notes = '') {
         if (!screenSharingActive || !screenVideoEl || screenVideoEl.readyState < 2 || !screenCanvasEl) return;
+        if (captureType === 'live' && screenSnapshotInFlight) return;
+        if (captureType === 'live') screenSnapshotInFlight = true;
+        const frameWidth = captureType === 'live' ? 800 : 1280;
+        const frameHeight = captureType === 'live' ? 450 : 720;
         const ctx = screenCanvasEl.getContext('2d');
-        const sourceWidth = screenVideoEl.videoWidth || 960;
-        const sourceHeight = screenVideoEl.videoHeight || 540;
-        const ratio = Math.min(960 / sourceWidth, 540 / sourceHeight);
+        const sourceWidth = screenVideoEl.videoWidth || frameWidth;
+        const sourceHeight = screenVideoEl.videoHeight || frameHeight;
+        const ratio = Math.min(frameWidth / sourceWidth, frameHeight / sourceHeight);
         const drawWidth = Math.max(1, Math.floor(sourceWidth * ratio));
         const drawHeight = Math.max(1, Math.floor(sourceHeight * ratio));
-        screenCanvasEl.width = 960;
-        screenCanvasEl.height = 540;
+        screenCanvasEl.width = frameWidth;
+        screenCanvasEl.height = frameHeight;
         ctx.fillStyle = '#111827';
-        ctx.fillRect(0, 0, 960, 540);
-        ctx.drawImage(screenVideoEl, (960 - drawWidth) / 2, (540 - drawHeight) / 2, drawWidth, drawHeight);
-        const snapshot = screenCanvasEl.toDataURL('image/jpeg', 0.58);
-        const formData = new URLSearchParams();
+        ctx.fillRect(0, 0, frameWidth, frameHeight);
+        ctx.drawImage(screenVideoEl, (frameWidth - drawWidth) / 2, (frameHeight - drawHeight) / 2, drawWidth, drawHeight);
+        const snapshot = screenCanvasEl.toDataURL('image/jpeg', captureType === 'live' ? 0.42 : 0.72);
+        const formData = new FormData();
         formData.append('action', 'screen_snapshot');
         formData.append('exam_id', examId);
         formData.append('snapshot', snapshot);
         formData.append('capture_type', captureType);
         if (notes) formData.append('notes', notes);
         try {
-            await fetch('', {
+            const response = await fetch('', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                },
-                body: formData.toString()
+                body: formData
             });
+            if (!response.ok) {
+                throw new Error(`Snapshot upload failed with HTTP ${response.status}`);
+            }
+            const result = await response.json().catch(() => null);
+            if (!result || !result.success) {
+                throw new Error(result?.error || 'Snapshot upload failed');
+            }
         } catch (error) {
             console.error('Snapshot upload failed:', error);
+        } finally {
+            if (captureType === 'live') screenSnapshotInFlight = false;
         }
     }
 
@@ -3331,9 +3580,9 @@ endif;
 
         // Update flag button
         const flagBtn = document.getElementById('flagBtn');
-        if (flaggedQuestions.has(q.id)) {
+        if (flagBtn && flaggedQuestions.has(q.id)) {
             flagBtn.classList.add('active');
-        } else {
+        } else if (flagBtn) {
             flagBtn.classList.remove('active');
         }
 
@@ -4853,7 +5102,7 @@ endif;
                         if (consoleOutput) {
                             consoleOutput.innerHTML = `
                                 <div class="terminal-session">
-                                    <pre class="terminal-transcript">${escapeHtml(transcript + '\nRunning...\n')}</pre>
+                                    <pre class="terminal-transcript">${escapeHtml(transcript + 'Running...\n')}</pre>
                                 </div>
                             `;
                         }
@@ -4887,11 +5136,38 @@ endif;
             formatted = `${transcript}\n${formatted}`.trimEnd();
         }
 
-        if (success && formatted && !/BUILD SUCCESSFUL/i.test(formatted)) {
-            formatted += '\n\nBUILD SUCCESSFUL';
+        if (success && formatted && !/Code Execution Successful/i.test(formatted)) {
+            formatted += '\n\n=== Code Execution Successful ===';
         }
 
-        return formatted || (success ? 'Program finished successfully with no output.\n\nBUILD SUCCESSFUL' : '');
+        return formatted || (success ? 'Program finished successfully with no output.\n\n=== Code Execution Successful ===' : '');
+    }
+
+    async function preflightCodeSyntax(code, language) {
+        const formData = new FormData();
+        formData.append('code', code);
+        formData.append('language', language);
+        formData.append('check_only', '1');
+        formData.append('files', JSON.stringify(openFiles.map(file => ({
+            name: file.name,
+            language: file.language,
+            content: file.content || '',
+            active: file === openFiles[activeFileIndex]
+        }))));
+
+        const response = await fetch(CODE_EXECUTOR_URL, {
+            method: 'POST',
+            body: formData
+        });
+        const text = await response.text();
+        try {
+            return JSON.parse(text);
+        } catch (error) {
+            return {
+                success: false,
+                error: `Compiler endpoint returned an invalid response:\n${text.slice(0, 1000)}`
+            };
+        }
     }
 
     async function runCode() {
@@ -4908,106 +5184,52 @@ endif;
             if (consoleOutput) consoleOutput.textContent = 'No file created. Use Create File first.';
             return;
         }
-        if (activeFile && monacoEditor) {
-            activeFile.content = monacoEditor.getValue();
-            saveCurrentAnswerToStorage();
-        }
+
+        activeFile.content = monacoEditor.getValue();
+        saveCurrentAnswerToStorage();
+
         const code = activeFile.content;
         const language = activeFile.language;
+        const langKey = String(language || '').toLowerCase();
         const consoleOutput = document.getElementById('consoleOutput');
         const webPreview = document.getElementById('webPreview');
         let programInput = '';
 
         if (!code || code.trim() === '') {
             showToast('No code to execute', 'warning');
-            if (consoleOutput) consoleOutput.textContent = '⚠️ No code to execute.';
+            if (consoleOutput) consoleOutput.textContent = 'No code to execute.';
             return;
         }
 
-        if (codeLikelyNeedsInput(code, language)) {
+        if (['html', 'css', 'javascript', 'js'].includes(langKey)) {
+            if (webPreview) {
+                webPreview.srcdoc = buildLinkedWebProject();
+                bindSafeOutputFrame(webPreview);
+                markOutputInteraction();
+                switchOutputTab('browser');
+                showToast('Preview ready', 'success');
+            }
+            return;
+        }
+
+        switchOutputTab('console');
+        if (consoleOutput) consoleOutput.textContent = 'Checking code...\n';
+
+        const needsInput = codeLikelyNeedsInput(code, language);
+        if (needsInput) {
+            const preflight = await preflightCodeSyntax(code, language);
+            if (!preflight.success) {
+                const preflightError = preflight.error || preflight.output || 'Syntax or compile error detected.';
+                if (consoleOutput) consoleOutput.textContent = `Error:\n${preflightError}`;
+                showToast('Fix the code error before entering input', 'error');
+                return;
+            }
             programInput = await collectProgramInputInConsole(code, language);
         }
 
-        console.log("Running code in:", language);
-        console.log("Code length:", code.length);
-
         showToast('Executing code...', 'info');
+        if (consoleOutput) consoleOutput.textContent = 'Running...\n';
 
-        if (consoleOutput) {
-            consoleOutput.textContent = '⏳ Processing...\n';
-            switchOutputTab('console');
-        }
-
-        // For HTML - show live preview
-        if (language === 'html') {
-            if (webPreview) {
-                const blob = new Blob([code], {
-                    type: 'text/html'
-                });
-                const url = URL.createObjectURL(blob);
-                webPreview.srcdoc = buildLinkedWebProject();
-                bindSafeOutputFrame(webPreview);
-                markOutputInteraction();
-                switchOutputTab('browser');
-                showToast('HTML preview ready', 'success');
-            }
-            return;
-        }
-
-        // For CSS - show preview
-        if (language === 'css') {
-            if (webPreview) {
-                webPreview.srcdoc = buildLinkedWebProject();
-                bindSafeOutputFrame(webPreview);
-                markOutputInteraction();
-                switchOutputTab('browser');
-                showToast('CSS preview ready', 'success');
-            }
-            return;
-        }
-
-        if (language === 'javascript' || language === 'js') {
-            if (webPreview) {
-                webPreview.srcdoc = buildLinkedWebProject();
-                bindSafeOutputFrame(webPreview);
-                markOutputInteraction();
-                switchOutputTab('browser');
-                showToast('JavaScript preview ready', 'success');
-            }
-            return;
-        }
-
-        // Legacy fallback for JavaScript, normally bypassed by the preview block above.
-        // For JavaScript - execute in browser
-        if (language === 'javascript' || language === 'js') {
-            let output = '';
-            const originalLog = console.log;
-
-            console.log = function(...args) {
-                output += args.join(' ') + '\n';
-                originalLog.apply(console, args);
-            };
-
-            try {
-                const executeCode = new Function(code);
-                const result = executeCode();
-
-                if (result && typeof result.then === 'function') {
-                    await result;
-                }
-
-                console.log = originalLog;
-                consoleOutput.textContent = output || '✓ JavaScript executed successfully (no output)';
-                showToast('JavaScript executed', 'success');
-            } catch (error) {
-                console.log = originalLog;
-                consoleOutput.textContent = `❌ Error: ${error.message}`;
-                showToast('Execution failed', 'error');
-            }
-            return;
-        }
-
-        // For other languages - send to backend (simulated for now)
         try {
             const formData = new FormData();
             formData.append('code', code);
@@ -5024,36 +5246,43 @@ endif;
                 method: 'POST',
                 body: formData
             });
-
-            const result = await response.json();
-
-            if (consoleOutput) {
-                if (result.error) {
-                    switchOutputTab('console');
-                    consoleOutput.textContent = `❌ Error:\n${result.error}`;
-                    showToast('Execution failed', 'error');
-                } else {
-                    const rawOutput = formatConsoleOutput(result.output || 'Program finished successfully with no output.');
-                    if (shouldRenderAsHtml(rawOutput, language) && webPreview) {
-                        webPreview.srcdoc = rawOutput;
-                        bindSafeOutputFrame(webPreview);
-                        markOutputInteraction();
-                        switchOutputTab('browser');
-                    } else {
-                        const output = formatConsoleOutputWithInputEcho(rawOutput, programInput, code, language, true);
-                        switchOutputTab(preferredOutputTab(language) === 'ui' ? 'ui' : 'console');
-                        const uiOutput = document.getElementById('uiOutput');
-                        if (preferredOutputTab(language) === 'ui' && uiOutput) {
-                            uiOutput.innerHTML = `<pre style="text-align:left;width:100%;white-space:pre-wrap;">${escapeHtml(output)}</pre>`;
-                        }
-                        consoleOutput.textContent = output;
-                    }
-                    showToast('Code processed', 'success');
-                }
+            const text = await response.text();
+            let result;
+            try {
+                result = JSON.parse(text);
+            } catch (parseError) {
+                result = {
+                    success: false,
+                    error: `Compiler endpoint returned an invalid response:\n${text.slice(0, 1000)}`
+                };
             }
+
+            if (result.error) {
+                switchOutputTab('console');
+                if (consoleOutput) consoleOutput.textContent = `Error:\n${result.error}`;
+                showToast('Execution failed', 'error');
+                return;
+            }
+
+            const rawOutput = formatConsoleOutput(result.output || 'Program finished successfully with no output.');
+            if (shouldRenderAsHtml(rawOutput, language) && webPreview) {
+                webPreview.srcdoc = rawOutput;
+                bindSafeOutputFrame(webPreview);
+                markOutputInteraction();
+                switchOutputTab('browser');
+            } else {
+                const output = formatConsoleOutputWithInputEcho(rawOutput, programInput, code, language, true);
+                switchOutputTab(preferredOutputTab(language) === 'ui' ? 'ui' : 'console');
+                const uiOutput = document.getElementById('uiOutput');
+                if (preferredOutputTab(language) === 'ui' && uiOutput) {
+                    uiOutput.innerHTML = `<pre style="text-align:left;width:100%;white-space:pre-wrap;">${escapeHtml(output)}</pre>`;
+                }
+                if (consoleOutput) consoleOutput.textContent = output;
+            }
+            showToast('Code executed', 'success');
         } catch (error) {
             switchOutputTab('console');
-            consoleOutput.textContent = `❌ Connection error: ${error.message}`;
+            if (consoleOutput) consoleOutput.textContent = `Connection error: ${error.message}`;
             showToast('Connection error', 'error');
         }
     }
@@ -5292,7 +5521,7 @@ endif;
         }
         saveFlaggedQuestions();
         renderQuestionButtons();
-        document.getElementById('flagBtn').classList.toggle('active', flaggedQuestions.has(q.id));
+        document.getElementById('flagBtn')?.classList.toggle('active', flaggedQuestions.has(q.id));
     }
 
     function saveProgressManual() {

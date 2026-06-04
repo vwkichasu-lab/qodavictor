@@ -1009,7 +1009,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         SELECT
                             active.student_id,
                             MAX(COALESCE(sc.captured_at, es.updated_at, es.started_at, es.created_at)) AS last_activity,
-                            CASE WHEN MAX(CASE WHEN sc.capture_type = 'live' THEN sc.captured_at ELSE NULL END) >= (NOW() - INTERVAL 12 SECOND) THEN 1 ELSE 0 END AS screen_sharing_active,
+                            CASE WHEN MAX(CASE WHEN sc.capture_type = 'live' THEN sc.captured_at ELSE NULL END) >= (NOW() - INTERVAL 45 SECOND) THEN 1 ELSE 0 END AS screen_sharing_active,
                             COUNT(DISTINCT sl.id) AS violations,
                             MAX(CASE WHEN pc.command_type = 'lock' THEN 1 WHEN pc.command_type = 'unlock' THEN 0 ELSE 0 END) AS screen_locked,
                             MAX(COALESCE(es.submitted, 0)) AS submitted,
@@ -1084,6 +1084,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                                sc.id AS snapshot_id,
                                sc.image_data AS snapshot,
                                sc.captured_at,
+                               CASE WHEN sc.captured_at >= (NOW() - INTERVAL 45 SECOND) THEN 1 ELSE 0 END AS screen_sharing_active,
                                COUNT(DISTINCT sl.id) AS violations,
                                MAX(COALESCE(es.submitted, 0)) AS submitted,
                                MAX(es.submitted_at) AS submitted_at,
@@ -1127,6 +1128,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $studentId = intval($_POST['student_id'] ?? 0);
                     $stmt = $pdo->prepare("
                         SELECT sc.student_id, sc.image_data AS snapshot, sc.captured_at,
+                               CASE WHEN sc.captured_at >= (NOW() - INTERVAL 45 SECOND) THEN 1 ELSE 0 END AS screen_sharing_active,
                                (SELECT COUNT(*) FROM suspicious_logs sl WHERE sl.exam_id = sc.exam_id AND sl.student_id = sc.student_id) AS violations
                         FROM screen_captures sc
                         WHERE sc.exam_id = ? AND sc.student_id = ?
@@ -1250,7 +1252,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         WHERE exam_id = ?
                           AND student_id = ?
                           AND capture_type = 'live'
-                          AND captured_at >= (NOW() - INTERVAL 15 SECOND)
+                          AND captured_at >= (NOW() - INTERVAL 45 SECOND)
                         ORDER BY id DESC
                         LIMIT 1
                     ");
@@ -18585,19 +18587,24 @@ function createCourseTable($courseCode)
         'AUTO_GRADED',
         'MANUALLY_GRADED'
     ]);
-    const PROCTOR_LIVE_FRAME_MAX_AGE_MS = 12000;
+    const PROCTOR_LIVE_FRAME_MAX_AGE_MS = 45000;
     const proctorSubmittedRemovalTimers = {};
 
     function proctorFrameAgeMs(timestamp) {
         if (!timestamp) return null;
-        const normalized = String(timestamp).includes('T') ? String(timestamp) : String(timestamp).replace(' ', 'T');
-        const frameTime = new Date(normalized).getTime();
+        const value = String(timestamp);
+        const localValue = value.includes('T') ? value : value.replace(' ', 'T');
+        let frameTime = new Date(localValue).getTime();
+        if (!Number.isFinite(frameTime) || Math.abs(Date.now() - frameTime) > 3600000) {
+            const utcValue = value.includes('T') ? value : value.replace(' ', 'T') + 'Z';
+            frameTime = new Date(utcValue).getTime();
+        }
         return Number.isFinite(frameTime) ? Date.now() - frameTime : null;
     }
 
     function isFreshProctorFrame(timestamp) {
         const ageMs = proctorFrameAgeMs(timestamp);
-        return ageMs !== null && ageMs >= 0 && ageMs <= PROCTOR_LIVE_FRAME_MAX_AGE_MS;
+        return ageMs !== null && ageMs >= -5000 && ageMs <= PROCTOR_LIVE_FRAME_MAX_AGE_MS;
     }
 
     function isSubmittedProctorRecord(record) {
@@ -18688,14 +18695,14 @@ function createCourseTable($courseCode)
 
                 activeProctoringStudents = studentsResult.data.map(student => {
                     const session = activeSessions.find(s => s.student_id == student.id);
-                    const hasFreshFrame = !!(session && session.snapshot && isFreshProctorFrame(session.latest_snapshot_at));
+                    const hasFreshFrame = !!(session && session.snapshot && (parseInt(session.screen_sharing_active || 0) === 1 || isFreshProctorFrame(session.latest_snapshot_at)));
                     return {
                         id: student.id,
                         student_id: student.student_id,
                         full_name: student.full_name,
                         level: student.level,
                         programme: student.programme,
-                        screenSharing: hasFreshFrame && parseInt(session.screen_sharing_active || 0) === 1,
+                        screenSharing: hasFreshFrame,
                         status: hasFreshFrame ? 'active' : 'offline',
                         violationCount: session ? parseInt(session.violations || 0) : 0,
                         lastActivity: session ? (session.latest_snapshot_at || session.last_activity) : null,
@@ -18890,7 +18897,7 @@ function createCourseTable($courseCode)
 
                     const student = activeProctoringStudents.find(s => String(s.id) === String(update.student_id));
                     if (student) {
-                        const hasFreshFrame = !!update.snapshot && isFreshProctorFrame(update.captured_at);
+                        const hasFreshFrame = !!update.snapshot && (parseInt(update.screen_sharing_active || 0) === 1 || isFreshProctorFrame(update.captured_at));
                         student.screenSharing = hasFreshFrame;
                         student.status = student.screenSharing ? 'active' : 'offline';
                         student.lastActivity = update.captured_at || student.lastActivity;
@@ -19078,14 +19085,14 @@ function createCourseTable($courseCode)
                 contentDiv.innerHTML = `
                 <div style="display: flex; justify-content: center; align-items: center; height: 100%; position: relative;">
                     <div id="fullScreenStreamContainer" style="width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; background: #000;">
-                        <img id="fullScreenImg" src="" alt="Screen stream" style="max-width: 100%; max-height: 100%; object-fit: contain; display:none;">
-                        <div id="fullScreenPlaceholder" style="text-align:center;color:#9ca3af;padding:30px;">
+                        <img id="fullScreenImg" src="${student.snapshot ? `data:image/jpeg;base64,${student.snapshot}` : ''}" alt="Screen stream" style="max-width: 100%; max-height: 100%; object-fit: contain; ${student.snapshot ? '' : 'display:none;'}">
+                        <div id="fullScreenPlaceholder" style="text-align:center;color:#9ca3af;padding:30px;${student.snapshot ? 'display:none;' : ''}">
                             <i class="fas fa-desktop" style="font-size:44px;margin-bottom:12px;"></i>
                             <p style="margin:0;font-weight:700;">Waiting for a fresh live screen frame</p>
                             <small>The student must keep screen sharing active.</small>
                         </div>
                     </div>
-                    <div id="fullLiveIndicator" class="live-indicator-full" style="position: absolute; top: 20px; right: 20px; background: #ef4444; color: white; padding: 8px 16px; border-radius: 8px; font-weight: 600; display:none;">
+                    <div id="fullLiveIndicator" class="live-indicator-full" style="position: absolute; top: 20px; right: 20px; background: #ef4444; color: white; padding: 8px 16px; border-radius: 8px; font-weight: 600; ${student.snapshot ? '' : 'display:none;'}">
                         <i class="fas fa-circle" style="font-size: 10px; animation: blink 1s infinite;"></i> LIVE STREAM
                     </div>
                 </div>
@@ -19103,14 +19110,14 @@ function createCourseTable($courseCode)
             clearInterval(window.studentStreamInterval);
         }
 
-        window.studentStreamInterval = setInterval(async () => {
+        const refreshStudentStream = async () => {
             try {
                 const result = await apiRequest('get_student_screen', {
                     student_id: studentId,
                     exam_id: currentProctoringExam
                 });
 
-                const hasFreshFrame = result.success && result.data && result.data.snapshot && isFreshProctorFrame(result.data.captured_at);
+                const hasFreshFrame = result.success && result.data && result.data.snapshot && (parseInt(result.data.screen_sharing_active || 0) === 1 || isFreshProctorFrame(result.data.captured_at));
                 if (hasFreshFrame) {
                     const fullScreenImg = document.getElementById('fullScreenImg');
                     const placeholder = document.getElementById('fullScreenPlaceholder');
@@ -19164,7 +19171,10 @@ function createCourseTable($courseCode)
             } catch (error) {
                 console.error('Error fetching student screen:', error);
             }
-        }, 800);
+        };
+
+        refreshStudentStream();
+        window.studentStreamInterval = setInterval(refreshStudentStream, 800);
     }
 
     function closeFullScreenProctorModal() {
