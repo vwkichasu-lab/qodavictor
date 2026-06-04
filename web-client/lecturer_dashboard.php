@@ -270,14 +270,17 @@ try {
     ensureLecturerColumn($pdo, 'screen_captures', 'notes', 'TEXT NULL');
     ensureLecturerColumn($pdo, 'exam_submissions', 'student_name', 'VARCHAR(255) NULL');
     ensureLecturerColumn($pdo, 'exam_submissions', 'student_identifier', 'VARCHAR(100) NULL');
+    ensureLecturerColumn($pdo, 'exam_submissions', 'answers', 'LONGTEXT NULL');
     ensureLecturerColumn($pdo, 'exam_submissions', 'submitted', 'TINYINT(1) NOT NULL DEFAULT 0');
     ensureLecturerColumn($pdo, 'exam_submissions', 'submittedAt', 'DATETIME NULL');
     ensureLecturerColumn($pdo, 'exam_submissions', 'graded_at', 'DATETIME NULL');
     ensureLecturerColumn($pdo, 'exam_submissions', 'graded_by', 'INT NULL');
     ensureLecturerColumn($pdo, 'exam_submissions', 'manual_feedback', 'TEXT NULL');
     ensureLecturerColumn($pdo, 'exam_submissions', 'execution_results', 'JSON NULL');
-    ensureLecturerColumn($pdo, 'exam_submissions', 'ai_feedback', 'TEXT NULL');
+    ensureLecturerColumn($pdo, 'exam_submissions', 'ai_feedback', 'MEDIUMTEXT NULL');
     ensureLecturerColumn($pdo, 'exam_submissions', 'auto_graded_at', 'DATETIME NULL');
+    $pdo->exec("ALTER TABLE exam_submissions MODIFY answers LONGTEXT NULL");
+    $pdo->exec("ALTER TABLE exam_submissions MODIFY ai_feedback MEDIUMTEXT NULL");
     $pdo->exec("
         ALTER TABLE exam_submissions
         MODIFY status VARCHAR(50) DEFAULT 'in_progress'

@@ -112,8 +112,11 @@ try {
     ensureExamInterfaceColumn($pdo, 'screen_captures', 'notes', 'TEXT NULL');
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'student_name', 'VARCHAR(255) NULL');
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'student_identifier', 'VARCHAR(100) NULL');
+    ensureExamInterfaceColumn($pdo, 'exam_submissions', 'answers', 'LONGTEXT NULL');
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'answers_json', 'JSON NULL');
+    ensureExamInterfaceColumn($pdo, 'exam_submissions', 'total_score', 'DECIMAL(5,2) DEFAULT 0');
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'total_marks', 'INT DEFAULT 0');
+    ensureExamInterfaceColumn($pdo, 'exam_submissions', 'percentage', 'DECIMAL(5,2) DEFAULT 0');
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'submitted', 'TINYINT(1) DEFAULT 0');
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'started_at', 'DATETIME NULL');
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'submittedAt', 'DATETIME NULL');
@@ -122,8 +125,10 @@ try {
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'submission_folder', 'VARCHAR(255) NULL');
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'auto_score', 'DECIMAL(5,2) DEFAULT 0');
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'execution_results', 'JSON NULL');
-    ensureExamInterfaceColumn($pdo, 'exam_submissions', 'ai_feedback', 'TEXT NULL');
+    ensureExamInterfaceColumn($pdo, 'exam_submissions', 'ai_feedback', 'MEDIUMTEXT NULL');
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'auto_graded_at', 'DATETIME NULL');
+    $pdo->exec("ALTER TABLE exam_submissions MODIFY answers LONGTEXT NULL");
+    $pdo->exec("ALTER TABLE exam_submissions MODIFY ai_feedback MEDIUMTEXT NULL");
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS proctor_commands (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -462,107 +467,139 @@ if (isset($_POST['action'])) {
     }
 
     if ($_POST['action'] === 'submit_exam') {
-        $answers = $_POST['answers'] ?? '[]';
-        $answersJson = (json_decode($answers, true) !== null) ? $answers : null;
-        $submittedStatus = !empty($_POST['auto_submit']) ? 'timed_out' : 'submitted';
-        $submissionFolder = preg_replace('/[^A-Za-z0-9_\-]/', '_', ($studentIdentifierForSubmission ?: 'student') . '_' . ($_POST['course_code'] ?? 'course'));
+        try {
+            $answers = $_POST['answers'] ?? '[]';
+            $answersJson = (json_decode($answers, true) !== null) ? $answers : null;
+            $submittedStatus = !empty($_POST['auto_submit']) ? 'timed_out' : 'submitted';
+            $submissionFolder = preg_replace('/[^A-Za-z0-9_\-]/', '_', ($studentIdentifierForSubmission ?: 'student') . '_' . ($_POST['course_code'] ?? 'course'));
 
-        $examStmt = $pdo->prepare("SELECT total_marks, questions, questions_to_answer, marking_scheme FROM exams WHERE id = ? LIMIT 1");
-        $examStmt->execute([$ajaxExamId]);
-        $examRow = $examStmt->fetch(PDO::FETCH_ASSOC);
-        $totalMarks = $examRow ? floatval($examRow['total_marks'] ?? 0) : 0;
-        $autoGrade = $examRow ? qodaAutoGradeExamAnswers($examRow, $answers) : [
-            'answers_json' => $answersJson,
-            'total_score' => 0,
-            'total_marks' => $totalMarks,
-            'percentage' => 0,
-            'execution_results' => null,
-            'ai_feedback' => null,
-        ];
-        $answersToStore = $autoGrade['answers_json'] ?: $answers;
-        $answersJsonToStore = (json_decode($answersToStore, true) !== null) ? $answersToStore : $answersJson;
-        $totalMarks = (float)($autoGrade['total_marks'] ?? $totalMarks);
-        $autoTotalScore = (float)($autoGrade['total_score'] ?? 0);
-        $autoPercentage = (float)($autoGrade['percentage'] ?? 0);
+            $examStmt = $pdo->prepare("SELECT total_marks, questions, questions_to_answer, marking_scheme FROM exams WHERE id = ? LIMIT 1");
+            $examStmt->execute([$ajaxExamId]);
+            $examRow = $examStmt->fetch(PDO::FETCH_ASSOC);
+            $totalMarks = $examRow ? floatval($examRow['total_marks'] ?? 0) : 0;
+            $autoGrade = [
+                'answers_json' => $answersJson,
+                'total_score' => 0,
+                'total_marks' => $totalMarks,
+                'percentage' => 0,
+                'execution_results' => null,
+                'ai_feedback' => 'Auto grading did not run for this submission.',
+            ];
 
-        $check = $pdo->prepare(
-            "SELECT id FROM exam_submissions WHERE exam_id = ? AND student_id = ? LIMIT 1"
-        );
-        $check->execute([$ajaxExamId, $studentRowId]);
-        $existing = $check->fetch(PDO::FETCH_ASSOC);
+            if ($examRow) {
+                try {
+                    $autoGrade = qodaAutoGradeExamAnswers($examRow, $answers);
+                } catch (Throwable $gradeError) {
+                    error_log('Submit auto grading failed: ' . $gradeError->getMessage());
+                    $autoGrade['ai_feedback'] = 'Auto grading failed during submission: ' . $gradeError->getMessage() . "\nThe submission was saved for lecturer review.";
+                }
+            }
 
-        if ($existing) {
-            $upd = $pdo->prepare("
-                UPDATE exam_submissions
-                SET answers = ?,
-                    answers_json = ?,
-                    total_score = ?,
-                    total_marks = ?,
-                    percentage = ?,
-                    auto_score = ?,
-                    execution_results = ?,
-                    ai_feedback = ?,
-                    auto_graded_at = NOW(),
-                    student_name = ?,
-                    student_identifier = ?,
-                    status = ?,
-                    submitted = 1,
-                    submitted_at = NOW(),
-                    submittedAt = NOW(),
-                    updated_at = NOW(),
-                    submission_folder = ?
-                WHERE id = ?
-            ");
-            $upd->execute([
-                $answersToStore,
-                $answersJsonToStore,
-                $autoTotalScore,
-                $totalMarks,
-                $autoPercentage,
-                $autoTotalScore,
-                $autoGrade['execution_results'] ?? null,
-                $autoGrade['ai_feedback'] ?? null,
-                $studentNameForSubmission,
-                $studentIdentifierForSubmission,
-                $submittedStatus,
-                $submissionFolder,
-                $existing['id']
+            $answersToStore = $autoGrade['answers_json'] ?: $answers;
+            $answersJsonToStore = (json_decode($answersToStore, true) !== null) ? $answersToStore : $answersJson;
+            if ($answersJsonToStore !== null && strlen($answersJsonToStore) > 200000) {
+                $answersJsonToStore = null;
+            }
+            $totalMarks = (float)($autoGrade['total_marks'] ?? $totalMarks);
+            $autoTotalScore = (float)($autoGrade['total_score'] ?? 0);
+            $autoPercentage = (float)($autoGrade['percentage'] ?? 0);
+            $executionResults = $autoGrade['execution_results'] ?? null;
+            $aiFeedback = $autoGrade['ai_feedback'] ?? null;
+
+            $check = $pdo->prepare(
+                "SELECT id FROM exam_submissions WHERE exam_id = ? AND student_id = ? LIMIT 1"
+            );
+            $check->execute([$ajaxExamId, $studentRowId]);
+            $existing = $check->fetch(PDO::FETCH_ASSOC);
+
+            $saveSubmission = function ($compact = false) use ($pdo, $existing, $answersToStore, $answersJsonToStore, $autoTotalScore, $totalMarks, $autoPercentage, $executionResults, $aiFeedback, $studentNameForSubmission, $studentIdentifierForSubmission, $submittedStatus, $submissionFolder, $ajaxExamId, $studentRowId) {
+                $storedExecutionResults = $compact ? null : $executionResults;
+                $storedFeedback = $compact ? 'Submission saved. Auto grading details were reduced because storage rejected the full grading payload.' : $aiFeedback;
+
+                if ($existing) {
+                    $upd = $pdo->prepare("
+                        UPDATE exam_submissions
+                        SET answers = ?,
+                            answers_json = ?,
+                            total_score = ?,
+                            total_marks = ?,
+                            percentage = ?,
+                            auto_score = ?,
+                            execution_results = ?,
+                            ai_feedback = ?,
+                            auto_graded_at = NOW(),
+                            student_name = ?,
+                            student_identifier = ?,
+                            status = ?,
+                            submitted = 1,
+                            submitted_at = NOW(),
+                            submittedAt = NOW(),
+                            updated_at = NOW(),
+                            submission_folder = ?
+                        WHERE id = ?
+                    ");
+                    $upd->execute([
+                        $answersToStore,
+                        $answersJsonToStore,
+                        $autoTotalScore,
+                        $totalMarks,
+                        $autoPercentage,
+                        $autoTotalScore,
+                        $storedExecutionResults,
+                        $storedFeedback,
+                        $studentNameForSubmission,
+                        $studentIdentifierForSubmission,
+                        $submittedStatus,
+                        $submissionFolder,
+                        $existing['id']
+                    ]);
+                    return $existing['id'];
+                }
+
+                $ins = $pdo->prepare("
+                    INSERT INTO exam_submissions
+                        (exam_id, student_id, student_name, student_identifier, answers, answers_json, total_score, total_marks, percentage, auto_score, execution_results, ai_feedback, auto_graded_at, status, submitted, started_at, submitted_at, submittedAt, ip_address, user_agent, submission_folder)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, 1, NOW(), NOW(), NOW(), ?, ?, ?)
+                ");
+                $ins->execute([
+                    $ajaxExamId,
+                    $studentRowId,
+                    $studentNameForSubmission,
+                    $studentIdentifierForSubmission,
+                    $answersToStore,
+                    $answersJsonToStore,
+                    $autoTotalScore,
+                    $totalMarks,
+                    $autoPercentage,
+                    $autoTotalScore,
+                    $storedExecutionResults,
+                    $storedFeedback,
+                    $submittedStatus,
+                    $_SERVER['REMOTE_ADDR'] ?? null,
+                    $_SERVER['HTTP_USER_AGENT'] ?? null,
+                    $submissionFolder
+                ]);
+                return $pdo->lastInsertId();
+            };
+
+            try {
+                $submissionId = $saveSubmission(false);
+            } catch (Throwable $saveError) {
+                error_log('Full submit save failed, retrying compact: ' . $saveError->getMessage());
+                $submissionId = $saveSubmission(true);
+            }
+
+            echo json_encode([
+                'success' => true,
+                'submission_id' => $submissionId,
+                'auto_score' => $autoTotalScore,
+                'percentage' => $autoPercentage,
+                'exam_score_60' => round(($autoPercentage * 60) / 100, 2),
             ]);
-            $submissionId = $existing['id'];
-        } else {
-            $ins = $pdo->prepare("
-                INSERT INTO exam_submissions
-                    (exam_id, student_id, student_name, student_identifier, answers, answers_json, total_score, total_marks, percentage, auto_score, execution_results, ai_feedback, auto_graded_at, status, submitted, started_at, submitted_at, submittedAt, ip_address, user_agent, submission_folder)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, 1, NOW(), NOW(), NOW(), ?, ?, ?)
-            ");
-            $ins->execute([
-                $ajaxExamId,
-                $studentRowId,
-                $studentNameForSubmission,
-                $studentIdentifierForSubmission,
-                $answersToStore,
-                $answersJsonToStore,
-                $autoTotalScore,
-                $totalMarks,
-                $autoPercentage,
-                $autoTotalScore,
-                $autoGrade['execution_results'] ?? null,
-                $autoGrade['ai_feedback'] ?? null,
-                $submittedStatus,
-                $_SERVER['REMOTE_ADDR'] ?? null,
-                $_SERVER['HTTP_USER_AGENT'] ?? null,
-                $submissionFolder
-            ]);
-            $submissionId = $pdo->lastInsertId();
+        } catch (Throwable $submitError) {
+            error_log('Submit exam failed: ' . $submitError->getMessage());
+            echo json_encode(['success' => false, 'error' => 'Submission could not be saved: ' . $submitError->getMessage()]);
         }
-
-        echo json_encode([
-            'success' => true,
-            'submission_id' => $submissionId,
-            'auto_score' => $autoTotalScore,
-            'percentage' => $autoPercentage,
-            'exam_score_60' => round(($autoPercentage * 60) / 100, 2),
-        ]);
         exit;
     }
 
@@ -6072,7 +6109,16 @@ endif;
                 body: formData
             });
 
-            const result = await response.json();
+            const responseText = await response.text();
+            let result = null;
+            try {
+                result = JSON.parse(responseText);
+            } catch (parseError) {
+                throw new Error(responseText.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300) || 'Invalid server response');
+            }
+            if (!response.ok) {
+                throw new Error(result?.error || `Server returned HTTP ${response.status}`);
+            }
 
             if (result.success) {
                 // Mark as submitted
@@ -6099,7 +6145,7 @@ endif;
 
         } catch (error) {
             console.error("Submit error:", error);
-            showMessageBox("Network error. Your answers are saved locally.");
+            showMessageBox("Submission error: " + (error.message || "Your answers are saved locally."));
             localStorage.setItem('exam_backup_' + examId, JSON.stringify(submissionData));
             document.querySelectorAll('button').forEach(btn => btn.disabled = false);
         }
