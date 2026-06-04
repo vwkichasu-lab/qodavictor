@@ -67,6 +67,21 @@ try {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ");
     $pdo->exec("ALTER TABLE proctor_commands MODIFY command_type ENUM('warning', 'lock', 'unlock') NOT NULL");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS proctor_screen_status (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            exam_id INT NOT NULL,
+            student_id INT NOT NULL,
+            sharing_active TINYINT(1) NOT NULL DEFAULT 0,
+            last_heartbeat_at DATETIME NULL,
+            last_frame_at DATETIME NULL,
+            last_status VARCHAR(40) NOT NULL DEFAULT 'offline',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_exam_student (exam_id, student_id),
+            INDEX idx_heartbeat (last_heartbeat_at),
+            INDEX idx_frame (last_frame_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
 } catch (Exception $e) {
     error_log('Exam interface schema upgrade failed: ' . $e->getMessage());
 }
@@ -241,6 +256,52 @@ if (isset($_POST['action'])) {
     $studentRowId = $sRow ? $sRow['id'] : $ajaxStudentId;
     $studentNameForSubmission = $sRow['full_name'] ?? ($_SESSION['user_name'] ?? null);
     $studentIdentifierForSubmission = $sRow['student_id'] ?? ($_SESSION['user_id_value'] ?? null);
+
+    if ($_POST['action'] === 'screen_heartbeat') {
+        $active = (int)($_POST['active'] ?? 1) === 1 ? 1 : 0;
+        $status = $active ? 'sharing' : 'offline';
+
+        $stmt = $pdo->prepare("
+            INSERT INTO proctor_screen_status (exam_id, student_id, sharing_active, last_heartbeat_at, last_status)
+            VALUES (?, ?, ?, NOW(), ?)
+            ON DUPLICATE KEY UPDATE
+                sharing_active = VALUES(sharing_active),
+                last_heartbeat_at = VALUES(last_heartbeat_at),
+                last_status = VALUES(last_status),
+                updated_at = CURRENT_TIMESTAMP
+        ");
+        $stmt->execute([$ajaxExamId, $studentRowId, $active, $status]);
+
+        if ($active) {
+            $session = $pdo->prepare("SELECT id FROM exam_submissions WHERE exam_id = ? AND student_id = ? LIMIT 1");
+            $session->execute([$ajaxExamId, $studentRowId]);
+            $sessionId = $session->fetchColumn();
+            if ($sessionId) {
+                $pdo->prepare("
+                    UPDATE exam_submissions
+                    SET updated_at = NOW(), status = IF(UPPER(status) IN ('SUBMITTED', 'TIMED_OUT', 'GRADED', 'MARKED', 'AUTO_GRADED', 'MANUALLY_GRADED'), status, 'in_progress')
+                    WHERE id = ?
+                ")->execute([$sessionId]);
+            } else {
+                $ins = $pdo->prepare("
+                    INSERT INTO exam_submissions
+                        (exam_id, student_id, student_name, student_identifier, status, started_at, updated_at, ip_address, user_agent)
+                    VALUES (?, ?, ?, ?, 'in_progress', NOW(), NOW(), ?, ?)
+                ");
+                $ins->execute([
+                    $ajaxExamId,
+                    $studentRowId,
+                    $studentNameForSubmission,
+                    $studentIdentifierForSubmission,
+                    $_SERVER['REMOTE_ADDR'] ?? null,
+                    $_SERVER['HTTP_USER_AGENT'] ?? null
+                ]);
+            }
+        }
+
+        echo json_encode(['success' => true, 'active' => $active, 'heartbeat_at' => date('Y-m-d H:i:s')]);
+        exit;
+    }
 
     if ($_POST['action'] === 'start_exam') {
         // Create an in_progress record if none exists
@@ -451,6 +512,17 @@ if (isset($_POST['action'])) {
         ");
         $stmt->execute([$ajaxExamId, $studentRowId, $imagePath, $snapshot, $captureType, $notes]);
         $captureId = $pdo->lastInsertId();
+        $status = $pdo->prepare("
+            INSERT INTO proctor_screen_status (exam_id, student_id, sharing_active, last_heartbeat_at, last_frame_at, last_status)
+            VALUES (?, ?, 1, NOW(), NOW(), 'sharing')
+            ON DUPLICATE KEY UPDATE
+                sharing_active = 1,
+                last_heartbeat_at = NOW(),
+                last_frame_at = NOW(),
+                last_status = 'sharing',
+                updated_at = CURRENT_TIMESTAMP
+        ");
+        $status->execute([$ajaxExamId, $studentRowId]);
         if ($captureType === 'live') {
             try {
                 $cleanup = $pdo->prepare("
@@ -481,7 +553,7 @@ if (isset($_POST['action'])) {
         if ($sessionId) {
             $pdo->prepare("
                 UPDATE exam_submissions
-                SET updated_at = NOW(), status = IF(UPPER(status) IN ('SUBMITTED', 'GRADED', 'MARKED', 'AUTO_GRADED', 'MANUALLY_GRADED'), status, 'in_progress')
+                SET updated_at = NOW(), status = IF(UPPER(status) IN ('SUBMITTED', 'TIMED_OUT', 'GRADED', 'MARKED', 'AUTO_GRADED', 'MANUALLY_GRADED'), status, 'in_progress')
                 WHERE id = ?
             ")->execute([$sessionId]);
         } else {
@@ -2761,9 +2833,11 @@ endif;
     let proctorCommandInterval = null;
     let screenVideoEl = null;
     let screenCanvasEl = null;
+    let screenImageCapture = null;
     let screenSnapshotInFlight = false;
     let screenSharePromptActive = false;
     let screenShareStartedThisPage = false;
+    let screenHeartbeatInterval = null;
     let pageIsUnloading = false;
 
     // Start screen share with persistence
@@ -2804,17 +2878,24 @@ endif;
             localStorage.setItem('screen_sharing_start_time', Date.now().toString());
             updateScreenShareButton();
             document.getElementById('screenShareRequiredOverlay')?.remove();
+            const track = screenStream.getVideoTracks()[0];
+            try {
+                screenImageCapture = (track && window.ImageCapture) ? new ImageCapture(track) : null;
+            } catch (captureError) {
+                screenImageCapture = null;
+            }
+            startScreenHeartbeat();
             setupScreenCapturePipeline();
             startProctorCommandPolling();
             await requestExamFullscreen();
             showToast('Screen sharing active!', 'success');
 
-            const track = screenStream.getVideoTracks()[0];
             if (track) {
                 track.onended = function() {
                     console.log("Screen sharing stopped");
                     screenSharingActive = false;
                     stopScreenCapturePipeline();
+                    stopScreenHeartbeat();
                     updateScreenShareButton();
                     localStorage.removeItem('screen_active_' + examId);
                     localStorage.removeItem('screen_sharing_active');
@@ -3005,33 +3086,90 @@ endif;
     function stopScreenCapturePipeline() {
         if (screenCaptureInterval) clearInterval(screenCaptureInterval);
         screenCaptureInterval = null;
+        screenImageCapture = null;
+    }
+
+    function startScreenHeartbeat() {
+        if (screenHeartbeatInterval) clearInterval(screenHeartbeatInterval);
+        sendScreenHeartbeat(true);
+        screenHeartbeatInterval = setInterval(() => sendScreenHeartbeat(true), 2000);
+    }
+
+    function stopScreenHeartbeat() {
+        if (screenHeartbeatInterval) clearInterval(screenHeartbeatInterval);
+        screenHeartbeatInterval = null;
+        sendScreenHeartbeat(false);
+    }
+
+    async function sendScreenHeartbeat(active = true) {
+        if (isPreview || !examId) return;
+        const formData = new URLSearchParams();
+        formData.append('action', 'screen_heartbeat');
+        formData.append('exam_id', examId);
+        formData.append('active', active ? '1' : '0');
+        try {
+            await fetch('', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: formData.toString(),
+                keepalive: true
+            });
+        } catch (error) {
+            console.error('Screen heartbeat failed:', error);
+        }
+    }
+
+    async function drawScreenFrame(ctx, frameWidth, frameHeight) {
+        let source = null;
+        let sourceWidth = frameWidth;
+        let sourceHeight = frameHeight;
+
+        if (screenImageCapture && typeof screenImageCapture.grabFrame === 'function') {
+            try {
+                source = await screenImageCapture.grabFrame();
+                sourceWidth = source.width || frameWidth;
+                sourceHeight = source.height || frameHeight;
+            } catch (error) {
+                source = null;
+            }
+        }
+
+        if (!source) {
+            if (!screenVideoEl || screenVideoEl.readyState < 2) return false;
+            source = screenVideoEl;
+            sourceWidth = screenVideoEl.videoWidth || frameWidth;
+            sourceHeight = screenVideoEl.videoHeight || frameHeight;
+        }
+
+        const ratio = Math.min(frameWidth / sourceWidth, frameHeight / sourceHeight);
+        const drawWidth = Math.max(1, Math.floor(sourceWidth * ratio));
+        const drawHeight = Math.max(1, Math.floor(sourceHeight * ratio));
+        ctx.fillStyle = '#111827';
+        ctx.fillRect(0, 0, frameWidth, frameHeight);
+        ctx.drawImage(source, (frameWidth - drawWidth) / 2, (frameHeight - drawHeight) / 2, drawWidth, drawHeight);
+        if (source && typeof source.close === 'function') source.close();
+        return true;
     }
 
     async function sendScreenSnapshot(captureType = 'live', notes = '') {
-        if (!screenSharingActive || !screenVideoEl || screenVideoEl.readyState < 2 || !screenCanvasEl) return;
+        if (!screenSharingActive || !screenCanvasEl) return;
         if (captureType === 'live' && screenSnapshotInFlight) return;
         if (captureType === 'live') screenSnapshotInFlight = true;
         const frameWidth = captureType === 'live' ? 800 : 1280;
         const frameHeight = captureType === 'live' ? 450 : 720;
         const ctx = screenCanvasEl.getContext('2d');
-        const sourceWidth = screenVideoEl.videoWidth || frameWidth;
-        const sourceHeight = screenVideoEl.videoHeight || frameHeight;
-        const ratio = Math.min(frameWidth / sourceWidth, frameHeight / sourceHeight);
-        const drawWidth = Math.max(1, Math.floor(sourceWidth * ratio));
-        const drawHeight = Math.max(1, Math.floor(sourceHeight * ratio));
         screenCanvasEl.width = frameWidth;
         screenCanvasEl.height = frameHeight;
-        ctx.fillStyle = '#111827';
-        ctx.fillRect(0, 0, frameWidth, frameHeight);
-        ctx.drawImage(screenVideoEl, (frameWidth - drawWidth) / 2, (frameHeight - drawHeight) / 2, drawWidth, drawHeight);
-        const snapshot = screenCanvasEl.toDataURL('image/jpeg', captureType === 'live' ? 0.42 : 0.72);
-        const formData = new FormData();
-        formData.append('action', 'screen_snapshot');
-        formData.append('exam_id', examId);
-        formData.append('snapshot', snapshot);
-        formData.append('capture_type', captureType);
-        if (notes) formData.append('notes', notes);
         try {
+            const drewFrame = await drawScreenFrame(ctx, frameWidth, frameHeight);
+            if (!drewFrame) return;
+            const snapshot = screenCanvasEl.toDataURL('image/jpeg', captureType === 'live' ? 0.42 : 0.72);
+            const formData = new FormData();
+            formData.append('action', 'screen_snapshot');
+            formData.append('exam_id', examId);
+            formData.append('snapshot', snapshot);
+            formData.append('capture_type', captureType);
+            if (notes) formData.append('notes', notes);
             const response = await fetch('', {
                 method: 'POST',
                 body: formData
@@ -3045,6 +3183,7 @@ endif;
             }
         } catch (error) {
             console.error('Snapshot upload failed:', error);
+            if (captureType === 'live') sendScreenHeartbeat(true);
         } finally {
             if (captureType === 'live') screenSnapshotInFlight = false;
         }

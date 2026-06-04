@@ -266,6 +266,21 @@ try {
         MODIFY command_type ENUM('warning', 'lock', 'unlock') NOT NULL
     ");
     $pdo->exec("
+        CREATE TABLE IF NOT EXISTS proctor_screen_status (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            exam_id INT NOT NULL,
+            student_id INT NOT NULL,
+            sharing_active TINYINT(1) NOT NULL DEFAULT 0,
+            last_heartbeat_at DATETIME NULL,
+            last_frame_at DATETIME NULL,
+            last_status VARCHAR(40) NOT NULL DEFAULT 'offline',
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_exam_student (exam_id, student_id),
+            INDEX idx_heartbeat (last_heartbeat_at),
+            INDEX idx_frame (last_frame_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+    $pdo->exec("
         CREATE TABLE IF NOT EXISTS exam_question_grading (
             id INT AUTO_INCREMENT PRIMARY KEY,
             submission_id INT NOT NULL,
@@ -1008,8 +1023,12 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $stmt = $pdo->prepare("
                         SELECT
                             active.student_id,
-                            MAX(COALESCE(sc.captured_at, es.updated_at, es.started_at, es.created_at)) AS last_activity,
-                            CASE WHEN MAX(CASE WHEN sc.capture_type = 'live' THEN sc.captured_at ELSE NULL END) >= (NOW() - INTERVAL 45 SECOND) THEN 1 ELSE 0 END AS screen_sharing_active,
+                            MAX(COALESCE(pss.last_frame_at, pss.last_heartbeat_at, sc.captured_at, es.updated_at, es.started_at, es.created_at)) AS last_activity,
+                            CASE
+                                WHEN MAX(CASE WHEN sc.capture_type = 'live' THEN sc.captured_at ELSE NULL END) >= (NOW() - INTERVAL 45 SECOND)
+                                  OR MAX(CASE WHEN COALESCE(pss.sharing_active, 0) = 1 AND pss.last_heartbeat_at >= (NOW() - INTERVAL 15 SECOND) THEN 1 ELSE 0 END) = 1
+                                THEN 1 ELSE 0
+                            END AS screen_sharing_active,
                             COUNT(DISTINCT sl.id) AS violations,
                             MAX(CASE WHEN pc.command_type = 'lock' THEN 1 WHEN pc.command_type = 'unlock' THEN 0 ELSE 0 END) AS screen_locked,
                             MAX(COALESCE(es.submitted, 0)) AS submitted,
@@ -1054,9 +1073,12 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             SELECT student_id FROM exam_submissions WHERE exam_id = ?
                             UNION
                             SELECT student_id FROM screen_captures WHERE exam_id = ?
+                            UNION
+                            SELECT student_id FROM proctor_screen_status WHERE exam_id = ?
                         ) active
                         LEFT JOIN exam_submissions es ON es.exam_id = ? AND es.student_id = active.student_id
                         LEFT JOIN screen_captures sc ON sc.exam_id = ? AND sc.student_id = active.student_id
+                        LEFT JOIN proctor_screen_status pss ON pss.exam_id = ? AND pss.student_id = active.student_id
                         LEFT JOIN suspicious_logs sl ON sl.exam_id = ? AND sl.student_id = active.student_id
                         LEFT JOIN proctor_commands pc ON pc.id = (
                             SELECT pc2.id
@@ -1069,7 +1091,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         )
                         GROUP BY active.student_id
                     ");
-                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId]);
+                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId]);
                     echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -1084,7 +1106,12 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                                sc.id AS snapshot_id,
                                sc.image_data AS snapshot,
                                sc.captured_at,
-                               CASE WHEN sc.captured_at >= (NOW() - INTERVAL 45 SECOND) THEN 1 ELSE 0 END AS screen_sharing_active,
+                               pss.last_heartbeat_at,
+                               CASE
+                                   WHEN sc.captured_at >= (NOW() - INTERVAL 45 SECOND)
+                                     OR (COALESCE(pss.sharing_active, 0) = 1 AND pss.last_heartbeat_at >= (NOW() - INTERVAL 15 SECOND))
+                                   THEN 1 ELSE 0
+                               END AS screen_sharing_active,
                                COUNT(DISTINCT sl.id) AS violations,
                                MAX(COALESCE(es.submitted, 0)) AS submitted,
                                MAX(es.submitted_at) AS submitted_at,
@@ -1101,6 +1128,8 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             SELECT student_id FROM screen_captures WHERE exam_id = ?
                             UNION
                             SELECT student_id FROM exam_submissions WHERE exam_id = ?
+                            UNION
+                            SELECT student_id FROM proctor_screen_status WHERE exam_id = ?
                         ) active
                         LEFT JOIN screen_captures sc ON sc.id = (
                             SELECT sc2.id
@@ -1112,10 +1141,11 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             LIMIT 1
                         )
                         LEFT JOIN exam_submissions es ON es.exam_id = ? AND es.student_id = active.student_id
+                        LEFT JOIN proctor_screen_status pss ON pss.exam_id = ? AND pss.student_id = active.student_id
                         LEFT JOIN suspicious_logs sl ON sl.exam_id = ? AND sl.student_id = active.student_id
-                        GROUP BY active.student_id, sc.id, sc.image_data, sc.captured_at
+                        GROUP BY active.student_id, sc.id, sc.image_data, sc.captured_at, pss.sharing_active, pss.last_heartbeat_at
                     ");
-                    $stmt->execute([$examId, $examId, $examId, $examId, $examId]);
+                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId, $examId]);
                     echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -1127,16 +1157,29 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $examId = intval($_POST['exam_id'] ?? 0);
                     $studentId = intval($_POST['student_id'] ?? 0);
                     $stmt = $pdo->prepare("
-                        SELECT sc.student_id, sc.image_data AS snapshot, sc.captured_at,
-                               CASE WHEN sc.captured_at >= (NOW() - INTERVAL 45 SECOND) THEN 1 ELSE 0 END AS screen_sharing_active,
-                               (SELECT COUNT(*) FROM suspicious_logs sl WHERE sl.exam_id = sc.exam_id AND sl.student_id = sc.student_id) AS violations
-                        FROM screen_captures sc
-                        WHERE sc.exam_id = ? AND sc.student_id = ?
-                          AND sc.capture_type = 'live'
-                        ORDER BY sc.id DESC
-                        LIMIT 1
+                        SELECT active.student_id,
+                               sc.image_data AS snapshot,
+                               sc.captured_at,
+                               pss.last_heartbeat_at,
+                               CASE
+                                   WHEN sc.captured_at >= (NOW() - INTERVAL 45 SECOND)
+                                     OR (COALESCE(pss.sharing_active, 0) = 1 AND pss.last_heartbeat_at >= (NOW() - INTERVAL 15 SECOND))
+                                   THEN 1 ELSE 0
+                               END AS screen_sharing_active,
+                               (SELECT COUNT(*) FROM suspicious_logs sl WHERE sl.exam_id = ? AND sl.student_id = active.student_id) AS violations
+                        FROM (SELECT ? AS student_id) active
+                        LEFT JOIN screen_captures sc ON sc.id = (
+                            SELECT sc2.id
+                            FROM screen_captures sc2
+                            WHERE sc2.exam_id = ?
+                              AND sc2.student_id = active.student_id
+                              AND sc2.capture_type = 'live'
+                            ORDER BY sc2.id DESC
+                            LIMIT 1
+                        )
+                        LEFT JOIN proctor_screen_status pss ON pss.exam_id = ? AND pss.student_id = active.student_id
                     ");
-                    $stmt->execute([$examId, $studentId]);
+                    $stmt->execute([$examId, $studentId, $examId, $examId]);
                     echo json_encode(['success' => true, 'data' => $stmt->fetch(PDO::FETCH_ASSOC)]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -18883,15 +18926,16 @@ function createCourseTable($courseCode)
 
                 activeProctoringStudents = studentsResult.data.map(student => {
                     const session = activeSessions.find(s => s.student_id == student.id);
-                    const hasFreshFrame = !!(session && session.snapshot && (parseInt(session.screen_sharing_active || 0) === 1 || isFreshProctorFrame(session.latest_snapshot_at)));
+                    const isSharing = !!(session && parseInt(session.screen_sharing_active || 0) === 1);
+                    const hasFreshFrame = !!(session && session.snapshot && isFreshProctorFrame(session.latest_snapshot_at));
                     return {
                         id: student.id,
                         student_id: student.student_id,
                         full_name: student.full_name,
                         level: student.level,
                         programme: student.programme,
-                        screenSharing: hasFreshFrame,
-                        status: hasFreshFrame ? 'active' : 'offline',
+                        screenSharing: isSharing,
+                        status: isSharing ? 'active' : 'offline',
                         violationCount: session ? parseInt(session.violations || 0) : 0,
                         lastActivity: session ? (session.latest_snapshot_at || session.last_activity) : null,
                         snapshot: hasFreshFrame ? (session.snapshot || '') : '',
@@ -18968,7 +19012,7 @@ function createCourseTable($courseCode)
                                 <div style="width:72px;height:72px;border-radius:50%;background:linear-gradient(135deg,#2563eb,#14b8a6);display:flex;align-items:center;justify-content:center;margin:0 auto 12px;color:white;font-size:28px;font-weight:800;">
                                     ${escapeHTML((student.full_name || '?').trim().charAt(0).toUpperCase())}
                                 </div>
-                                <p style="margin:0 0 4px;">${student.latestSnapshotAt ? 'Live feed paused' : 'Screen not shared'}</p>
+                                <p style="margin:0 0 4px;">${sharingStatus ? (student.latestSnapshotAt ? 'Live feed paused' : 'Screen shared, waiting for live frame') : 'Screen not shared'}</p>
                                 <small>${escapeHTML(student.full_name || 'Student')}</small>
                         </div>
                     </div>
@@ -19085,10 +19129,11 @@ function createCourseTable($courseCode)
 
                     const student = activeProctoringStudents.find(s => String(s.id) === String(update.student_id));
                     if (student) {
-                        const hasFreshFrame = !!update.snapshot && (parseInt(update.screen_sharing_active || 0) === 1 || isFreshProctorFrame(update.captured_at));
-                        student.screenSharing = hasFreshFrame;
+                        const isSharing = parseInt(update.screen_sharing_active || 0) === 1;
+                        const hasFreshFrame = !!update.snapshot && isFreshProctorFrame(update.captured_at);
+                        student.screenSharing = isSharing;
                         student.status = student.screenSharing ? 'active' : 'offline';
-                        student.lastActivity = update.captured_at || student.lastActivity;
+                        student.lastActivity = update.captured_at || update.last_heartbeat_at || student.lastActivity;
                         student.violationCount = parseInt(update.violations || student.violationCount || 0);
                         student.snapshot = hasFreshFrame ? (update.snapshot || '') : '';
                         student.snapshotId = hasFreshFrame ? (update.snapshot_id || '') : '';
@@ -19160,7 +19205,11 @@ function createCourseTable($courseCode)
         if (placeholder) {
             placeholder.style.display = isSharing && student.snapshot ? 'none' : 'block';
             const label = placeholder.querySelector('p');
-            if (label) label.textContent = student.snapshot ? 'Live feed paused' : 'Screen not shared';
+            if (label) {
+                label.textContent = isSharing
+                    ? (student.snapshot ? 'Live feed paused' : 'Screen shared, waiting for live frame')
+                    : 'Screen not shared';
+            }
         }
         if (frameTime) {
             const text = student.lastActivity ? new Date(student.lastActivity).toLocaleTimeString() : 'N/A';
@@ -19276,8 +19325,8 @@ function createCourseTable($courseCode)
                         <img id="fullScreenImg" src="${student.snapshot ? `data:image/jpeg;base64,${student.snapshot}` : ''}" alt="Screen stream" style="max-width: 100%; max-height: 100%; object-fit: contain; ${student.snapshot ? '' : 'display:none;'}">
                         <div id="fullScreenPlaceholder" style="text-align:center;color:#9ca3af;padding:30px;${student.snapshot ? 'display:none;' : ''}">
                             <i class="fas fa-desktop" style="font-size:44px;margin-bottom:12px;"></i>
-                            <p style="margin:0;font-weight:700;">Waiting for a fresh live screen frame</p>
-                            <small>The student must keep screen sharing active.</small>
+                            <p style="margin:0;font-weight:700;">${student.screenSharing ? 'Screen shared, waiting for live frame' : 'Screen not shared'}</p>
+                            <small>${student.screenSharing ? 'A fresh frame should appear in a moment.' : 'The student must keep screen sharing active.'}</small>
                         </div>
                     </div>
                     <div id="fullLiveIndicator" class="live-indicator-full" style="position: absolute; top: 20px; right: 20px; background: #ef4444; color: white; padding: 8px 16px; border-radius: 8px; font-weight: 600; ${student.snapshot ? '' : 'display:none;'}">
@@ -19305,7 +19354,8 @@ function createCourseTable($courseCode)
                     exam_id: currentProctoringExam
                 });
 
-                const hasFreshFrame = result.success && result.data && result.data.snapshot && (parseInt(result.data.screen_sharing_active || 0) === 1 || isFreshProctorFrame(result.data.captured_at));
+                const isSharing = result.success && result.data && parseInt(result.data.screen_sharing_active || 0) === 1;
+                const hasFreshFrame = result.success && result.data && result.data.snapshot && isFreshProctorFrame(result.data.captured_at);
                 if (hasFreshFrame) {
                     const fullScreenImg = document.getElementById('fullScreenImg');
                     const placeholder = document.getElementById('fullScreenPlaceholder');
@@ -19351,6 +19401,10 @@ function createCourseTable($courseCode)
                     }
                     if (placeholder) {
                         placeholder.style.display = 'block';
+                        const label = placeholder.querySelector('p');
+                        const small = placeholder.querySelector('small');
+                        if (label) label.textContent = isSharing ? 'Screen shared, waiting for live frame' : 'Screen not shared';
+                        if (small) small.textContent = isSharing ? 'A fresh frame should appear in a moment.' : 'The student must keep screen sharing active.';
                     }
                     if (liveIndicator) {
                         liveIndicator.style.display = 'none';
