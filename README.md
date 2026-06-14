@@ -1,66 +1,143 @@
-# QODA — Online Coding Examination System
+# QODA PU
 
-A focused PHP/MySQL system where lecturers create **coding exams** and students write, run, and submit code in the browser. **No MCQ, short answer, or essay — coding only.**
+QODA PU is a secure coding examination platform for creating, publishing, monitoring, grading, and reviewing programming exams. It supports lecturer exam building, student exam delivery, browser-based coding, test-case grading, live proctoring, realtime screen monitoring, score sheets, and deployment on Railway.
 
-## Stack
-- PHP 7.4+ / 8+
-- MySQL (XAMPP / phpMyAdmin)
-- HTML / CSS / vanilla JS (in-browser JavaScript runner)
+Live app: [https://qoda-production.up.railway.app](https://qoda-production.up.railway.app)
 
-## Install (XAMPP)
+Repository: [https://github.com/vwkichasu-lab/qodavictor](https://github.com/vwkichasu-lab/qodavictor)
 
-1. Copy the `qoda` folder into `xampp/htdocs/`.
-2. Start **Apache** and **MySQL** in XAMPP.
-3. If your MySQL port is **3306** (not 3307), edit both:
-   - `config/db.php`
-   - `config/install.php`
-   change `$DB_PORT = '3307'` → `'3306'`.
-4. Visit **http://localhost/qoda/config/install.php** once — this creates the database, tables, demo accounts, and a sample JavaScript exam.
-5. Go to **http://localhost/qoda/**.
+## Project Structure
 
-## Database Changes
+![QODA project structure](docs/project-structure-main.png)
 
-- Keep the full project schema updated in `backend-php/database.sql`.
-- When a feature needs a database change, update the SQL file in VS Code and also provide the exact SQL snippet that can be pasted into phpMyAdmin.
-- Use phpMyAdmin for live database updates, then keep `backend-php/database.sql` as the source of truth for fresh installs or resets.
-- Project upgrades should also be added to `database/migrations/` and applied with `php scripts/migrate.php`.
+![QODA main application structure](docs/project-structure-application.png)
 
-## Upgrade Checks
+## Main Features
 
-Before deploying or after pulling updates, run:
+- Lecturer dashboard for exam creation, publishing, grading, monitoring, and student management.
+- Student dashboard for viewing available exams, starting exams, and reviewing results.
+- Secure coding exam interface with timer, save, submit, compiler panel, starter code, and question navigation.
+- Multi-language code execution and grading support through PHP, Node.js, Python, Java, C/C++, .NET, and related runtime tooling.
+- Test-case based grading with model solutions, marking schemes, and score storage.
+- Live proctoring tools with screen-sharing status, violations, locks, warnings, and evidence workflow.
+- Realtime Socket.IO server for live monitoring, exam control messages, and screen-share signaling.
+- Railway deployment with Docker-based build and startup migration support.
+- MySQL database schema and migration files for repeatable setup.
+
+## Technology Stack
+
+- PHP 8.3
+- MySQL / MariaDB
+- JavaScript, HTML, CSS
+- Node.js
+- Socket.IO
+- Monaco Editor
+- Docker
+- Railway
+
+## Main Folders
+
+```text
+QODA/
+|-- assets/                 Shared images, styles, and QODA branding
+|-- auth/                   Lecturer registration and auth entry points
+|-- web-client/             Main browser pages for students, lecturers, and admins
+|-- backend-php/            PHP API, controllers, grading, security, and DB logic
+|-- database/migrations/    SQL migrations
+|-- scripts/                Migration, preflight, smoke-test, and realtime server scripts
+|-- includes/               Shared legacy layout/auth helpers
+|-- backend/                Node/Prisma backend reference implementation
+|-- Dockerfile              Railway container build
+|-- railway.json            Railway deployment configuration
+`-- package.json            Node dependencies and startup command
+```
+
+## Local Setup
+
+1. Install XAMPP or another PHP/MySQL environment.
+2. Clone the repository into your web root.
+
+```bash
+git clone https://github.com/vwkichasu-lab/qodavictor.git QODA
+cd QODA
+```
+
+3. Install Node dependencies.
+
+```bash
+npm install
+```
+
+4. Create your local environment variables. Do not commit real secrets.
+
+```bash
+cp .env.example .env
+```
+
+5. Configure database connection values for your local MySQL database.
+6. Import the schema or run migrations.
+
+```bash
+php scripts/migrate.php
+```
+
+7. Start the realtime server.
+
+```bash
+npm start
+```
+
+8. Open the app in your browser through your local PHP/XAMPP URL.
+
+## Useful Commands
 
 ```bash
 php scripts/migrate.php
 php scripts/preflight.php
 php scripts/smoke_grade.php
+npm test
+npm start
 ```
 
-The longer upgrade roadmap is in `PROJECT_UPGRADE_PLAN.md`.
+## Railway Deployment
 
-## Demo accounts (password: `password123`)
-- Lecturer: `lecturer@qoda.test`
-- Student: `student@qoda.test`
+This project is configured for Railway using `Dockerfile` and `railway.json`.
 
-## Flow
+The container starts by running database migrations and then starts the Node/Socket.IO realtime server, which proxies PHP requests internally.
 
-**Lecturer:** Login → Create Exam → add coding questions (prompt + language + expected output + points) → Save.
-
-**Student:** Login → Available Exams → Start → write code (timer running) → click **Run** for JavaScript questions (output captured automatically) → Submit.
-
-## Grading
-- **JavaScript** questions are auto-graded by exact stdout match (`console.log` output trimmed and compared to the expected output).
-- **Other languages** (Python, PHP, Java, C++, Other) are stored as code text and graded manually by the lecturer in the **Grade** screen.
-
-## Files
+```bash
+railway up --service qoda
 ```
-qoda/
-  config/         db.php, install.php
-  auth/           login.php, register.php, logout.php
-  lecturer/       dashboard.php, create_exam.php, save_exam.php,
-                  view_exams.php, submissions.php, grade.php
-  student/        dashboard.php, exams.php, take_exam.php,
-                  submit_exam.php, result.php, results.php
-  includes/       auth.php, header.php, footer.php
-  assets/css/     style.css
-  index.php
+
+Required production environment values should be configured in Railway variables, not committed to GitHub.
+
+## Database
+
+The main schema reference is:
+
+```text
+backend-php/database.sql
 ```
+
+Incremental migrations live in:
+
+```text
+database/migrations/
+```
+
+Run migrations with:
+
+```bash
+php scripts/migrate.php
+```
+
+## Security Notes
+
+- Keep `.env`, Railway tokens, database passwords, and API keys out of Git.
+- Use Railway variables or a managed secret store for production credentials.
+- Do not commit uploads, runtime execution output, or local database dumps.
+- Review the repository before pushing public changes that may contain credentials.
+
+## License
+
+This project is currently marked as ISC in `package.json`. Update this section if the institution uses a different license.
