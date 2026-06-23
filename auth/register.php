@@ -141,6 +141,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
         $error = 'Please fill all required fields.';
     } elseif (registerLooksLikeStudentIdentifier($username)) {
         $error = 'This looks like a student ID. Students should not register here. Please use the login details given by your lecturer.';
+    } elseif (str_contains($username, '/')) {
+        $error = 'Do not use a student or staff ID as your username. Enter a simple name-based lecturer username instead.';
     } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
         $error = 'Please enter a valid email address.';
     } else {
@@ -286,6 +288,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
             box-shadow: 0 16px 32px rgba(37,99,235,.28);
         }
         .error { margin-bottom: 14px; padding: 12px 14px; border-radius: 14px; background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
+        .notice { margin-bottom: 14px; padding: 14px; border-radius: 16px; background:#eff6ff; border:1px solid #bfdbfe; color:#1d4ed8; line-height:1.45; }
+        .notice strong { display:block; margin-bottom:4px; color:#1e3a8a; }
+        .field-hint { display:block; margin-top:6px; color:#64748b; font-size:12px; line-height:1.35; }
         .back { display:block; margin-top: 14px; text-align:center; color:#2563eb; font-weight:800; text-decoration:none; }
         .modal {
             position: fixed;
@@ -338,13 +343,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
             <div class="top">
                 <div>
                     <h1>Lecturer Registration</h1>
-                    <p style="margin:6px 0 0;color:#64748b;">Create your QODA account.</p>
+                    <p style="margin:6px 0 0;color:#64748b;">Create a lecturer account for managing QODA exams.</p>
                 </div>
                 <div class="logo"><img src="../assets/qoda-logo.png" alt="QODA logo"></div>
             </div>
 
-            <div class="error" style="background:#eff6ff;border-color:#bfdbfe;color:#1d4ed8;">
-                Students should not register here. Use the student ID and password given by your lecturer.
+            <div class="notice">
+                <strong>Lecturers only</strong>
+                Students should not register here. Student IDs such as PUIT/, PUSE/, PUAS/, PU/, or PUC/ must be used on the login page with the password given by the lecturer.
             </div>
 
             <?php if ($error): ?>
@@ -362,8 +368,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
                         </select>
                     </div>
                     <div>
-                        <label for="username">Username</label>
-                        <input id="username" name="username" required value="<?= htmlspecialchars($_POST['username'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
+                        <label for="username">Preferred Lecturer Username</label>
+                        <input id="username" name="username" required
+                            placeholder="e.g., victor.kichasu"
+                            autocomplete="username"
+                            value="<?= htmlspecialchars($_POST['username'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
+                        <small class="field-hint">Do not enter a student ID like PUIT/22110014 here.</small>
                     </div>
                     <div>
                         <label for="name">Full Name</label>
@@ -375,7 +385,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
                     </div>
                     <div class="full">
                         <label for="department">Department</label>
-                        <input id="department" name="department" required value="<?= htmlspecialchars($_POST['department'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
+                        <input id="department" name="department" required
+                            placeholder="e.g., Information Technology"
+                            value="<?= htmlspecialchars($_POST['department'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
+                        <small class="field-hint">QODA will generate your lecturer ID from this department, for example PULC/IT/00001.</small>
                     </div>
                 </div>
                 <button class="submit" type="submit">Create Lecturer Account</button>
@@ -387,7 +400,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
     <div class="modal <?= $registeredStaffId ? 'show' : '' ?>" id="successModal">
         <div class="modal-card">
             <h2 style="margin:0 0 8px;">Registration Successful</h2>
-            <p style="color:#475569;line-height:1.55;">Your generated staff ID is your username and default password. Change it after first login.</p>
+            <p style="color:#475569;line-height:1.55;">Use this generated lecturer ID as your login ID and default password. Change it after first login.</p>
             <div class="generated-id"><?= htmlspecialchars($registeredStaffId, ENT_QUOTES, 'UTF-8') ?></div>
             <a href="<?= htmlspecialchars(register_base_url('web-client/login.php'), ENT_QUOTES, 'UTF-8') ?>">Go to Login</a>
         </div>
