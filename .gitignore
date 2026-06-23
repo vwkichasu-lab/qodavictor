@@ -17,6 +17,7 @@ tools/
 *.log
 *.tmp
 *.cache
+backups/
 
 # Local IDE/system files
 .vscode/
