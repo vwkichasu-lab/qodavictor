@@ -571,9 +571,47 @@
         </div>
     </div>
 
+    <!-- Course Stats Modal -->
+    <div id="courseStatsModal" class="modal" style="display:none;">
+        <div class="modal-content course-stats-modal">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h3><i class="fas fa-chart-line"></i> Course Performance Summary</h3>
+                <button onclick="closeCourseStatsModal()"
+                    style="background: none; border: none; font-size: 24px; cursor: pointer;">&times;</button>
+            </div>
+            <div id="courseStatsContent"></div>
+            <div class="modal-actions">
+                <button class="btn" onclick="closeCourseStatsModal()">Close</button>
+            </div>
+        </div>
+    </div>
 
+    <!-- Submissions Stats Modal -->
+    <div id="submissionsStatsModal" class="modal" style="display:none;">
+        <div class="modal-content course-stats-modal">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h3><i class="fas fa-check-circle"></i> Submissions Summary</h3>
+                <button onclick="closeSubmissionsStatsModal()"
+                    style="background: none; border: none; font-size: 24px; cursor: pointer;">&times;</button>
+            </div>
+            <div id="submissionsStatsContent"></div>
+            <div class="modal-actions">
+                <button class="btn" onclick="closeSubmissionsStatsModal()">Close</button>
+            </div>
+        </div>
+    </div>
 
-
-
-
-
+    <!-- Average Score Modal -->
+    <div id="averageScoreModal" class="modal" style="display:none;">
+        <div class="modal-content course-stats-modal">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h3><i class="fas fa-chart-line"></i> Course Average Scores & Pass Rates</h3>
+                <button onclick="closeAverageScoreModal()"
+                    style="background: none; border: none; font-size: 24px; cursor: pointer;">&times;</button>
+            </div>
+            <div id="averageScoreContent"></div>
+            <div class="modal-actions">
+                <button class="btn" onclick="closeAverageScoreModal()">Close</button>
+            </div>
+        </div>
+    </div>
