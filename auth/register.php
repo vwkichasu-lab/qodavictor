@@ -100,6 +100,12 @@ function departmentAbbreviation(string $department): string
     return preg_replace('/[^A-Z0-9]/', '', substr($abbr, 0, 5)) ?: 'GEN';
 }
 
+function registerLooksLikeStudentIdentifier(string $value): bool
+{
+    $candidate = strtoupper(preg_replace('/\s+/', '', trim($value)));
+    return (bool)preg_match('/^(PUIT|PUSE|PUAS|PUC|PU)\//', $candidate);
+}
+
 function generateLecturerStaffId(PDO $pdo, string $department): string
 {
     $prefix = 'PULC/' . departmentAbbreviation($department) . '/';
@@ -133,6 +139,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
 
     if ($username === '' || $name === '' || $email === '' || $department === '') {
         $error = 'Please fill all required fields.';
+    } elseif (registerLooksLikeStudentIdentifier($username)) {
+        $error = 'This looks like a student ID. Students should not register here. Please use the login details given by your lecturer.';
     } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
         $error = 'Please enter a valid email address.';
     } else {
@@ -333,6 +341,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
                     <p style="margin:6px 0 0;color:#64748b;">Create your QODA account.</p>
                 </div>
                 <div class="logo"><img src="../assets/qoda-logo.png" alt="QODA logo"></div>
+            </div>
+
+            <div class="error" style="background:#eff6ff;border-color:#bfdbfe;color:#1d4ed8;">
+                Students should not register here. Use the student ID and password given by your lecturer.
             </div>
 
             <?php if ($error): ?>
