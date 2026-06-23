@@ -29,7 +29,6 @@ $u = current_user();
       <a class="btn-ghost" href="<?= base_url('auth/logout.php') ?>">Logout</a>
     <?php else: ?>
       <a href="<?= base_url('auth/login.php') ?>">Login</a>
-      <a href="<?= base_url('auth/register.php') ?>">Register</a>
     <?php endif; ?>
   </nav>
 </header>
