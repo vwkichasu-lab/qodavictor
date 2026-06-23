@@ -10437,6 +10437,11 @@ function createCourseTable($courseCode)
                     <span class="tooltip-text">Monitoring</span>
                 </div>
 
+                <div class="nav-icon" data-tooltip="Add Lecturer" title="Add Lecturer" onclick="handleNavClick(this, 'add-lecturer')">
+                    <i class="fas fa-user-plus"></i>
+                    <span class="tooltip-text">Add Lecturer</span>
+                </div>
+
                 <div class="nav-icon has-submenu" data-submenu="accountSubmenu" title="Account" onclick="toggleSubmenuPanel(this)">
                     <i class="fas fa-user-circle"></i>
                     <span class="tooltip-text">Account</span>
@@ -10513,6 +10518,8 @@ function createCourseTable($courseCode)
 
             <?php include __DIR__ . '/partials/lecturer/profile_view.php'; ?>
 
+            <?php include __DIR__ . '/partials/lecturer/add_lecturer_view.php'; ?>
+
             <?php include __DIR__ . '/partials/lecturer/monitoring_view.php'; ?>
 
             <?php include __DIR__ . '/partials/lecturer/proctoring_view.php'; ?>
@@ -10553,7 +10560,7 @@ function createCourseTable($courseCode)
     ])); ?>;
 
     const routes = ["exams", "builder", "submissions", "marking", "results",
-        "students", "student-details", "profile", "monitoring", "proctoring"
+        "students", "student-details", "profile", "add-lecturer", "monitoring", "proctoring"
     ];
 
     const codingLanguagesList = [

@@ -637,7 +637,8 @@
 
         document.querySelectorAll(".nav-icon").forEach(icon => {
             const tooltip = icon.getAttribute('data-tooltip');
-            if (tooltip && tooltip.toLowerCase().includes(route)) {
+            const tooltipRoute = (tooltip || '').trim().toLowerCase().replace(/\s+/g, '-');
+            if (tooltipRoute === route || (tooltip && tooltip.toLowerCase().includes(route))) {
                 icon.classList.add('active');
             } else if (icon.classList.contains('has-submenu') && route === 'builder') {
                 icon.classList.add('active');
@@ -660,6 +661,7 @@
             students: "👥 Students",
             "student-details": "📋 Student Details",
             profile: "👤 Profile",
+            "add-lecturer": "Add Lecturer",
             proctoring: "👁️ Proctoring"
         };
 
@@ -4405,6 +4407,7 @@
     function enhanceSidebarTooltips() {
         const descriptions = {
             Profile: 'Lecturer profile and teaching courses',
+            'Add Lecturer': 'Create another lecturer account',
             Dashboard: 'Home, statistics, and activity',
             'Exam Management': 'Create exams, submissions, and results',
             'Student Management': 'Students, enrollment, and levels',
