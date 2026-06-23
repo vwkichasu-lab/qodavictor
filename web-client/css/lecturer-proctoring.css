@@ -1,0 +1,125 @@
+/* Proctoring Grid Styles */
+.student-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px;
+    margin-top: 20px;
+    align-items: start;
+}
+
+.student-proctor-card {
+    background: var(--panel);
+    border-radius: 16px;
+    overflow: hidden;
+    transition: transform 0.2s, box-shadow 0.2s;
+    cursor: pointer;
+    border: 2px solid transparent;
+}
+
+.student-proctor-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 20px 25px -12px rgba(0, 0, 0, 0.25);
+}
+
+.screen-preview-container {
+    position: relative;
+    background: #1e1e1e;
+    aspect-ratio: 16 / 9;
+    height: auto;
+    min-height: 220px;
+    overflow: hidden;
+}
+
+.screen-preview-container img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.live-badge,
+.violation-badge {
+    position: absolute;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    z-index: 10;
+}
+
+.live-badge {
+    top: 10px;
+    right: 10px;
+    background: #ef4444;
+    color: white;
+}
+
+.live-badge i {
+    font-size: 8px;
+    margin-right: 4px;
+    animation: pulse 1s infinite;
+}
+
+.violation-badge {
+    top: 10px;
+    left: 10px;
+    background: #ef4444;
+    color: white;
+}
+
+@keyframes pulse {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.5;
+    }
+}
+
+/* Full screen modal */
+#fullScreenProctorModal {
+    padding: 0 !important;
+    align-items: stretch !important;
+    justify-content: stretch !important;
+}
+
+#fullScreenProctorModal .modal-content {
+    padding: 0;
+    background: var(--panel);
+    width: 100vw !important;
+    height: 100vh !important;
+    max-width: none !important;
+    max-height: 100vh !important;
+    border-radius: 0 !important;
+    overflow: hidden;
+}
+
+#fullScreenContent {
+    background: #000;
+    min-height: 0;
+    flex: 1 1 auto;
+    display: flex;
+    align-items: stretch;
+    justify-content: stretch;
+    overflow: hidden;
+}
+
+#fullScreenStreamContainer,
+#fullScreenImg {
+    width: 100%;
+    height: 100%;
+}
+
+#fullScreenImg {
+    object-fit: contain;
+    image-rendering: auto;
+    background: #000;
+}
+
+@media (max-width: 900px) {
+    .student-grid {
+        grid-template-columns: 1fr;
+    }
+}
