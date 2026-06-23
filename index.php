@@ -236,7 +236,6 @@ function qoda_url(string $path): string
             <p>Write, supervise, grade, and publish programming assessments from one secure examination workspace.</p>
             <div class="actions">
                 <a class="btn" href="<?= htmlspecialchars(qoda_url('web-client/login.php'), ENT_QUOTES, 'UTF-8') ?>">Login</a>
-                <a class="btn secondary" href="<?= htmlspecialchars(qoda_url('web-client/login.php'), ENT_QUOTES, 'UTF-8') ?>">Use Assigned Account</a>
             </div>
         </section>
     </main>

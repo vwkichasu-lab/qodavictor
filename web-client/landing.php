@@ -55,7 +55,6 @@
             <p>Secure programming examinations, live proctoring, compiler-based assessment, and score publishing for Pentecost University.</p>
             <div class="actions">
                 <a href="login.php">Login</a>
-                <a class="secondary" href="login.php">Use Assigned Account</a>
             </div>
         </section>
     </main>
