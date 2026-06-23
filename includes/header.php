@@ -8,6 +8,7 @@ $u = current_user();
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title><?= isset($page_title) ? e($page_title) . ' · QODA' : 'QODA' ?></title>
+<link rel="icon" type="image/png" href="<?= base_url('assets/qoda-logo.png') ?>">
 <link rel="stylesheet" href="<?= base_url('assets/css/style.css') ?>">
 </head>
 <body>

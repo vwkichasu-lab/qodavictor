@@ -8,10 +8,25 @@ if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
+require_once '../backend-php/lib/grade_storage.php';
+require_once '../backend-php/lib/socket_auth.php';
+
 // Helper function to round to nearest whole number
 function roundToInt($value)
 {
     return (int)round(floatval($value));
+}
+
+function qodaGradeInfo(float $score): array
+{
+    if ($score >= 80) return ['grade' => 'A', 'gradePoint' => 4.0];
+    if ($score >= 75) return ['grade' => 'B+', 'gradePoint' => 3.5];
+    if ($score >= 70) return ['grade' => 'B', 'gradePoint' => 3.0];
+    if ($score >= 65) return ['grade' => 'C+', 'gradePoint' => 2.5];
+    if ($score >= 60) return ['grade' => 'C', 'gradePoint' => 2.0];
+    if ($score >= 55) return ['grade' => 'D+', 'gradePoint' => 1.5];
+    if ($score >= 50) return ['grade' => 'D', 'gradePoint' => 1.0];
+    return ['grade' => 'E', 'gradePoint' => 0.0];
 }
 
 function qodaQuestionMarks(array $question): float
@@ -50,6 +65,218 @@ function qodaEffectiveExamMarks(array $questions, int $questionsToAnswer = 0): f
     $compulsoryCount = count(array_filter($questions, fn($q) => is_array($q) && !empty($q['compulsory'])));
     $optionalSlots = max(0, $limit - $compulsoryCount);
     return $compulsoryMarks + array_sum(array_slice($optionalMarks, 0, $optionalSlots));
+}
+
+function qodaEnsureExamQuestionDetailsTable(PDO $pdo): void
+{
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS exam_question_details (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            exam_id INT NOT NULL,
+            question_index INT NOT NULL,
+            question_id VARCHAR(100) NULL,
+            question_type VARCHAR(50) NOT NULL DEFAULT 'code',
+            language VARCHAR(80) NULL,
+            question_text LONGTEXT NULL,
+            input_format LONGTEXT NULL,
+            output_format LONGTEXT NULL,
+            notes LONGTEXT NULL,
+            sample_cases LONGTEXT NULL,
+            test_cases LONGTEXT NULL,
+            starter_code LONGTEXT NULL,
+            model_solution LONGTEXT NULL,
+            marking_scheme LONGTEXT NULL,
+            execution_settings LONGTEXT NULL,
+            security_settings LONGTEXT NULL,
+            question_bank_tags TEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_exam_question_details (exam_id, question_index),
+            INDEX idx_exam_question_details_exam (exam_id),
+            INDEX idx_exam_question_details_language (language)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC
+    ");
+}
+
+function qodaQuestionDetailJson($value): ?string
+{
+    if ($value === null || $value === '') {
+        return null;
+    }
+    return json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+}
+
+function qodaIsStorageFullError(Throwable $error): bool
+{
+    $message = strtolower($error->getMessage());
+    return str_contains($message, 'table') && str_contains($message, 'full')
+        || str_contains($message, '1114')
+        || str_contains($message, 'disk is full');
+}
+
+function qodaPlainQuestionText($value): string
+{
+    return trim(html_entity_decode(strip_tags((string)$value), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+}
+
+function qodaCompactQuestionsForExamStorage(string $questionsJson): string
+{
+    $questions = json_decode($questionsJson, true);
+    if (!is_array($questions)) {
+        return $questionsJson;
+    }
+
+    $compact = [];
+    foreach (array_values($questions) as $question) {
+        if (!is_array($question)) {
+            continue;
+        }
+        $problem = (string)($question['problemStatement'] ?? $question['text'] ?? '');
+        $compact[] = [
+            'id' => (string)($question['id'] ?? ''),
+            'type' => (string)($question['type'] ?? 'code'),
+            'title' => (string)($question['title'] ?? ''),
+            'text' => qodaPlainQuestionText($problem),
+            'problemStatement' => $problem,
+            'inputFormat' => (string)($question['inputFormat'] ?? ''),
+            'outputFormat' => (string)($question['outputFormat'] ?? ''),
+            'language' => (string)($question['language'] ?? 'Python'),
+            'languageMode' => (string)($question['languageMode'] ?? 'single'),
+            'marks' => (float)($question['marks'] ?? 0),
+            'compulsory' => !empty($question['compulsory']),
+            'starterCode' => (string)($question['starterCode'] ?? ''),
+            'testCases' => is_array($question['testCases'] ?? null) ? $question['testCases'] : [],
+            'markingRubric' => is_array($question['markingRubric'] ?? null) ? $question['markingRubric'] : [],
+            'executionSettings' => is_array($question['executionSettings'] ?? null) ? $question['executionSettings'] : [],
+            'topic' => (string)($question['topic'] ?? ''),
+            'tags' => (string)($question['tags'] ?? $question['questionBankTags'] ?? '')
+        ];
+    }
+
+    return json_encode($compact, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+}
+
+function qodaMarkExistingExamPublishedMinimal(PDO $pdo, int $examId, int $lecturerId): void
+{
+    $stmt = $pdo->prepare("
+        UPDATE exams
+        SET published = 1,
+            status = 'published',
+            published_at = COALESCE(published_at, NOW()),
+            updated_at = NOW()
+        WHERE id = ? AND (created_by = ? OR lecturer_id = ?)
+    ");
+    $stmt->execute([$examId, $lecturerId, $lecturerId]);
+}
+
+function qodaSyncExamQuestionDetails(PDO $pdo, int $examId, string $questionsJson): void
+{
+    if ($examId <= 0) {
+        return;
+    }
+
+    $questions = json_decode($questionsJson, true);
+    if (!is_array($questions)) {
+        $questions = [];
+    }
+
+    try {
+        qodaEnsureExamQuestionDetailsTable($pdo);
+        $pdo->prepare("DELETE FROM exam_question_details WHERE exam_id = ?")->execute([$examId]);
+
+        if (!$questions) {
+            return;
+        }
+
+        $insert = $pdo->prepare("
+            INSERT INTO exam_question_details (
+                exam_id, question_index, question_id, question_type, language,
+                question_text, input_format, output_format, notes,
+                sample_cases, test_cases, starter_code, model_solution,
+                marking_scheme, execution_settings, security_settings, question_bank_tags
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ");
+
+        foreach (array_values($questions) as $index => $question) {
+            if (!is_array($question)) {
+                continue;
+            }
+
+            $insert->execute([
+                $examId,
+                $index + 1,
+                (string)($question['id'] ?? ''),
+                (string)($question['type'] ?? 'code'),
+                (string)($question['language'] ?? ''),
+                (string)($question['problemStatement'] ?? $question['text'] ?? ''),
+                (string)($question['inputFormat'] ?? ''),
+                (string)($question['outputFormat'] ?? ''),
+                (string)($question['notes'] ?? $question['constraints'] ?? ''),
+                qodaQuestionDetailJson($question['sampleCases'] ?? []),
+                qodaQuestionDetailJson($question['testCases'] ?? []),
+                (string)($question['starterCode'] ?? ''),
+                (string)($question['modelSolution'] ?? ''),
+                qodaQuestionDetailJson($question['markingRubric'] ?? $question['markingScheme'] ?? []),
+                qodaQuestionDetailJson($question['executionSettings'] ?? []),
+                qodaQuestionDetailJson($question['securitySettings'] ?? []),
+                (string)($question['questionBankTags'] ?? $question['tags'] ?? '')
+            ]);
+        }
+    } catch (Throwable $error) {
+        error_log('Exam question details sync skipped: ' . $error->getMessage());
+    }
+}
+
+function qodaEnsureStudentSessionMonitorTables(PDO $pdo): void
+{
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS student_active_sessions (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            student_id INT NOT NULL,
+            student_identifier VARCHAR(100) NULL,
+            session_id VARCHAR(191) NOT NULL,
+            device_id VARCHAR(191) NOT NULL,
+            browser_fingerprint CHAR(64) NOT NULL,
+            operating_system VARCHAR(80) NULL,
+            ip_address VARCHAR(64) NULL,
+            user_agent TEXT NULL,
+            login_at DATETIME NOT NULL,
+            last_seen DATETIME NOT NULL,
+            expires_at DATETIME NULL,
+            active TINYINT(1) NOT NULL DEFAULT 1,
+            released_at DATETIME NULL,
+            release_reason VARCHAR(80) NULL,
+            locked_exam_id INT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_student_active (student_id, active, last_seen),
+            INDEX idx_session_id (session_id),
+            INDEX idx_device_id (device_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC
+    ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS student_session_events (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            student_id INT NULL,
+            student_identifier VARCHAR(100) NULL,
+            event_type VARCHAR(80) NOT NULL,
+            device_id VARCHAR(191) NULL,
+            browser_fingerprint CHAR(64) NULL,
+            operating_system VARCHAR(80) NULL,
+            ip_address VARCHAR(64) NULL,
+            user_agent TEXT NULL,
+            exam_id INT NULL,
+            details TEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_student_events (student_id, created_at),
+            INDEX idx_event_type (event_type, created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC
+    ");
+    if (function_exists('ensureLecturerColumn')) {
+        ensureLecturerColumn($pdo, 'student_active_sessions', 'locked_exam_id', 'INT NULL');
+        ensureLecturerColumn($pdo, 'student_session_events', 'exam_id', 'INT NULL');
+        ensureLecturerColumn($pdo, 'student_session_events', 'operating_system', 'VARCHAR(80) NULL');
+    }
 }
 
 function normalizeDateTimeInput($value): ?string
@@ -170,6 +397,12 @@ function questionFileStem(string $questionText, int $questionNumber): string
 
 // Check if user is logged in
 if (!isset($_SESSION['user_id']) || !isset($_SESSION['user_role'])) {
+    if (isset($_POST['action'])) {
+        header('Content-Type: application/json');
+        http_response_code(401);
+        echo json_encode(['success' => false, 'error' => 'Session expired. Please log in again.']);
+        exit;
+    }
     // Not logged in, redirect to login
     header('Location: login.php');
     exit;
@@ -177,6 +410,12 @@ if (!isset($_SESSION['user_id']) || !isset($_SESSION['user_role'])) {
 
 // Check if user has proper role (LECTURER only)
 if ($_SESSION['user_role'] !== 'LECTURER') {
+    if (isset($_POST['action'])) {
+        header('Content-Type: application/json');
+        http_response_code(403);
+        echo json_encode(['success' => false, 'error' => 'Lecturer access is required.']);
+        exit;
+    }
     // Wrong role, redirect to student dashboard or login
     header('Location: student_dashboard.php');
     exit;
@@ -194,6 +433,42 @@ require_once __DIR__ . '/../backend-php/helpers/grading.php';  // Add this line
 global $pdo;
 $db = $pdo;
 
+// Final grades are read by submissions, results, and the grading IDE. Create the
+// compact grade table before heavier schema maintenance so one failed ALTER does
+// not break the submissions page.
+try {
+    qodaTryEnsureFinalGradeTable($pdo);
+} catch (Throwable $finalGradeSetupError) {
+    error_log('Early final grade table setup failed: ' . $finalGradeSetupError->getMessage());
+}
+
+$dashboardAjaxAction = (string)($_POST['action'] ?? '');
+$skipLecturerSchemaUpgrade = ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && in_array($dashboardAjaxAction, [
+    'get_active_sessions',
+    'get_screen_updates',
+    'get_student_screen',
+    'get_violation_evidence',
+    'get_proctored_courses',
+    'send_warning_to_student',
+    'send_message_to_student',
+    'add_student_exam_time',
+    'manage_exam_time',
+    'lock_student_screen',
+    'unlock_student_screen',
+    'unlock_all_screens',
+    'take_snapshot',
+    'get_course_students',
+    'get_exam_details',
+    'get_active_student_sessions',
+    'force_logout_student_session',
+    'get_student_session_history',
+    'webrtc_fetch_student_offer',
+    'webrtc_submit_monitor_answer',
+    'webrtc_create_offer',
+    'webrtc_poll_answer',
+    'webrtc_close_stream',
+], true);
+
 if (!function_exists('ensureLecturerColumn')) {
     function ensureLecturerColumn(PDO $pdo, string $table, string $column, string $definition): void
     {
@@ -209,10 +484,50 @@ if (!function_exists('ensureLecturerColumn')) {
     }
 }
 
+if (!function_exists('qodaColumnExists')) {
+    function qodaColumnExists(PDO $pdo, string $table, string $column): bool
+    {
+        static $cache = [];
+        $key = $table . '.' . $column;
+        if (array_key_exists($key, $cache)) {
+            return $cache[$key];
+        }
+        try {
+            $stmt = $pdo->prepare("
+                SELECT COUNT(*)
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
+            ");
+            $stmt->execute([$table, $column]);
+            $cache[$key] = (int)$stmt->fetchColumn() > 0;
+        } catch (Throwable $error) {
+            error_log('Column availability check failed for ' . $key . ': ' . $error->getMessage());
+            $cache[$key] = false;
+        }
+        return $cache[$key];
+    }
+}
+
+if (!function_exists('qodaExamOptionalColumnValues')) {
+    function qodaExamOptionalColumnValues(PDO $pdo, array $values): array
+    {
+        $available = [];
+        foreach ($values as $column => $value) {
+            if (qodaColumnExists($pdo, 'exams', $column)) {
+                $available[$column] = $value;
+            }
+        }
+        return $available;
+    }
+}
+
 if (!function_exists('qodaPruneLiveScreenCaptures')) {
     function qodaPruneLiveScreenCaptures(PDO $pdo, bool $force = false): void
     {
         static $lastRun = 0;
+        if (!$force && mt_rand(1, 20) !== 1) {
+            return;
+        }
         if (!$force && time() - $lastRun < 20) {
             return;
         }
@@ -245,6 +560,7 @@ if (!function_exists('qodaPruneLiveScreenCaptures')) {
     }
 }
 
+if (!$skipLecturerSchemaUpgrade) {
 try {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS screen_captures (
@@ -261,10 +577,34 @@ try {
             INDEX idx_captured_at (captured_at)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS proctor_webrtc_streams (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            stream_key VARCHAR(191) NOT NULL UNIQUE,
+            exam_id INT NOT NULL,
+            student_id INT NOT NULL,
+            lecturer_id INT NOT NULL,
+            offer LONGTEXT NULL,
+            answer LONGTEXT NULL,
+            status VARCHAR(30) NOT NULL DEFAULT 'offer',
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            expires_at DATETIME NOT NULL,
+            INDEX idx_exam_student_status (exam_id, student_id, status),
+            INDEX idx_lecturer (lecturer_id, updated_at),
+            INDEX idx_expires (expires_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
     ensureLecturerColumn($pdo, 'exams', 'end_datetime', 'DATETIME NULL');
     ensureLecturerColumn($pdo, 'exams', 'draft_saved_at', 'DATETIME NULL');
+    ensureLecturerColumn($pdo, 'exams', 'academic_year', 'VARCHAR(50) NULL');
     ensureLecturerColumn($pdo, 'exams', 'results_published', 'TINYINT(1) NOT NULL DEFAULT 0');
     ensureLecturerColumn($pdo, 'exams', 'results_published_at', 'DATETIME NULL');
+    ensureLecturerColumn($pdo, 'exams', 'grace_period_minutes', 'INT NOT NULL DEFAULT 0');
+    ensureLecturerColumn($pdo, 'exams', 'cutoff_datetime', 'DATETIME NULL');
+    ensureLecturerColumn($pdo, 'exams', 'exam_control_status', "VARCHAR(30) NOT NULL DEFAULT 'active'");
+    ensureLecturerColumn($pdo, 'exams', 'pause_started_at', 'DATETIME NULL');
+    ensureLecturerColumn($pdo, 'exams', 'paused_seconds_total', 'INT NOT NULL DEFAULT 0');
     ensureLecturerColumn($pdo, 'screen_captures', 'image_data', 'LONGTEXT NULL');
     ensureLecturerColumn($pdo, 'screen_captures', 'capture_type', "VARCHAR(30) NOT NULL DEFAULT 'live'");
     ensureLecturerColumn($pdo, 'screen_captures', 'notes', 'TEXT NULL');
@@ -276,15 +616,32 @@ try {
     ensureLecturerColumn($pdo, 'exam_submissions', 'graded_at', 'DATETIME NULL');
     ensureLecturerColumn($pdo, 'exam_submissions', 'graded_by', 'INT NULL');
     ensureLecturerColumn($pdo, 'exam_submissions', 'manual_feedback', 'TEXT NULL');
+    ensureLecturerColumn($pdo, 'exam_submissions', 'class_score', 'DECIMAL(5,2) DEFAULT 0');
+    ensureLecturerColumn($pdo, 'exam_submissions', 'exam_score', 'DECIMAL(5,2) DEFAULT 0');
+    ensureLecturerColumn($pdo, 'exam_submissions', 'grade', 'VARCHAR(5) NULL');
+    ensureLecturerColumn($pdo, 'exam_submissions', 'grade_point', 'DECIMAL(3,1) DEFAULT 0');
     ensureLecturerColumn($pdo, 'exam_submissions', 'execution_results', 'JSON NULL');
     ensureLecturerColumn($pdo, 'exam_submissions', 'ai_feedback', 'MEDIUMTEXT NULL');
     ensureLecturerColumn($pdo, 'exam_submissions', 'auto_graded_at', 'DATETIME NULL');
-    $pdo->exec("ALTER TABLE exam_submissions MODIFY answers LONGTEXT NULL");
-    $pdo->exec("ALTER TABLE exam_submissions MODIFY ai_feedback MEDIUMTEXT NULL");
-    $pdo->exec("
-        ALTER TABLE exam_submissions
-        MODIFY status VARCHAR(50) DEFAULT 'in_progress'
-    ");
+    ensureLecturerColumn($pdo, 'users', 'username', 'VARCHAR(120) NULL');
+    ensureLecturerColumn($pdo, 'users', 'title', 'VARCHAR(50) NULL');
+    ensureLecturerColumn($pdo, 'users', 'deleted_at', 'DATETIME NULL');
+    ensureLecturerColumn($pdo, 'students', 'deleted_at', 'DATETIME NULL');
+    if (getenv('QODA_ALLOW_HEAVY_ALTERS') === '1') {
+        $pdo->exec("ALTER TABLE exam_submissions MODIFY answers LONGTEXT NULL");
+        $pdo->exec("ALTER TABLE exam_submissions MODIFY ai_feedback MEDIUMTEXT NULL");
+        $pdo->exec("ALTER TABLE users MODIFY profile_pic MEDIUMTEXT NULL");
+        $pdo->exec("ALTER TABLE students MODIFY profile_pic MEDIUMTEXT NULL");
+        try {
+            $pdo->exec("ALTER TABLE exam_submissions ROW_FORMAT=DYNAMIC");
+        } catch (Throwable $rowFormatError) {
+            error_log('exam_submissions row format upgrade skipped: ' . $rowFormatError->getMessage());
+        }
+        $pdo->exec("
+            ALTER TABLE exam_submissions
+            MODIFY status VARCHAR(50) DEFAULT 'in_progress'
+        ");
+    }
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS proctor_commands (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -304,7 +661,20 @@ try {
         ALTER TABLE proctor_commands
         MODIFY command_type ENUM('warning', 'lock', 'unlock') NOT NULL
     ");
-    qodaPruneLiveScreenCaptures($pdo, true);
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS student_exam_time_adjustments (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            exam_id INT NOT NULL,
+            student_id INT NOT NULL,
+            delta_minutes INT NOT NULL DEFAULT 0,
+            reason VARCHAR(255) NULL,
+            adjusted_by INT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_exam_student (exam_id, student_id),
+            INDEX idx_created_at (created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+    qodaPruneLiveScreenCaptures($pdo, false);
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS exam_question_grading (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -321,6 +691,7 @@ try {
             INDEX idx_submission (submission_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ");
+    qodaTryEnsureFinalGradeTable($pdo);
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS ai_grading_cache (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -331,10 +702,123 @@ try {
             INDEX idx_consistency_hash (consistency_hash)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS question_bank (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            lecturer_id INT NULL,
+            course_code VARCHAR(50) NULL,
+            course_name VARCHAR(255) NULL,
+            topic VARCHAR(255) NULL,
+            difficulty VARCHAR(50) NULL,
+            language VARCHAR(50) NULL,
+            semester VARCHAR(100) NULL,
+            academic_year VARCHAR(50) NULL,
+            title VARCHAR(255) NOT NULL,
+            prompt LONGTEXT NOT NULL,
+            question_json LONGTEXT NULL,
+            test_cases JSON NULL,
+            marks DECIMAL(10,2) NOT NULL DEFAULT 0,
+            source_exam_id INT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_question_bank_filters (lecturer_id, course_code, language, semester, academic_year),
+            INDEX idx_question_bank_source (source_exam_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS exam_time_adjustments (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            exam_id INT NOT NULL,
+            adjusted_by INT NULL,
+            old_start_datetime DATETIME NULL,
+            old_end_datetime DATETIME NULL,
+            new_start_datetime DATETIME NULL,
+            new_end_datetime DATETIME NULL,
+            delta_minutes INT NOT NULL DEFAULT 0,
+            reason TEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_exam_time_adjustments_exam (exam_id, created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS compiler_run_logs (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            actor_id INT NULL,
+            actor_role VARCHAR(50) NULL,
+            exam_id INT NULL,
+            submission_id INT NULL,
+            question_index INT NULL,
+            language VARCHAR(50) NULL,
+            success TINYINT(1) NOT NULL DEFAULT 0,
+            input_preview TEXT NULL,
+            output_preview TEXT NULL,
+            error_preview TEXT NULL,
+            execution_time_ms INT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_compiler_run_logs_submission (submission_id, question_index),
+            INDEX idx_compiler_run_logs_exam (exam_id, created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS lecturer_courses (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            lecturer_id INT NOT NULL,
+            course_code VARCHAR(50) NOT NULL,
+            course_name VARCHAR(255) NOT NULL,
+            level VARCHAR(20) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_lecturer_course_level (lecturer_id, course_code, level),
+            INDEX idx_lecturer_courses_lecturer (lecturer_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS student_active_sessions (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            student_id INT NOT NULL,
+            student_identifier VARCHAR(100) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            device_id VARCHAR(128) NOT NULL,
+            browser_fingerprint CHAR(64) NOT NULL,
+            operating_system VARCHAR(120) NULL,
+            ip_address VARCHAR(45) NULL,
+            user_agent TEXT NULL,
+            login_at DATETIME NOT NULL,
+            last_seen DATETIME NOT NULL,
+            expires_at DATETIME NULL,
+            locked_exam_id INT NULL,
+            active TINYINT(1) NOT NULL DEFAULT 1,
+            released_at DATETIME NULL,
+            release_reason VARCHAR(80) NULL,
+            INDEX idx_student_active_session_state (student_id, active, last_seen),
+            INDEX idx_student_active_sessions_lookup (student_identifier, active),
+            INDEX idx_student_active_sessions_last_seen (last_seen)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC
+    ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS student_session_events (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            student_id INT NULL,
+            student_identifier VARCHAR(100) NULL,
+            event_type VARCHAR(80) NOT NULL,
+            device_id VARCHAR(128) NULL,
+            browser_fingerprint CHAR(64) NULL,
+            operating_system VARCHAR(120) NULL,
+            ip_address VARCHAR(45) NULL,
+            user_agent TEXT NULL,
+            exam_id INT NULL,
+            details TEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_session_events_student (student_id, created_at),
+            INDEX idx_session_events_type (event_type, created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC
+    ");
 } catch (Exception $e) {
     error_log('Lecturer dashboard schema upgrade failed: ' . $e->getMessage());
 }
+}
 // ========== SUBMISSIONS TABLE CREATION (SIMPLIFIED) ==========
+if (!$skipLecturerSchemaUpgrade) {
 try {
     // Create submissions table if not exists
     $createSubmissionsTable = "
@@ -359,15 +843,17 @@ try {
 } catch (Exception $e) {
     error_log("Error creating submissions table: " . $e->getMessage());
 }
+}
 
 // ========== CREATE TEST SUBMISSION IF NONE EXISTS ==========
+if (!$skipLecturerSchemaUpgrade) {
 try {
     // Check if there are any submissions
     $countStmt = $pdo->prepare("SELECT COUNT(*) FROM exam_submissions");
     $countStmt->execute();
     $submissionCount = $countStmt->fetchColumn();
 
-    if ($submissionCount == 0) {
+    if (false && $submissionCount == 0) {
         // Get first exam and student
         $examStmt = $pdo->prepare("SELECT id, title, questions, total_marks FROM exams WHERE lecturer_id = ? LIMIT 1");
         $examStmt->execute([$lecturerId]);
@@ -415,6 +901,7 @@ try {
 } catch (Exception $e) {
     error_log("Error creating test submission: " . $e->getMessage());
 }
+}
 
 
 // Get lecturer details from database
@@ -445,9 +932,32 @@ if (isset($_POST['action'])) {
 
             case 'get_exams':
                 $stmt = $pdo->prepare("
-        SELECT * FROM exams 
-        WHERE created_by = ? OR lecturer_id = ?
-        ORDER BY created_at DESC
+        SELECT
+            e.*,
+            (
+                SELECT ce.course_name
+                FROM course_enrollments ce
+                WHERE ce.course_code = e.course_code
+                  AND (ce.lecturer_id = e.lecturer_id OR ce.lecturer_id = e.created_by)
+                ORDER BY ce.enrolled_at DESC
+                LIMIT 1
+            ) AS course_name,
+            (
+                SELECT COUNT(DISTINCT ce.student_id)
+                FROM course_enrollments ce
+                WHERE ce.course_code = e.course_code
+                  AND (ce.lecturer_id = e.lecturer_id OR ce.lecturer_id = e.created_by)
+            ) AS assigned_students_count,
+            (
+                SELECT COUNT(DISTINCT COALESCE(NULLIF(es.student_identifier, ''), CAST(es.student_id AS CHAR)))
+                FROM exam_submissions es
+                WHERE es.exam_id = e.id
+                  AND LOWER(COALESCE(es.status, '')) NOT IN ('in_progress', 'draft', 'autosaved')
+                  AND (COALESCE(es.submitted, 0) = 1 OR es.submitted_at IS NOT NULL OR es.submittedAt IS NOT NULL)
+            ) AS submitted_students_count
+        FROM exams e
+        WHERE e.created_by = ? OR e.lecturer_id = ?
+        ORDER BY e.created_at DESC
     ");
                 $stmt->execute([$lecturerId, $lecturerId]);
                 $exams = $stmt->fetchAll();
@@ -629,24 +1139,24 @@ case 'auto_grade_all_submissions':
         foreach ($submissions as $submission) {
             $gradeResult = autoGradeSubmission($submission, $pdo);
             $results[] = $gradeResult;
-            
-            // Update submission with auto-grade
-            $updateStmt = $pdo->prepare("
-                UPDATE exam_submissions 
-                SET total_score = ?, 
-                    percentage = ?, 
-                    status = 'AUTO_GRADED',
-                    auto_graded_at = NOW(),
-                    execution_results = ?,
-                    ai_feedback = ?
-                WHERE id = ?
-            ");
-            $updateStmt->execute([
-                $gradeResult['total_score'],
-                $gradeResult['percentage'],
-                json_encode($gradeResult['details']),
-                $gradeResult['ai_feedback'],
-                $submission['id']
+
+            $classScore = min(40, max(0, roundToInt($submission['class_score'] ?? 0)));
+            $examScore = min(60, max(0, roundToInt((($gradeResult['percentage'] ?? 0) * 60) / 100)));
+            $finalTotalScore = min(100, max(0, $examScore + $classScore));
+            $gradeInfo = qodaGradeInfo($finalTotalScore);
+
+            qodaPersistFinalGrade($pdo, [
+                'submission_id' => $submission['id'],
+                'raw_question_score' => $gradeResult['total_score'],
+                'percentage' => $gradeResult['percentage'],
+                'class_score' => $classScore,
+                'exam_score' => $examScore,
+                'total_score' => $finalTotalScore,
+                'grade' => $gradeInfo['grade'],
+                'grade_point' => $gradeInfo['gradePoint'],
+                'status' => 'AUTO_GRADED',
+                'score_source' => 'auto',
+                'graded_by' => $lecturerId
             ]);
         }
         
@@ -667,25 +1177,40 @@ case 'auto_grade_all_submissions':
 case 'finalize_grades':
     try {
         $submission_id = intval($_POST['submission_id'] ?? 0);
-        $total_score = floatval($_POST['total_score'] ?? 0);
+        $rawQuestionScore = max(0, floatval($_POST['total_score'] ?? 0));
         $percentage = floatval($_POST['percentage'] ?? 0);
         $scores = json_decode($_POST['scores'] ?? '{}', true);
         
-        $stmt = $pdo->prepare("SELECT answers FROM exam_submissions WHERE id = ?");
+        $stmt = $pdo->prepare("SELECT answers, class_score FROM exam_submissions WHERE id = ?");
         $stmt->execute([$submission_id]);
         $submission = $stmt->fetch(PDO::FETCH_ASSOC);
         
-        $answers = json_decode($submission['answers'], true);
-        $answers['_scores'] = $scores;
-        $answers['_finalized'] = true;
-        $answers['_finalized_at'] = date('Y-m-d H:i:s');
+        if (!$submission) {
+            echo json_encode(['success' => false, 'error' => 'Submission not found']);
+            break;
+        }
+
+        $answers = json_decode($submission['answers'] ?? '[]', true);
+        if (!is_array($answers)) $answers = [];
+        $existingGrading = $answers['grading'] ?? $answers['_grading'] ?? [];
+        $classScore = min(40, max(0, roundToInt($submission['class_score'] ?? $existingGrading['class_score'] ?? 0)));
+        $examScore = min(60, max(0, roundToInt(($percentage * 60) / 100)));
+        $finalTotalScore = min(100, max(0, $examScore + $classScore));
+        $gradeInfo = qodaGradeInfo($finalTotalScore);
         
-        $stmt2 = $pdo->prepare("
-            UPDATE exam_submissions 
-            SET answers = ?, total_score = ?, percentage = ?, status = 'GRADED', graded_at = NOW()
-            WHERE id = ?
-        ");
-        $stmt2->execute([json_encode($answers), $total_score, $percentage, $submission_id]);
+        qodaPersistFinalGrade($pdo, [
+            'submission_id' => $submission_id,
+            'raw_question_score' => $rawQuestionScore,
+            'percentage' => $percentage,
+            'class_score' => $classScore,
+            'exam_score' => $examScore,
+            'total_score' => $finalTotalScore,
+            'grade' => $gradeInfo['grade'],
+            'grade_point' => $gradeInfo['gradePoint'],
+            'status' => 'GRADED',
+            'score_source' => 'manual',
+            'graded_by' => $lecturerId
+        ]);
         
         echo json_encode(['success' => true]);
     } catch (Exception $e) {
@@ -1042,18 +1567,156 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                 }
                 break;
 
+            case 'webrtc_create_offer':
+                try {
+                    $examId = intval($_POST['exam_id'] ?? 0);
+                    $studentId = intval($_POST['student_id'] ?? 0);
+                    $offer = trim($_POST['offer'] ?? '');
+                    if (!$examId || !$studentId || $offer === '') {
+                        echo json_encode(['success' => false, 'error' => 'Missing WebRTC offer data']);
+                        break;
+                    }
+                    $streamKey = hash('sha256', implode('|', [
+                        $examId,
+                        $studentId,
+                        $lecturerId,
+                        session_id(),
+                        microtime(true),
+                        bin2hex(random_bytes(6))
+                    ]));
+                    $pdo->prepare("DELETE FROM proctor_webrtc_streams WHERE expires_at < NOW() OR (exam_id = ? AND student_id = ? AND lecturer_id = ? AND stream_key <> ?)")
+                        ->execute([$examId, $studentId, $lecturerId, $streamKey]);
+                    $stmt = $pdo->prepare("
+                        INSERT INTO proctor_webrtc_streams
+                            (stream_key, exam_id, student_id, lecturer_id, offer, answer, status, created_at, updated_at, expires_at)
+                        VALUES (?, ?, ?, ?, ?, NULL, 'offer', NOW(), NOW(), DATE_ADD(NOW(), INTERVAL 5 MINUTE))
+                        ON DUPLICATE KEY UPDATE
+                            offer = VALUES(offer),
+                            answer = NULL,
+                            status = 'offer',
+                            updated_at = NOW(),
+                            expires_at = DATE_ADD(NOW(), INTERVAL 5 MINUTE)
+                    ");
+                    $stmt->execute([$streamKey, $examId, $studentId, $lecturerId, $offer]);
+                    echo json_encode(['success' => true, 'stream_key' => $streamKey]);
+                } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
+            case 'webrtc_fetch_student_offer':
+                try {
+                    $examId = intval($_POST['exam_id'] ?? 0);
+                    $studentId = intval($_POST['student_id'] ?? 0);
+                    $pdo->exec("
+                        CREATE TABLE IF NOT EXISTS proctor_webrtc_streams (
+                            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                            stream_key VARCHAR(191) NOT NULL UNIQUE,
+                            exam_id INT NOT NULL,
+                            student_id INT NOT NULL,
+                            lecturer_id INT NOT NULL,
+                            offer LONGTEXT NULL,
+                            answer LONGTEXT NULL,
+                            status VARCHAR(30) NOT NULL DEFAULT 'offer',
+                            created_at DATETIME NOT NULL,
+                            updated_at DATETIME NOT NULL,
+                            expires_at DATETIME NOT NULL,
+                            INDEX idx_exam_student_status (exam_id, student_id, status),
+                            INDEX idx_lecturer (lecturer_id, updated_at),
+                            INDEX idx_expires (expires_at)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    ");
+                    $stmt = $pdo->prepare("
+                        SELECT stream_key, offer, student_id, exam_id, updated_at
+                        FROM proctor_webrtc_streams
+                        WHERE exam_id = ?
+                          AND student_id = ?
+                          AND status IN ('student_offer', 'answered')
+                          AND offer IS NOT NULL
+                          AND expires_at > NOW()
+                        ORDER BY updated_at DESC, id DESC
+                        LIMIT 1
+                    ");
+                    $stmt->execute([$examId, $studentId]);
+                    echo json_encode(['success' => true, 'data' => $stmt->fetch(PDO::FETCH_ASSOC) ?: null]);
+                } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
+            case 'webrtc_submit_monitor_answer':
+                try {
+                    $streamKey = trim((string)($_POST['stream_key'] ?? ''));
+                    $answer = trim((string)($_POST['answer'] ?? ''));
+                    if ($streamKey === '' || $answer === '') {
+                        echo json_encode(['success' => false, 'error' => 'Missing live stream answer data']);
+                        break;
+                    }
+                    $stmt = $pdo->prepare("
+                        UPDATE proctor_webrtc_streams
+                        SET answer = ?,
+                            lecturer_id = ?,
+                            status = 'answered',
+                            updated_at = NOW(),
+                            expires_at = DATE_ADD(NOW(), INTERVAL 5 MINUTE)
+                        WHERE stream_key = ?
+                    ");
+                    $stmt->execute([$answer, $lecturerId, $streamKey]);
+                    echo json_encode(['success' => $stmt->rowCount() > 0]);
+                } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
+            case 'webrtc_poll_answer':
+                try {
+                    $streamKey = trim($_POST['stream_key'] ?? '');
+                    if ($streamKey === '') {
+                        echo json_encode(['success' => false, 'error' => 'Missing stream key']);
+                        break;
+                    }
+                    $stmt = $pdo->prepare("
+                        SELECT answer, status, updated_at
+                        FROM proctor_webrtc_streams
+                        WHERE stream_key = ? AND lecturer_id = ? AND expires_at > NOW()
+                        LIMIT 1
+                    ");
+                    $stmt->execute([$streamKey, $lecturerId]);
+                    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+                    echo json_encode(['success' => true, 'data' => $row ?: null]);
+                } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
+            case 'webrtc_close_stream':
+                try {
+                    $streamKey = trim($_POST['stream_key'] ?? '');
+                    if ($streamKey !== '') {
+                        $stmt = $pdo->prepare("UPDATE proctor_webrtc_streams SET status = 'closed', updated_at = NOW(), expires_at = NOW() WHERE stream_key = ? AND lecturer_id = ?");
+                        $stmt->execute([$streamKey, $lecturerId]);
+                    }
+                    echo json_encode(['success' => true]);
+                } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
             case 'get_active_sessions':
                 try {
                     $examId = intval($_POST['exam_id'] ?? 0);
                     $stmt = $pdo->prepare("
                         SELECT
                             active.student_id,
-                            MAX(COALESCE(live_sc.captured_at, hb_sc.captured_at, es.updated_at, es.started_at, es.created_at)) AS last_activity,
+                            MAX(COALESCE(sss.last_updated, live_sc.captured_at, hb_sc.captured_at, es.updated_at, es.started_at, es.created_at)) AS last_activity,
                             CASE
-                                WHEN MAX(live_sc.captured_at) >= (NOW() - INTERVAL 45 SECOND)
-                                  OR MAX(hb_sc.captured_at) >= (NOW() - INTERVAL 15 SECOND)
+                                WHEN MAX(live_sc.captured_at) >= (NOW() - INTERVAL 90 SECOND)
+                                  OR MAX(CASE WHEN hb_sc.notes = 'sharing' THEN hb_sc.captured_at ELSE NULL END) >= (NOW() - INTERVAL 45 SECOND)
+                                  OR MAX(CASE WHEN sss.is_sharing = 1 THEN sss.last_updated ELSE NULL END) >= (NOW() - INTERVAL 45 SECOND)
                                 THEN 1 ELSE 0
                             END AS screen_sharing_active,
+                            MAX(CASE WHEN sss.is_sharing = 1 THEN sss.last_updated ELSE NULL END) AS latest_socket_at,
+                            SUBSTRING_INDEX(GROUP_CONCAT(sss.session_id ORDER BY sss.last_updated DESC SEPARATOR '||'), '||', 1) AS socket_session_id,
                             COUNT(DISTINCT sl.id) AS violations,
                             MAX(CASE WHEN pc.command_type = 'lock' THEN 1 WHEN pc.command_type = 'unlock' THEN 0 ELSE 0 END) AS screen_locked,
                             MAX(COALESCE(es.submitted, 0)) AS submitted,
@@ -1063,7 +1726,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                                 SELECT sc3.image_data
                                 FROM screen_captures sc3
                                 WHERE sc3.exam_id = ?
-                                  AND sc3.student_id = active.student_id
+                                  AND (sc3.student_id = active.student_id OR sc3.student_id = active_s.user_id)
                                   AND sc3.capture_type = 'live'
                                 ORDER BY sc3.id DESC
                                 LIMIT 1
@@ -1072,7 +1735,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                                 SELECT sc5.id
                                 FROM screen_captures sc5
                                 WHERE sc5.exam_id = ?
-                                  AND sc5.student_id = active.student_id
+                                  AND (sc5.student_id = active.student_id OR sc5.student_id = active_s.user_id)
                                   AND sc5.capture_type = 'live'
                                 ORDER BY sc5.id DESC
                                 LIMIT 1
@@ -1081,7 +1744,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                                 SELECT sc4.captured_at
                                 FROM screen_captures sc4
                                 WHERE sc4.exam_id = ?
-                                  AND sc4.student_id = active.student_id
+                                  AND (sc4.student_id = active.student_id OR sc4.student_id = active_s.user_id)
                                   AND sc4.capture_type = 'live'
                                 ORDER BY sc4.id DESC
                                 LIMIT 1
@@ -1095,27 +1758,50 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                                 THEN 1 ELSE 0
                             END) AS is_submitted
                         FROM (
-                            SELECT student_id FROM exam_submissions WHERE exam_id = ?
-                            UNION
-                            SELECT student_id FROM screen_captures WHERE exam_id = ?
+                            SELECT COALESCE(s.id, raw.student_id) AS student_id
+                            FROM (
+                                SELECT student_id FROM exam_submissions WHERE exam_id = ?
+                                UNION
+                                SELECT student_id FROM screen_captures WHERE exam_id = ?
+                                UNION
+                                SELECT student_id FROM screen_share_sessions WHERE exam_id = ?
+                            ) raw
+                            LEFT JOIN students s ON s.id = raw.student_id OR s.user_id = raw.student_id
+                            GROUP BY COALESCE(s.id, raw.student_id)
                         ) active
-                        LEFT JOIN exam_submissions es ON es.exam_id = ? AND es.student_id = active.student_id
-                        LEFT JOIN screen_captures live_sc ON live_sc.exam_id = ? AND live_sc.student_id = active.student_id AND live_sc.capture_type = 'live'
-                        LEFT JOIN screen_captures hb_sc ON hb_sc.exam_id = ? AND hb_sc.student_id = active.student_id AND hb_sc.capture_type = 'heartbeat'
-                        LEFT JOIN suspicious_logs sl ON sl.exam_id = ? AND sl.student_id = active.student_id
+                        LEFT JOIN students active_s ON active_s.id = active.student_id
+                        LEFT JOIN exam_submissions es ON es.exam_id = ? AND (es.student_id = active.student_id OR es.student_id = active_s.user_id)
+                        LEFT JOIN screen_captures live_sc ON live_sc.exam_id = ? AND (live_sc.student_id = active.student_id OR live_sc.student_id = active_s.user_id) AND live_sc.capture_type = 'live'
+                        LEFT JOIN screen_captures hb_sc ON hb_sc.exam_id = ? AND (hb_sc.student_id = active.student_id OR hb_sc.student_id = active_s.user_id) AND hb_sc.capture_type = 'heartbeat'
+                        LEFT JOIN screen_share_sessions sss ON sss.exam_id = ? AND (sss.student_id = active.student_id OR sss.student_id = active_s.user_id)
+                        LEFT JOIN suspicious_logs sl ON sl.exam_id = ? AND (sl.student_id = active.student_id OR sl.student_id = active_s.user_id)
                         LEFT JOIN proctor_commands pc ON pc.id = (
                             SELECT pc2.id
                             FROM proctor_commands pc2
                             WHERE pc2.exam_id = ?
-                              AND pc2.student_id = active.student_id
+                              AND (pc2.student_id = active.student_id OR pc2.student_id = active_s.user_id)
                               AND pc2.command_type IN ('lock', 'unlock')
                             ORDER BY pc2.id DESC
                             LIMIT 1
                         )
-                        GROUP BY active.student_id
+                        GROUP BY active.student_id, active_s.id, active_s.user_id
                     ");
-                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId]);
-                    echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId]);
+                    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    $liveFrameDir = dirname(__DIR__) . '/runtime/live_frames';
+                    foreach ($rows as &$row) {
+                        $safeKey = preg_replace('/[^A-Za-z0-9_-]/', '_', $examId . '_' . (int)($row['student_id'] ?? 0));
+                        $framePath = $liveFrameDir . '/' . $safeKey . '.jpg';
+                        if (is_file($framePath) && filemtime($framePath) >= time() - 8) {
+                            $row['snapshot'] = base64_encode((string)file_get_contents($framePath));
+                            $row['snapshot_id'] = 'liveframe_' . filemtime($framePath) . '_' . filesize($framePath);
+                            $row['latest_snapshot_at'] = date('Y-m-d H:i:s', filemtime($framePath));
+                            $row['last_activity'] = $row['latest_snapshot_at'];
+                            $row['screen_sharing_active'] = 1;
+                        }
+                    }
+                    unset($row);
+                    echo json_encode(['success' => true, 'data' => $rows]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
                 }
@@ -1128,14 +1814,20 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         SELECT active.student_id,
                                sc.id AS snapshot_id,
                                sc.image_data AS snapshot,
+                               MD5(sc.image_data) AS snapshot_hash,
                                sc.captured_at,
                                hb.captured_at AS last_heartbeat_at,
+                               sss.last_updated AS latest_socket_at,
+                               sss.session_id AS socket_session_id,
                                CASE
-                                   WHEN sc.captured_at >= (NOW() - INTERVAL 45 SECOND)
-                                     OR hb.captured_at >= (NOW() - INTERVAL 15 SECOND)
+                                   WHEN sc.captured_at >= (NOW() - INTERVAL 90 SECOND)
+                                     OR (hb.captured_at >= (NOW() - INTERVAL 45 SECOND) AND hb.notes = 'sharing')
+                                     OR (sss.is_sharing = 1 AND sss.last_updated >= (NOW() - INTERVAL 45 SECOND))
                                    THEN 1 ELSE 0
                                END AS screen_sharing_active,
                                COUNT(DISTINCT sl.id) AS violations,
+                               latest_pc.command_type AS latest_lock_command,
+                               CASE WHEN latest_pc.command_type = 'lock' THEN 1 ELSE 0 END AS screen_locked,
                                MAX(COALESCE(es.submitted, 0)) AS submitted,
                                MAX(es.submitted_at) AS submitted_at,
                                MAX(es.submittedAt) AS submittedAt,
@@ -1148,34 +1840,74 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                                    THEN 1 ELSE 0
                                END) AS is_submitted
                         FROM (
-                            SELECT student_id FROM screen_captures WHERE exam_id = ?
-                            UNION
-                            SELECT student_id FROM exam_submissions WHERE exam_id = ?
+                            SELECT COALESCE(s.id, raw.student_id) AS student_id
+                            FROM (
+                                SELECT student_id FROM screen_captures WHERE exam_id = ?
+                                UNION
+                                SELECT student_id FROM exam_submissions WHERE exam_id = ?
+                                UNION
+                                SELECT student_id FROM screen_share_sessions WHERE exam_id = ?
+                            ) raw
+                            LEFT JOIN students s ON s.id = raw.student_id OR s.user_id = raw.student_id
+                            GROUP BY COALESCE(s.id, raw.student_id)
                         ) active
+                        LEFT JOIN students active_s ON active_s.id = active.student_id
                         LEFT JOIN screen_captures sc ON sc.id = (
                             SELECT sc2.id
                             FROM screen_captures sc2
                             WHERE sc2.exam_id = ?
-                              AND sc2.student_id = active.student_id
+                              AND (sc2.student_id = active.student_id OR sc2.student_id = active_s.user_id)
                               AND sc2.capture_type = 'live'
                             ORDER BY sc2.id DESC
                             LIMIT 1
                         )
-                        LEFT JOIN exam_submissions es ON es.exam_id = ? AND es.student_id = active.student_id
+                        LEFT JOIN exam_submissions es ON es.exam_id = ? AND (es.student_id = active.student_id OR es.student_id = active_s.user_id)
                         LEFT JOIN screen_captures hb ON hb.id = (
                             SELECT hb2.id
                             FROM screen_captures hb2
                             WHERE hb2.exam_id = ?
-                              AND hb2.student_id = active.student_id
+                              AND (hb2.student_id = active.student_id OR hb2.student_id = active_s.user_id)
                               AND hb2.capture_type = 'heartbeat'
                             ORDER BY hb2.id DESC
                             LIMIT 1
                         )
-                        LEFT JOIN suspicious_logs sl ON sl.exam_id = ? AND sl.student_id = active.student_id
-                        GROUP BY active.student_id, sc.id, sc.image_data, sc.captured_at, hb.captured_at
+                        LEFT JOIN screen_share_sessions sss ON sss.id = (
+                            SELECT sss2.id
+                            FROM screen_share_sessions sss2
+                            WHERE sss2.exam_id = ?
+                              AND (sss2.student_id = active.student_id OR sss2.student_id = active_s.user_id)
+                            ORDER BY sss2.last_updated DESC, sss2.id DESC
+                            LIMIT 1
+                        )
+                        LEFT JOIN suspicious_logs sl ON sl.exam_id = ? AND (sl.student_id = active.student_id OR sl.student_id = active_s.user_id)
+                        LEFT JOIN proctor_commands latest_pc ON latest_pc.id = (
+                            SELECT pc2.id
+                            FROM proctor_commands pc2
+                            WHERE pc2.exam_id = ?
+                              AND (pc2.student_id = active.student_id OR pc2.student_id = active_s.user_id)
+                              AND pc2.command_type IN ('lock', 'unlock')
+                            ORDER BY pc2.id DESC
+                            LIMIT 1
+                        )
+                        GROUP BY active.student_id, active_s.id, active_s.user_id, sc.id, sc.image_data, sc.captured_at, hb.captured_at, hb.notes, sss.id, sss.session_id, sss.is_sharing, sss.last_updated, latest_pc.command_type
                     ");
-                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId]);
-                    echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+                    $stmt->execute([$examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId, $examId]);
+                    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    $liveFrameDir = dirname(__DIR__) . '/runtime/live_frames';
+                    foreach ($rows as &$row) {
+                        $safeKey = preg_replace('/[^A-Za-z0-9_-]/', '_', $examId . '_' . (int)($row['student_id'] ?? 0));
+                        $framePath = $liveFrameDir . '/' . $safeKey . '.jpg';
+                        if (is_file($framePath) && filemtime($framePath) >= time() - 8) {
+                            $frameMtime = filemtime($framePath);
+                            $row['snapshot'] = base64_encode((string)file_get_contents($framePath));
+                            $row['snapshot_id'] = 'liveframe_' . $frameMtime . '_' . filesize($framePath);
+                            $row['snapshot_hash'] = md5_file($framePath);
+                            $row['captured_at'] = date('Y-m-d H:i:s', $frameMtime);
+                            $row['screen_sharing_active'] = 1;
+                        }
+                    }
+                    unset($row);
+                    echo json_encode(['success' => true, 'data' => $rows]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
                 }
@@ -1191,17 +1923,24 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                                sc.captured_at,
                                hb.captured_at AS last_heartbeat_at,
                                CASE
-                                   WHEN sc.captured_at >= (NOW() - INTERVAL 45 SECOND)
-                                     OR hb.captured_at >= (NOW() - INTERVAL 15 SECOND)
+                                   WHEN sc.captured_at >= (NOW() - INTERVAL 90 SECOND)
+                                     OR (hb.captured_at >= (NOW() - INTERVAL 45 SECOND) AND hb.notes = 'sharing')
                                    THEN 1 ELSE 0
                                END AS screen_sharing_active,
-                               (SELECT COUNT(*) FROM suspicious_logs sl WHERE sl.exam_id = ? AND sl.student_id = active.student_id) AS violations
+                               CASE WHEN latest_pc.command_type = 'lock' THEN 1 ELSE 0 END AS screen_locked,
+                               (
+                                   SELECT COUNT(*)
+                                   FROM suspicious_logs sl
+                                   WHERE sl.exam_id = ?
+                                     AND (sl.student_id = active.student_id OR sl.student_id = active_s.id OR sl.student_id = active_s.user_id)
+                               ) AS violations
                         FROM (SELECT ? AS student_id) active
+                        LEFT JOIN students active_s ON active_s.id = active.student_id OR active_s.user_id = active.student_id
                         LEFT JOIN screen_captures sc ON sc.id = (
                             SELECT sc2.id
                             FROM screen_captures sc2
                             WHERE sc2.exam_id = ?
-                              AND sc2.student_id = active.student_id
+                              AND (sc2.student_id = active.student_id OR sc2.student_id = active_s.id OR sc2.student_id = active_s.user_id)
                               AND sc2.capture_type = 'live'
                             ORDER BY sc2.id DESC
                             LIMIT 1
@@ -1210,14 +1949,35 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             SELECT hb2.id
                             FROM screen_captures hb2
                             WHERE hb2.exam_id = ?
-                              AND hb2.student_id = active.student_id
+                              AND (hb2.student_id = active.student_id OR hb2.student_id = active_s.id OR hb2.student_id = active_s.user_id)
                               AND hb2.capture_type = 'heartbeat'
                             ORDER BY hb2.id DESC
                             LIMIT 1
                         )
+                        LEFT JOIN proctor_commands latest_pc ON latest_pc.id = (
+                            SELECT pc2.id
+                            FROM proctor_commands pc2
+                            WHERE pc2.exam_id = ?
+                              AND (pc2.student_id = active.student_id OR pc2.student_id = active_s.id OR pc2.student_id = active_s.user_id)
+                              AND pc2.command_type IN ('lock', 'unlock')
+                            ORDER BY pc2.id DESC
+                            LIMIT 1
+                        )
                     ");
-                    $stmt->execute([$examId, $studentId, $examId, $examId]);
-                    echo json_encode(['success' => true, 'data' => $stmt->fetch(PDO::FETCH_ASSOC)]);
+                    $stmt->execute([$examId, $studentId, $examId, $examId, $examId]);
+                    $row = $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
+                    if ($row) {
+                        $liveFrameDir = dirname(__DIR__) . '/runtime/live_frames';
+                        $safeKey = preg_replace('/[^A-Za-z0-9_-]/', '_', $examId . '_' . (int)($row['student_id'] ?? $studentId));
+                        $framePath = $liveFrameDir . '/' . $safeKey . '.jpg';
+                        if (is_file($framePath) && filemtime($framePath) >= time() - 8) {
+                            $frameMtime = filemtime($framePath);
+                            $row['snapshot'] = base64_encode((string)file_get_contents($framePath));
+                            $row['captured_at'] = date('Y-m-d H:i:s', $frameMtime);
+                            $row['screen_sharing_active'] = 1;
+                        }
+                    }
+                    echo json_encode(['success' => true, 'data' => $row]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
                 }
@@ -1230,8 +1990,12 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $where = "sl.exam_id = ?";
                     $params = [$examId];
                     if ($studentId > 0) {
-                        $where .= " AND sl.student_id = ?";
-                        $params[] = $studentId;
+                        $where .= " AND (
+                            sl.student_id = ?
+                            OR sl.student_id = (SELECT user_id FROM students WHERE id = ? OR user_id = ? LIMIT 1)
+                            OR sl.student_id = (SELECT id FROM students WHERE id = ? OR user_id = ? LIMIT 1)
+                        )";
+                        array_push($params, $studentId, $studentId, $studentId, $studentId, $studentId);
                     }
                     $stmt = $pdo->prepare("
                         SELECT sl.id, sl.student_id, s.student_id AS student_identifier, s.full_name,
@@ -1240,18 +2004,56 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                                    SELECT sc.image_data
                                    FROM screen_captures sc
                                    WHERE sc.exam_id = sl.exam_id
-                                     AND sc.student_id = sl.student_id
+                                     AND (sc.student_id = sl.student_id OR sc.student_id = s.id OR sc.student_id = s.user_id)
                                      AND sc.captured_at <= sl.created_at
                                    ORDER BY sc.captured_at DESC
                                    LIMIT 1
-                               ) AS snapshot
+                               ) AS snapshot,
+                               (
+                                   SELECT sc.image_path
+                                   FROM screen_captures sc
+                                   WHERE sc.exam_id = sl.exam_id
+                                     AND (sc.student_id = sl.student_id OR sc.student_id = s.id OR sc.student_id = s.user_id)
+                                     AND sc.captured_at <= sl.created_at
+                                     AND sc.image_path <> ''
+                                   ORDER BY sc.captured_at DESC
+                                   LIMIT 1
+                               ) AS image_path
                         FROM suspicious_logs sl
-                        LEFT JOIN students s ON s.id = sl.student_id
+                        LEFT JOIN students s ON s.id = sl.student_id OR s.user_id = sl.student_id
                         WHERE {$where}
                         ORDER BY sl.created_at DESC
                         LIMIT 80
                     ");
                     $stmt->execute($params);
+                    echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+                } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
+            case 'get_proctored_courses':
+                try {
+                    $stmt = $pdo->prepare("
+                        SELECT
+                            e.id,
+                            e.title,
+                            e.course_code,
+                            e.semester,
+                            e.start_datetime,
+                            e.end_datetime,
+                            COUNT(DISTINCT sc.student_id) AS captured_students,
+                            COUNT(DISTINCT sl.id) AS evidence_count,
+                            MAX(COALESCE(sc.captured_at, sl.created_at)) AS last_proctored_at
+                        FROM exams e
+                        LEFT JOIN screen_captures sc ON sc.exam_id = e.id
+                        LEFT JOIN suspicious_logs sl ON sl.exam_id = e.id
+                        WHERE (e.lecturer_id = ? OR e.created_by = ?)
+                          AND (sc.id IS NOT NULL OR sl.id IS NOT NULL)
+                        GROUP BY e.id, e.title, e.course_code, e.semester, e.start_datetime, e.end_datetime
+                        ORDER BY last_proctored_at DESC, e.created_at DESC
+                    ");
+                    $stmt->execute([$lecturerId, $lecturerId]);
                     echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -1273,10 +2075,95 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                 }
                 break;
 
+            case 'send_message_to_student':
+                try {
+                    $examId = intval($_POST['exam_id'] ?? 0);
+                    $studentId = intval($_POST['student_id'] ?? 0);
+                    $message = trim((string)($_POST['message'] ?? ''));
+                    if ($examId <= 0 || $studentId <= 0 || $message === '') {
+                        echo json_encode(['success' => false, 'error' => 'Select a student and enter a message.']);
+                        break;
+                    }
+                    $stmt = $pdo->prepare("INSERT INTO proctor_commands (exam_id, student_id, command_type, message, created_by) VALUES (?, ?, 'warning', ?, ?)");
+                    $stmt->execute([$examId, $studentId, $message, $lecturerId]);
+                    echo json_encode(['success' => true, 'message' => 'Message sent to student.']);
+                } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
+            case 'add_student_exam_time':
+                try {
+                    $examId = intval($_POST['exam_id'] ?? 0);
+                    $studentId = intval($_POST['student_id'] ?? 0);
+                    $minutes = max(1, intval($_POST['minutes'] ?? 0));
+                    $reason = trim((string)($_POST['reason'] ?? 'Individual extra time granted by lecturer'));
+                    if ($examId <= 0 || $studentId <= 0 || $minutes <= 0) {
+                        echo json_encode(['success' => false, 'error' => 'Select a student and enter valid minutes.']);
+                        break;
+                    }
+                    $allowed = $pdo->prepare("SELECT id FROM exams WHERE id = ? AND (lecturer_id = ? OR created_by = ?) LIMIT 1");
+                    $allowed->execute([$examId, $lecturerId, $lecturerId]);
+                    if (!$allowed->fetchColumn()) {
+                        echo json_encode(['success' => false, 'error' => 'Exam not found or not allowed.']);
+                        break;
+                    }
+                    $pdo->exec("
+                        CREATE TABLE IF NOT EXISTS student_exam_time_adjustments (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            exam_id INT NOT NULL,
+                            student_id INT NOT NULL,
+                            delta_minutes INT NOT NULL DEFAULT 0,
+                            reason VARCHAR(255) NULL,
+                            adjusted_by INT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            INDEX idx_exam_student (exam_id, student_id),
+                            INDEX idx_created_at (created_at)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    ");
+                    $stmt = $pdo->prepare("
+                        INSERT INTO student_exam_time_adjustments (exam_id, student_id, delta_minutes, reason, adjusted_by)
+                        VALUES (?, ?, ?, ?, ?)
+                    ");
+                    $stmt->execute([$examId, $studentId, $minutes, $reason, $lecturerId]);
+                    $notice = "The lecturer has added {$minutes} minute(s) to your examination time.";
+                    $cmd = $pdo->prepare("INSERT INTO proctor_commands (exam_id, student_id, command_type, message, created_by) VALUES (?, ?, 'warning', ?, ?)");
+                    $cmd->execute([$examId, $studentId, $notice, $lecturerId]);
+                    echo json_encode(['success' => true, 'message' => $notice]);
+                } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
             case 'lock_student_screen':
                 try {
                     $examId = intval($_POST['exam_id'] ?? 0);
                     $studentId = intval($_POST['student_id'] ?? 0);
+                    $latestFrame = $pdo->prepare("
+                        SELECT image_data
+                        FROM screen_captures
+                        WHERE exam_id = ?
+                          AND (
+                              student_id = ?
+                              OR student_id = (SELECT user_id FROM students WHERE id = ? OR user_id = ? LIMIT 1)
+                              OR student_id = (SELECT id FROM students WHERE id = ? OR user_id = ? LIMIT 1)
+                          )
+                          AND capture_type = 'live'
+                          AND image_data IS NOT NULL
+                          AND image_data <> ''
+                          AND captured_at >= (NOW() - INTERVAL 2 MINUTE)
+                        ORDER BY id DESC
+                        LIMIT 1
+                    ");
+                    $latestFrame->execute([$examId, $studentId, $studentId, $studentId, $studentId, $studentId]);
+                    $lockEvidence = $latestFrame->fetchColumn();
+                    if ($lockEvidence) {
+                        $evidence = $pdo->prepare("
+                            INSERT INTO screen_captures (exam_id, student_id, image_path, image_data, capture_type, notes, captured_at)
+                            VALUES (?, ?, '', ?, 'evidence', 'Captured automatically immediately before lecturer lock screen', NOW())
+                        ");
+                        $evidence->execute([$examId, $studentId, $lockEvidence]);
+                    }
                     $stmt = $pdo->prepare("INSERT INTO proctor_commands (exam_id, student_id, command_type, message, created_by) VALUES (?, ?, 'lock', 'Your exam screen has been locked by the lecturer.', ?)");
                     $stmt->execute([$examId, $studentId, $lecturerId]);
                     $log = $pdo->prepare("INSERT INTO suspicious_logs (student_id, exam_id, event_type, details, severity) VALUES (?, ?, 'SCREEN_LOCKED_BY_LECTURER', 'Screen locked from proctoring dashboard', 'high')");
@@ -1330,13 +2217,17 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         SELECT image_data
                         FROM screen_captures
                         WHERE exam_id = ?
-                          AND student_id = ?
+                          AND (
+                              student_id = ?
+                              OR student_id = (SELECT user_id FROM students WHERE id = ? OR user_id = ? LIMIT 1)
+                              OR student_id = (SELECT id FROM students WHERE id = ? OR user_id = ? LIMIT 1)
+                          )
                           AND capture_type = 'live'
                           AND captured_at >= (NOW() - INTERVAL 45 SECOND)
                         ORDER BY id DESC
                         LIMIT 1
                     ");
-                    $stmt->execute([$examId, $studentId]);
+                    $stmt->execute([$examId, $studentId, $studentId, $studentId, $studentId, $studentId]);
                     $snapshot = $stmt->fetchColumn();
                     if (!$snapshot) {
                         echo json_encode(['success' => false, 'error' => 'No fresh live screen frame is available for this student. Ask the student to share their screen, then try again.']);
@@ -1374,21 +2265,112 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
 
             case 'get_submissions':
                 try {
+                    $finalGradeTableReady = qodaTryEnsureFinalGradeTable($pdo);
+                    $finalGradeSelect = $finalGradeTableReady ? "
+                            efg.total_score AS final_total_score,
+                            efg.percentage AS final_percentage,
+                            efg.class_score AS final_class_score,
+                            efg.exam_score AS final_exam_score,
+                            efg.grade AS final_grade,
+                            efg.grade_point AS final_grade_point,
+                            efg.status AS final_status,
+                            efg.graded_at AS final_graded_at" : "
+                            NULL AS final_total_score,
+                            NULL AS final_percentage,
+                            NULL AS final_class_score,
+                            NULL AS final_exam_score,
+                            NULL AS final_grade,
+                            NULL AS final_grade_point,
+                            NULL AS final_status,
+                            NULL AS final_graded_at";
+                    $finalGradeJoin = $finalGradeTableReady
+                        ? "LEFT JOIN exam_final_grades efg ON efg.submission_id = es.id"
+                        : "";
                     $stmt = $pdo->prepare("
-            SELECT 
-                es.*,
-                s.full_name as student_name,
-                s.student_id as student_identifier,
-                e.title as exam_title,
-                e.course_code
-            FROM exam_submissions es
-            LEFT JOIN students s ON es.student_id = s.id
-            LEFT JOIN exams e ON es.exam_id = e.id
-            WHERE e.lecturer_id = ? OR e.created_by = ? OR e.lecturer_id IS NULL
-            ORDER BY es.submitted_at DESC
-        ");
+                        SELECT
+                            es.*,
+                            COALESCE(es.student_name, s.full_name) AS student_name,
+                            COALESCE(es.student_identifier, s.student_id) AS student_identifier,
+                            e.title AS exam_title,
+                            e.course_code,
+                            (
+                                SELECT ce.course_name
+                                FROM course_enrollments ce
+                                WHERE ce.course_code = e.course_code
+                                  AND (ce.lecturer_id = e.lecturer_id OR ce.lecturer_id = e.created_by)
+                                ORDER BY ce.enrolled_at DESC
+                                LIMIT 1
+                            ) AS course_name,
+                            e.exam_code,
+                            e.start_datetime,
+                            e.end_datetime,
+                            e.duration_minutes,
+                            e.semester,
+                            e.school_type,
+                            e.academic_year,
+                            e.exam_type,
+                            e.level,
+                            e.school_name,
+                            e.department,
+                            e.results_published,
+                            $finalGradeSelect
+                        FROM exam_submissions es
+                        LEFT JOIN students s ON es.student_id = s.id
+                        LEFT JOIN exams e ON es.exam_id = e.id
+                        $finalGradeJoin
+                        WHERE (e.lecturer_id = ? OR e.created_by = ? OR e.lecturer_id IS NULL)
+                          AND LOWER(COALESCE(es.status, '')) NOT IN ('in_progress', 'draft', 'autosaved')
+                          AND (
+                              COALESCE(es.submitted, 0) = 1
+                              OR es.submitted_at IS NOT NULL
+                              OR es.submittedAt IS NOT NULL
+                              OR UPPER(COALESCE(es.status, '')) IN ('SUBMITTED', 'TIMED_OUT', 'GRADED', 'MARKED', 'AUTO_GRADED', 'MANUALLY_GRADED')
+                          )
+                        ORDER BY es.exam_id ASC, es.student_id ASC, es.id DESC
+                    ");
                     $stmt->execute([$lecturerId, $lecturerId]);
-                    $submissions = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    $statusPriority = static function ($status): int {
+                        $status = strtoupper((string)$status);
+                        if (in_array($status, ['GRADED', 'MARKED', 'MANUALLY_GRADED'], true)) return 5;
+                        if ($status === 'AUTO_GRADED') return 4;
+                        if (in_array($status, ['SUBMITTED', 'TIMED_OUT'], true)) return 3;
+                        return 1;
+                    };
+                    $deduped = [];
+                    foreach ($rows as $row) {
+                        if ($row['final_total_score'] !== null && $row['final_total_score'] !== '') {
+                            $row['total_score'] = $row['final_total_score'];
+                            $row['percentage'] = $row['final_percentage'];
+                            $row['class_score'] = $row['final_class_score'];
+                            $row['exam_score'] = $row['final_exam_score'];
+                            $row['grade'] = $row['final_grade'];
+                            $row['grade_point'] = $row['final_grade_point'];
+                            $row['status'] = $row['final_status'] ?: ($row['status'] ?? 'GRADED');
+                            if (!empty($row['final_graded_at'])) {
+                                $row['graded_at'] = $row['final_graded_at'];
+                            }
+                        }
+                        $studentKey = $row['student_id'] ?: ($row['student_identifier'] ?? '');
+                        $key = ($row['exam_id'] ?? '') . '::' . $studentKey;
+                        $row['submitted_exact'] = $row['submittedAt'] ?? $row['submitted_at'] ?? null;
+                        if (!isset($deduped[$key])) {
+                            $deduped[$key] = $row;
+                            continue;
+                        }
+                        $existing = $deduped[$key];
+                        $currentPriority = $statusPriority($row['status'] ?? '');
+                        $existingPriority = $statusPriority($existing['status'] ?? '');
+                        $currentTime = strtotime((string)($row['submitted_exact'] ?? $row['updated_at'] ?? $row['submitted_at'] ?? '')) ?: 0;
+                        $existingTime = strtotime((string)($existing['submitted_exact'] ?? $existing['updated_at'] ?? $existing['submitted_at'] ?? '')) ?: 0;
+                        if ($currentPriority > $existingPriority || ($currentPriority === $existingPriority && ($currentTime > $existingTime || (int)$row['id'] > (int)$existing['id']))) {
+                            $deduped[$key] = $row;
+                        }
+                    }
+                    $submissions = array_values($deduped);
+                    usort($submissions, static function ($a, $b) {
+                        return strcmp((string)($b['submitted_exact'] ?? $b['submitted_at'] ?? ''), (string)($a['submitted_exact'] ?? $a['submitted_at'] ?? ''));
+                    });
 
                     echo json_encode(['success' => true, 'data' => $submissions]);
                 } catch (Exception $e) {
@@ -1537,52 +2519,27 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $classScore = min(40, max(0, roundToInt($_POST['class_score'] ?? 0)));
                     $examScore = min(60, max(0, roundToInt($_POST['exam_score'] ?? 0)));
                     $totalScore = min(100, max(0, $examScore + $classScore));
-                    $grade = $_POST['grade'] ?? '';
-                    $gradePoint = round(floatval($_POST['grade_point'] ?? 0), 1);
+                    $fallbackGrade = qodaGradeInfo($totalScore);
+                    $grade = trim((string)($_POST['grade'] ?? '')) ?: $fallbackGrade['grade'];
+                    $gradePoint = isset($_POST['grade_point']) && $_POST['grade_point'] !== ''
+                        ? round(floatval($_POST['grade_point']), 1)
+                        : $fallbackGrade['gradePoint'];
 
-                    $stmt = $pdo->prepare("
-            UPDATE exam_submissions 
-            SET status = ?, 
-                total_score = ?,
-                percentage = ?,
-                graded_at = NOW()
-            WHERE id = ?
-        ");
-
-                    // Store class score and exam score in answers JSON
-                    $getStmt = $pdo->prepare("SELECT answers FROM exam_submissions WHERE id = ?");
-                    $getStmt->execute([$submissionId]);
-                    $submission = $getStmt->fetch(PDO::FETCH_ASSOC);
-
-                    $answers = json_decode($submission['answers'], true) ?? [];
-                    $answers['grading'] = [
+                    $storedGrade = qodaPersistFinalGrade($pdo, [
+                        'submission_id' => $submissionId,
+                        'raw_question_score' => $examScore,
+                        'percentage' => $examScore > 0 ? min(100, ($examScore / 60) * 100) : 0,
                         'class_score' => $classScore,
                         'exam_score' => $examScore,
                         'total_score' => $totalScore,
                         'grade' => $grade,
                         'grade_point' => $gradePoint,
-                        'graded_at' => date('Y-m-d H:i:s')
-                    ];
-
-                    $updateStmt = $pdo->prepare("
-            UPDATE exam_submissions 
-            SET status = ?, 
-                total_score = ?,
-                percentage = ?,
-                answers = ?,
-                graded_at = NOW()
-            WHERE id = ?
-        ");
-
-                    $updateStmt->execute([
-                        $status,
-                        $totalScore,
-                        $totalScore,
-                        json_encode($answers),
-                        $submissionId
+                        'status' => $status,
+                        'score_source' => 'manual',
+                        'graded_by' => $lecturerId
                     ]);
 
-                    echo json_encode(['success' => true]);
+                    echo json_encode(['success' => true, 'grade' => $storedGrade]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
                 }
@@ -1617,19 +2574,62 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         // Parse questions and answers
                         $questions = json_decode($submission['questions'], true);
                         $answers = json_decode($submission['answers'], true);
+                        if (!is_array($answers)) {
+                            $answers = json_decode($submission['answers_json'] ?? '[]', true);
+                        }
+                        if (!is_array($answers)) {
+                            $answers = [];
+                        }
+
+                        $savedScores = [];
+                        $savedFeedback = [];
+                        try {
+                            $scoreTable = $pdo->query("SHOW TABLES LIKE 'submission_question_scores'");
+                            if ($scoreTable && $scoreTable->rowCount() > 0) {
+                                $scoreStmt = $pdo->prepare("SELECT question_id, score, feedback FROM submission_question_scores WHERE submission_id = ?");
+                                $scoreStmt->execute([$submissionId]);
+                                foreach ($scoreStmt->fetchAll(PDO::FETCH_ASSOC) as $scoreRow) {
+                                    $savedScores[(string)$scoreRow['question_id']] = (float)$scoreRow['score'];
+                                    $savedFeedback[(string)$scoreRow['question_id']] = (string)($scoreRow['feedback'] ?? '');
+                                }
+                            }
+                        } catch (Throwable $scoreLoadError) {
+                            error_log('Could not load saved question scores: ' . $scoreLoadError->getMessage());
+                        }
 
                         // Combine questions with answers
                         $questionList = [];
                         if (is_array($questions)) {
                             foreach ($questions as $index => $question) {
+                                $questionId = (string)($question['id'] ?? ('Q' . $index));
+                                $answerRow = is_array($answers[$questionId] ?? null)
+                                    ? $answers[$questionId]
+                                    : (is_array($answers[$index] ?? null) ? $answers[$index] : []);
+                                $answerValue = $answerRow['value'] ?? $answerRow;
+                                $answerText = 'No answer provided';
+                                if (is_array($answerValue)) {
+                                    if (isset($answerValue['code'])) {
+                                        $answerText = (string)$answerValue['code'];
+                                    } elseif (!empty($answerValue['files']) && is_array($answerValue['files'])) {
+                                        $firstFile = $answerValue['files'][0] ?? [];
+                                        $answerText = (string)($firstFile['content'] ?? 'No answer provided');
+                                    } elseif (isset($answerValue['answer'])) {
+                                        $answerText = (string)$answerValue['answer'];
+                                    }
+                                } elseif (is_string($answerValue) && $answerValue !== '') {
+                                    $answerText = $answerValue;
+                                }
+
                                 $questionList[] = [
                                     'number' => $index + 1,
+                                    'id' => $questionId,
                                     'text' => $question['text'] ?? 'No question text',
                                     'marks' => $question['marks'] ?? 0,
                                     'language' => $question['language'] ?? 'text',
                                     'expectedOutput' => $question['expectedOutput'] ?? '',
-                                    'answer' => $answers[$index]['code'] ?? $answers[$index]['answer'] ?? 'No answer provided',
-                                    'savedScore' => $submission['question_scores'][$index] ?? 0
+                                    'answer' => $answerText,
+                                    'savedScore' => $savedScores[$questionId] ?? (float)($answerRow['auto_score'] ?? $answerRow['score'] ?? 0),
+                                    'autoFeedback' => $savedFeedback[$questionId] ?? (string)($answerRow['auto_feedback'] ?? '')
                                 ];
                             }
                         }
@@ -1874,7 +2874,15 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $examId = intval($_POST['exam_id'] ?? 0);
 
                     $stmt = $pdo->prepare("
-            SELECT e.*, 
+            SELECT e.*,
+                   (
+                       SELECT ce.course_name
+                       FROM course_enrollments ce
+                       WHERE ce.course_code = e.course_code
+                         AND (ce.lecturer_id = e.lecturer_id OR ce.lecturer_id = e.created_by)
+                       ORDER BY ce.enrolled_at DESC
+                       LIMIT 1
+                   ) AS course_name,
                    s.full_name as lecturer_name,
                    s.staff_id as lecturer_staff_id
             FROM exams e
@@ -1905,40 +2913,27 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $percentage = min(100, max(0, floatval($_POST['percentage'] ?? 0)));
                     $examScore = min(60, max(0, roundToInt(($percentage * 60) / 100)));
 
-                    // Get current submission to update answers
-                    $stmt = $pdo->prepare("SELECT answers, student_identifier FROM exam_submissions WHERE id = ?");
+                    $stmt = $pdo->prepare("SELECT student_identifier, class_score FROM exam_submissions WHERE id = ?");
                     $stmt->execute([$submissionId]);
                     $submission = $stmt->fetch(PDO::FETCH_ASSOC);
 
                     if ($submission) {
-                        $answers = json_decode($submission['answers'], true) ?? [];
-                        $existingGrading = $answers['grading'] ?? $answers['_grading'] ?? [];
-                        $classScore = min(40, max(0, roundToInt($existingGrading['class_score'] ?? 0)));
+                        $classScore = min(40, max(0, roundToInt($submission['class_score'] ?? 0)));
                         $finalTotalScore = min(100, max(0, $examScore + $classScore));
-                        $answers['_grading'] = [
+                        $gradeInfo = qodaGradeInfo($finalTotalScore);
+
+                        qodaPersistFinalGrade($pdo, [
+                            'submission_id' => $submissionId,
                             'raw_question_score' => $rawTotalScore,
+                            'percentage' => $percentage,
                             'class_score' => $classScore,
                             'exam_score' => $examScore,
                             'total_score' => $finalTotalScore,
-                            'percentage' => $percentage,
-                            'graded_at' => date('Y-m-d H:i:s'),
+                            'grade' => $gradeInfo['grade'],
+                            'grade_point' => $gradeInfo['gradePoint'],
+                            'status' => 'AUTO_GRADED',
+                            'score_source' => 'auto',
                             'graded_by' => $lecturerId
-                        ];
-
-                        $updateStmt = $pdo->prepare("
-                UPDATE exam_submissions 
-                SET total_score = ?,
-                    percentage = ?,
-                    answers = ?,
-                    status = 'AUTO_GRADED'
-                WHERE id = ?
-            ");
-
-                        $updateStmt->execute([
-                            $finalTotalScore,
-                            $percentage,
-                            json_encode($answers),
-                            $submissionId
                         ]);
 
                         echo json_encode(['success' => true, 'message' => 'Scores saved successfully']);
@@ -1975,19 +2970,41 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $submissionId = intval($_POST['submission_id'] ?? 0);
                     $scores = json_decode($_POST['scores'] ?? '{}', true);
                     $feedback = $_POST['feedback'] ?? '';
-                    $totalScore = floatval($_POST['total_score'] ?? 0);
+                    $rawScore = max(0, floatval($_POST['total_score'] ?? 0));
 
                     $stmt = $pdo->prepare("
-            UPDATE exam_submissions 
-            SET total_score = ?, 
-                percentage = (? / (SELECT total_marks FROM exams WHERE id = exam_id)) * 100,
-                status = 'MANUALLY_GRADED',
-                manual_feedback = ?,
-                graded_at = NOW(),
-                graded_by = ?
-            WHERE id = ?
-        ");
-                    $stmt->execute([$totalScore, $totalScore, $feedback, $lecturerId, $submissionId]);
+                        SELECT e.total_marks, es.class_score
+                        FROM exam_submissions es
+                        JOIN exams e ON e.id = es.exam_id
+                        WHERE es.id = ?
+                    ");
+                    $stmt->execute([$submissionId]);
+                    $submissionMeta = $stmt->fetch(PDO::FETCH_ASSOC);
+                    if (!$submissionMeta) {
+                        echo json_encode(['success' => false, 'error' => 'Submission not found']);
+                        break;
+                    }
+
+                    $totalMarks = max(1, (float)($submissionMeta['total_marks'] ?? 100));
+                    $percentage = min(100, max(0, ($rawScore / $totalMarks) * 100));
+                    $examScore = min(60, max(0, roundToInt(($percentage * 60) / 100)));
+                    $classScore = min(40, max(0, roundToInt($submissionMeta['class_score'] ?? 0)));
+                    $finalTotalScore = min(100, max(0, $examScore + $classScore));
+                    $gradeInfo = qodaGradeInfo($finalTotalScore);
+
+                    qodaPersistFinalGrade($pdo, [
+                        'submission_id' => $submissionId,
+                        'raw_question_score' => $rawScore,
+                        'percentage' => $percentage,
+                        'class_score' => $classScore,
+                        'exam_score' => $examScore,
+                        'total_score' => $finalTotalScore,
+                        'grade' => $gradeInfo['grade'],
+                        'grade_point' => $gradeInfo['gradePoint'],
+                        'status' => 'MANUALLY_GRADED',
+                        'score_source' => 'manual',
+                        'graded_by' => $lecturerId
+                    ]);
 
                     // Save individual question scores
                     foreach ($scores as $questionId => $score) {
@@ -2026,10 +3043,19 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                 $duration = max(1, intval($_POST['duration'] ?? 180));
                 $startDatetime = normalizeDateTimeInput($_POST['start_datetime'] ?? null);
                 $endDatetime = normalizeExamEndTime($startDatetime, $_POST['end_datetime'] ?? null, $duration);
+                $gracePeriod = max(0, intval($_POST['grace_period_minutes'] ?? 0));
+                $cutoffDatetime = normalizeDateTimeInput($_POST['cutoff_datetime'] ?? null);
+                if (!$cutoffDatetime && $endDatetime && $gracePeriod > 0) {
+                    $cutoffDatetime = date('Y-m-d H:i:s', strtotime($endDatetime) + ($gracePeriod * 60));
+                }
+                if ($cutoffDatetime && $endDatetime && strtotime($cutoffDatetime) < strtotime($endDatetime)) {
+                    $cutoffDatetime = $endDatetime;
+                }
+                $academicYear = trim($_POST['academic_year'] ?? '');
                 $stmt = $pdo->prepare("
         INSERT INTO exams (exam_id, title, course_code, duration_minutes, start_datetime, end_datetime, instructions, marking_scheme,
-        questions_to_answer, shuffle_enabled, grading_mode, created_by, lecturer_id, created_at) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+        questions_to_answer, shuffle_enabled, grading_mode, academic_year, created_by, lecturer_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
     ");
                 $stmt->execute([
                     $examId,
@@ -2043,12 +3069,26 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $_POST['questions_to_answer'] ?? 0,
                     $_POST['shuffle_enabled'] ?? 0,
                     $_POST['grading_mode'] ?? 'auto',
+                    $academicYear,
                     $_SESSION['user_id'],
                     $lecturerId
                 ]);
 
                 // Get the last inserted ID - THIS IS THE NUMERIC ID
                 $lastId = $pdo->lastInsertId();
+                $optional = qodaExamOptionalColumnValues($pdo, [
+                    'grace_period_minutes' => $gracePeriod,
+                    'cutoff_datetime' => $cutoffDatetime,
+                    'exam_control_status' => 'active',
+                    'pause_started_at' => null,
+                    'paused_seconds_total' => 0
+                ]);
+                if ($optional) {
+                    $sets = implode(', ', array_map(fn($column) => "`$column` = ?", array_keys($optional)));
+                    $pdo->prepare("UPDATE exams SET {$sets} WHERE id = ?")
+                        ->execute([...array_values($optional), $lastId]);
+                }
+                qodaSyncExamQuestionDetails($pdo, (int)$lastId, $_POST['questions'] ?? '[]');
 
                 echo json_encode(['success' => true, 'exam_id' => $lastId, 'exam_code' => $examId]);
                 break;
@@ -2196,13 +3236,16 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
 
             case 'get_profile':
                 try {
-                    $stmt = $pdo->prepare("SELECT id, user_id, full_name, email, profile_pic, staff_id, department, faculty, levels_taught, classes, courses FROM users WHERE id = ? AND role = 'LECTURER'");
+                    $stmt = $pdo->prepare("SELECT id, user_id, username, title, full_name, email, profile_pic, staff_id, department, faculty, levels_taught, classes, courses FROM users WHERE id = ? AND role = 'LECTURER' AND COALESCE(status, 'Active') <> 'Deleted'");
                     $stmt->execute([$lecturerId]);
                     $profile = $stmt->fetch(PDO::FETCH_ASSOC);
                     if (!$profile) {
                         echo json_encode(['success' => false, 'error' => 'Profile not found']);
                         break;
                     }
+                    $courseStmt = $pdo->prepare("SELECT id, course_code, course_name, level FROM lecturer_courses WHERE lecturer_id = ? ORDER BY course_code, level");
+                    $courseStmt->execute([$lecturerId]);
+                    $profile['teaching_courses'] = $courseStmt->fetchAll(PDO::FETCH_ASSOC);
                     echo json_encode(['success' => true, 'data' => $profile]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -2234,7 +3277,6 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             full_name = ?,
                             fullName = ?,
                             email = ?,
-                            staff_id = ?,
                             department = ?,
                             faculty = ?,
                             levels_taught = ?,
@@ -2248,7 +3290,6 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         $fullName,
                         $fullName,
                         $email,
-                        trim($_POST['staff_id'] ?? ''),
                         trim($_POST['department'] ?? ''),
                         trim($_POST['faculty'] ?? ''),
                         trim($_POST['levels_taught'] ?? ''),
@@ -2265,33 +3306,88 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
 
             case 'upload_profile_pic':
                 if (isset($_FILES['profile_pic']) && $_FILES['profile_pic']['error'] == 0) {
-                    $uploadDir = 'uploads/profile_pictures/';
-                    if (!file_exists($uploadDir)) {
-                        mkdir($uploadDir, 0777, true);
-                    }
-
                     $extension = strtolower(pathinfo($_FILES['profile_pic']['name'], PATHINFO_EXTENSION));
                     $allowed = ['jpg', 'jpeg', 'png', 'gif'];
 
-                    if (in_array($extension, $allowed)) {
-                        $filename = 'profile_' . $_SESSION['user_id'] . '_' . time() . '.' . $extension;
-                        $uploadPath = $uploadDir . $filename;
-
-                        if (move_uploaded_file($_FILES['profile_pic']['tmp_name'], $uploadPath)) {
-                            $profilePicUrl = $uploadPath;
-
-                            $stmt = $pdo->prepare("UPDATE users SET profile_pic = ? WHERE id = ?");
-                            $stmt->execute([$profilePicUrl, $_SESSION['user_id']]);
-
-                            echo json_encode(['success' => true, 'url' => $profilePicUrl]);
-                        } else {
-                            echo json_encode(['success' => false, 'error' => 'Failed to upload file']);
-                        }
-                    } else {
+                    if (!in_array($extension, $allowed, true)) {
                         echo json_encode(['success' => false, 'error' => 'Invalid file type']);
+                        break;
                     }
+                    if (($_FILES['profile_pic']['size'] ?? 0) > 2 * 1024 * 1024) {
+                        echo json_encode(['success' => false, 'error' => 'Profile picture must be 2MB or smaller']);
+                        break;
+                    }
+                    $tmpPath = $_FILES['profile_pic']['tmp_name'];
+                    $mime = mime_content_type($tmpPath) ?: ('image/' . ($extension === 'jpg' ? 'jpeg' : $extension));
+                    $profilePicDataUrl = 'data:' . $mime . ';base64,' . base64_encode(file_get_contents($tmpPath));
+
+                    $uploadDir = __DIR__ . '/uploads/profile_pictures';
+                    if (!is_dir($uploadDir)) {
+                        mkdir($uploadDir, 0775, true);
+                    }
+                    $fileName = 'lecturer_' . (int)$_SESSION['user_id'] . '_' . time() . '.' . $extension;
+                    $absolutePath = $uploadDir . '/' . $fileName;
+                    if (!move_uploaded_file($_FILES['profile_pic']['tmp_name'], $absolutePath)) {
+                        echo json_encode(['success' => false, 'error' => 'Could not save uploaded profile picture']);
+                        break;
+                    }
+                    $profilePicUrl = 'uploads/profile_pictures/' . $fileName;
+
+                    $stmt = $pdo->prepare("UPDATE users SET profile_pic = ?, updated_at = NOW() WHERE id = ?");
+                    try {
+                        $stmt->execute([$profilePicDataUrl, $_SESSION['user_id']]);
+                        $profilePicUrl = $profilePicDataUrl;
+                    } catch (Throwable $imageStoreError) {
+                        error_log('Profile picture data-url storage failed, using file path fallback: ' . $imageStoreError->getMessage());
+                        try {
+                            $stmt->execute(['uploads/profile_pictures/' . $fileName, $_SESSION['user_id']]);
+                        } catch (Throwable $pathStoreError) {
+                            error_log('Profile picture file-path storage also failed: ' . $pathStoreError->getMessage());
+                        }
+                    }
+
+                    echo json_encode(['success' => true, 'url' => $profilePicUrl, 'preview_url' => $profilePicDataUrl]);
                 } else {
                     echo json_encode(['success' => false, 'error' => 'No file uploaded']);
+                }
+                break;
+            case 'save_lecturer_course':
+                try {
+                    $courseCode = strtoupper(trim($_POST['course_code'] ?? ''));
+                    $courseName = trim($_POST['course_name'] ?? '');
+                    $level = trim($_POST['level'] ?? '');
+                    if ($courseCode === '' || $courseName === '' || $level === '') {
+                        echo json_encode(['success' => false, 'error' => 'Course code, course name, and level are required']);
+                        break;
+                    }
+                    $stmt = $pdo->prepare("
+                        INSERT INTO lecturer_courses (lecturer_id, course_code, course_name, level)
+                        VALUES (?, ?, ?, ?)
+                        ON DUPLICATE KEY UPDATE course_name = VALUES(course_name), updated_at = NOW()
+                    ");
+                    $stmt->execute([$lecturerId, $courseCode, $courseName, $level]);
+                    echo json_encode(['success' => true]);
+                } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+            case 'delete_lecturer_account':
+                try {
+                    $password = $_POST['password'] ?? '';
+                    $stmt = $pdo->prepare("SELECT password FROM users WHERE id = ? AND role = 'LECTURER'");
+                    $stmt->execute([$lecturerId]);
+                    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+                    if (!$user || !password_verify($password, $user['password'])) {
+                        echo json_encode(['success' => false, 'error' => 'Password confirmation failed']);
+                        break;
+                    }
+                    $stmt = $pdo->prepare("UPDATE users SET status = 'Deleted', deleted_at = NOW(), updated_at = NOW() WHERE id = ? AND role = 'LECTURER'");
+                    $stmt->execute([$lecturerId]);
+                    session_unset();
+                    session_destroy();
+                    echo json_encode(['success' => true, 'redirect' => 'login.php']);
+                } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
                 }
                 break;
             case 'change_lecturer_password':
@@ -2349,10 +3445,90 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $newPassword = $student['student_id'];
                     $hashedPassword = password_hash($newPassword, PASSWORD_DEFAULT);
 
-                    $stmt = $pdo->prepare("UPDATE students SET password = ? WHERE id = ?");
+                    $stmt = $pdo->prepare("UPDATE students SET password = ?, updated_at = NOW() WHERE id = ?");
                     $stmt->execute([$hashedPassword, $studentId]);
 
                     echo json_encode(['success' => true, 'message' => 'Password reset to Student ID']);
+                } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+            case 'migrate_student_level':
+                try {
+                    $studentDbId = intval($_POST['student_id'] ?? 0);
+                    $newLevel = trim((string)($_POST['level'] ?? ''));
+                    $allowedLevels = ['100', '200', '300', '400', '500'];
+                    if ($studentDbId <= 0 || !in_array($newLevel, $allowedLevels, true)) {
+                        echo json_encode(['success' => false, 'error' => 'Select a valid student and level']);
+                        break;
+                    }
+
+                    $stmt = $pdo->prepare("SELECT student_id, full_name, level FROM students WHERE id = ?");
+                    $stmt->execute([$studentDbId]);
+                    $student = $stmt->fetch(PDO::FETCH_ASSOC);
+                    if (!$student) {
+                        echo json_encode(['success' => false, 'error' => 'Student not found']);
+                        break;
+                    }
+
+                    $oldLevel = (string)($student['level'] ?? '');
+                    $stmt = $pdo->prepare("UPDATE students SET level = ?, updated_at = NOW() WHERE id = ?");
+                    $stmt->execute([$newLevel, $studentDbId]);
+
+                    try {
+                        $audit = $pdo->prepare("INSERT INTO audit_logs (actor_id, actor_role, action, description, ip_address) VALUES (?, 'LECTURER', 'STUDENT_LEVEL_MIGRATION', ?, ?)");
+                        $audit->execute([
+                            $lecturerId,
+                            'Migrated ' . ($student['student_id'] ?? $studentDbId) . ' from level ' . ($oldLevel ?: 'not set') . ' to level ' . $newLevel,
+                            $_SERVER['REMOTE_ADDR'] ?? ''
+                        ]);
+                    } catch (Throwable $auditError) {
+                        error_log('student level migration audit skipped: ' . $auditError->getMessage());
+                    }
+
+                    echo json_encode([
+                        'success' => true,
+                        'message' => ($student['full_name'] ?? 'Student') . ' moved to level ' . $newLevel
+                    ]);
+                } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+            case 'bulk_migrate_student_level':
+                try {
+                    $newLevel = trim((string)($_POST['level'] ?? ''));
+                    $allowedLevels = ['100', '200', '300', '400', '500'];
+                    $ids = json_decode((string)($_POST['student_ids'] ?? '[]'), true);
+                    $ids = is_array($ids) ? array_values(array_unique(array_filter(array_map('intval', $ids)))) : [];
+
+                    if (!in_array($newLevel, $allowedLevels, true)) {
+                        echo json_encode(['success' => false, 'error' => 'Select a valid destination level']);
+                        break;
+                    }
+
+                    if ($ids) {
+                        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+                        $params = array_merge([$newLevel], $ids, [$lecturerId]);
+                        $stmt = $pdo->prepare("UPDATE students SET level = ?, updated_at = NOW() WHERE id IN ($placeholders) AND lecturer_id = ?");
+                        $stmt->execute($params);
+                    } else {
+                        $stmt = $pdo->prepare("UPDATE students SET level = ?, updated_at = NOW() WHERE lecturer_id = ?");
+                        $stmt->execute([$newLevel, $lecturerId]);
+                    }
+
+                    $count = $stmt->rowCount();
+                    try {
+                        $audit = $pdo->prepare("INSERT INTO audit_logs (actor_id, actor_role, action, description, ip_address) VALUES (?, 'LECTURER', 'BULK_STUDENT_LEVEL_MIGRATION', ?, ?)");
+                        $audit->execute([
+                            $lecturerId,
+                            'Bulk migrated ' . $count . ' student(s) to level ' . $newLevel,
+                            $_SERVER['REMOTE_ADDR'] ?? ''
+                        ]);
+                    } catch (Throwable $auditError) {
+                        error_log('bulk student level migration audit skipped: ' . $auditError->getMessage());
+                    }
+
+                    echo json_encode(['success' => true, 'count' => $count, 'message' => "Migrated {$count} student(s) to Level {$newLevel}"]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
                 }
@@ -2527,6 +3703,8 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $duration = max(1, intval($_POST['duration'] ?? 180));
                     $startDatetime = $_POST['start_datetime'] ?? null;
                     $endDatetime = $_POST['end_datetime'] ?? null;
+                    $gracePeriod = max(0, intval($_POST['grace_period_minutes'] ?? 0));
+                    $cutoffDatetime = normalizeDateTimeInput($_POST['cutoff_datetime'] ?? null);
                     $instructions = trim($_POST['instructions'] ?? '');
                     $markingScheme = trim($_POST['marking_scheme'] ?? '');
                     $questionsToAnswer = intval($_POST['questions_to_answer'] ?? 0);
@@ -2538,6 +3716,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $facultyName = trim($_POST['faculty_name'] ?? '');
                     $department = trim($_POST['department'] ?? '');
                     $semester = trim($_POST['semester'] ?? '');
+                    $academicYear = trim($_POST['academic_year'] ?? '');
                     $examType = trim($_POST['exam_type'] ?? '');
                     $schoolType = trim($_POST['school_type'] ?? '');
                     $level = trim($_POST['level'] ?? '');
@@ -2549,6 +3728,12 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     [$startDatetime, $endDatetime] = normalizePublishedExamSchedule($startDatetime, $endDatetime, $duration);
                     if ($startDatetime && $endDatetime) {
                         $duration = max(1, (int)round((strtotime($endDatetime) - strtotime($startDatetime)) / 60));
+                    }
+                    if (!$cutoffDatetime && $endDatetime && $gracePeriod > 0) {
+                        $cutoffDatetime = date('Y-m-d H:i:s', strtotime($endDatetime) + ($gracePeriod * 60));
+                    }
+                    if ($cutoffDatetime && $endDatetime && strtotime($cutoffDatetime) < strtotime($endDatetime)) {
+                        $cutoffDatetime = $endDatetime;
                     }
 
                     // ========== BACKEND VALIDATION ==========
@@ -2579,14 +3764,14 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $stmt = $pdo->prepare("
             INSERT INTO exams (
                 exam_id, title, course_code, duration_minutes, start_datetime, end_datetime,
-                instructions, marking_scheme, questions, questions_to_answer, 
-                shuffle_enabled, grading_mode, exam_password, require_password, 
-                school_name, faculty_name, department, semester, exam_type, 
-                school_type, level, exam_code, auto_grading_enabled, 
+                instructions, marking_scheme, questions, questions_to_answer,
+                shuffle_enabled, grading_mode, exam_password, require_password,
+                school_name, faculty_name, department, semester, exam_type,
+                school_type, academic_year, level, exam_code, auto_grading_enabled,
                 partial_grading_enabled, show_correct_answers, allow_review,
                 published, created_by, lecturer_id, created_at
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NOW()
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NOW()
             )
         ");
 
@@ -2611,6 +3796,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         $semester,
                         $examType,
                         $schoolType,
+                        $academicYear,
                         $level,
                         $examCode,
                         $autoGradingEnabled,
@@ -2622,6 +3808,19 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     ]);
 
                     $lastId = $pdo->lastInsertId();
+                    $optional = qodaExamOptionalColumnValues($pdo, [
+                        'grace_period_minutes' => $gracePeriod,
+                        'cutoff_datetime' => $cutoffDatetime,
+                        'exam_control_status' => 'active',
+                        'pause_started_at' => null,
+                        'paused_seconds_total' => 0
+                    ]);
+                    if ($optional) {
+                        $sets = implode(', ', array_map(fn($column) => "`$column` = ?", array_keys($optional)));
+                        $pdo->prepare("UPDATE exams SET {$sets} WHERE id = ?")
+                            ->execute([...array_values($optional), $lastId]);
+                    }
+                    qodaSyncExamQuestionDetails($pdo, (int)$lastId, $questionsJson);
 
                     echo json_encode([
                         'success' => true,
@@ -2650,6 +3849,8 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $duration = max(1, intval($_POST['duration'] ?? $_POST['duration_minutes'] ?? 180));
                     $startDatetime = $_POST['start_datetime'] ?? null;
                     $endDatetime = $_POST['end_datetime'] ?? null;
+                    $gracePeriod = max(0, intval($_POST['grace_period_minutes'] ?? 0));
+                    $cutoffDatetime = normalizeDateTimeInput($_POST['cutoff_datetime'] ?? null);
                     $instructions = trim($_POST['instructions'] ?? '');
                     $markingScheme = trim($_POST['marking_scheme'] ?? '');
                     $questionsToAnswer = intval($_POST['questions_to_answer'] ?? 0);
@@ -2661,6 +3862,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $facultyName = trim($_POST['faculty_name'] ?? '');
                     $department = trim($_POST['department'] ?? '');
                     $semester = trim($_POST['semester'] ?? '');
+                    $academicYear = trim($_POST['academic_year'] ?? '');
                     $examType = trim($_POST['exam_type'] ?? '');
                     $schoolType = trim($_POST['school_type'] ?? '');
                     $level = trim($_POST['level'] ?? '');
@@ -2676,6 +3878,12 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     $endDatetime = normalizeExamEndTime($startDatetime, $endDatetime, $duration);
                     if ($startDatetime && $endDatetime) {
                         $duration = max(1, (int)round((strtotime($endDatetime) - strtotime($startDatetime)) / 60));
+                    }
+                    if (!$cutoffDatetime && $endDatetime && $gracePeriod > 0) {
+                        $cutoffDatetime = date('Y-m-d H:i:s', strtotime($endDatetime) + ($gracePeriod * 60));
+                    }
+                    if ($cutoffDatetime && $endDatetime && strtotime($cutoffDatetime) < strtotime($endDatetime)) {
+                        $cutoffDatetime = $endDatetime;
                     }
 
                     $questions = json_decode($questionsJson, true);
@@ -2710,6 +3918,9 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                         break;
                     }
 
+                    $publishWarning = null;
+                    $usedMinimalPublish = false;
+
                     // Check if exam exists
                     $checkStmt = $pdo->prepare("SELECT id FROM exams WHERE id = ? AND (created_by = ? OR lecturer_id = ?)");
                     $checkStmt->execute([$examId, $lecturerId, $lecturerId]);
@@ -2737,6 +3948,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     semester = ?,
                     exam_type = ?,
                     school_type = ?,
+                    academic_year = ?,
                     level = ?,
                     exam_code = ?,
                     auto_grading_enabled = ?,
@@ -2751,7 +3963,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                 WHERE id = ? AND (created_by = ? OR lecturer_id = ?)
             ");
 
-                        $stmt->execute([
+                        $updateParams = [
                             $title,
                             $courseCode,
                             $duration,
@@ -2771,6 +3983,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             $semester,
                             $examType,
                             $schoolType,
+                            $academicYear,
                             $level,
                             $examCode,
                             $autoGradingEnabled,
@@ -2781,7 +3994,27 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             $examId,
                             $lecturerId,
                             $lecturerId
-                        ]);
+                        ];
+                        try {
+                            $stmt->execute($updateParams);
+                        } catch (Throwable $storageError) {
+                            if (!qodaIsStorageFullError($storageError)) {
+                                throw $storageError;
+                            }
+                            qodaPruneLiveScreenCaptures($pdo, true);
+                            $updateParams[7] = qodaCompactQuestionsForExamStorage($questionsJson);
+                            try {
+                                $stmt->execute($updateParams);
+                                $questionsJson = $updateParams[7];
+                            } catch (Throwable $compactError) {
+                                if (!qodaIsStorageFullError($compactError)) {
+                                    throw $compactError;
+                                }
+                                qodaMarkExistingExamPublishedMinimal($pdo, $examId, $lecturerId);
+                                $usedMinimalPublish = true;
+                                $publishWarning = 'Railway MySQL is full, so QODA published the last saved copy of this exam. Some latest edits may remain only in your browser draft until database storage is freed.';
+                            }
+                        }
                     } else {
                         // ===== INSERT NEW EXAM - INCLUDING ALL COLUMNS =====
                         $newExamId = 'EXAM-' . strtoupper(uniqid());
@@ -2791,7 +4024,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     instructions, marking_scheme, questions, questions_to_answer,
                     shuffle_enabled, grading_mode, exam_password, require_password,
                     school_name, faculty_name, department, semester, exam_type,
-                    school_type, level, exam_code, auto_grading_enabled,
+                    school_type, academic_year, level, exam_code, auto_grading_enabled,
                     partial_grading_enabled, show_correct_answers, allow_review,
                     total_marks, published, status, published_at, created_by, lecturer_id, created_at
                 ) VALUES (
@@ -2799,13 +4032,13 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     ?, ?, ?, ?,
                     ?, ?, ?, ?,
                     ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?,
                     ?, ?, ?,
                     ?, 1, 'published', NOW(), ?, ?, NOW()
                 )
             ");
 
-                        $stmt->execute([
+                        $insertParams = [
                             $newExamId,
                             $title,
                             $courseCode,
@@ -2826,6 +4059,7 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             $semester,
                             $examType,
                             $schoolType,
+                            $academicYear,
                             $level,
                             $examCode,
                             $autoGradingEnabled,
@@ -2835,28 +4069,67 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                             $totalMarks,
                             $lecturerId,
                             $lecturerId
-                        ]);
+                        ];
+                        try {
+                            $stmt->execute($insertParams);
+                        } catch (Throwable $storageError) {
+                            if (!qodaIsStorageFullError($storageError)) {
+                                throw $storageError;
+                            }
+                            qodaPruneLiveScreenCaptures($pdo, true);
+                            $insertParams[8] = qodaCompactQuestionsForExamStorage($questionsJson);
+                            $stmt->execute($insertParams);
+                            $questionsJson = $insertParams[8];
+                        }
 
                         $examId = $pdo->lastInsertId();
                     }
 
-                    // Also add to exam_class_access for course filtering
-                    $checkAccess = $pdo->prepare("SELECT id FROM exam_class_access WHERE exam_id = ? AND class_code = ?");
-                    $checkAccess->execute([$examId, $courseCode]);
+                    if (!$usedMinimalPublish) {
+                        try {
+                            $optional = qodaExamOptionalColumnValues($pdo, [
+                                'grace_period_minutes' => $gracePeriod,
+                                'cutoff_datetime' => $cutoffDatetime,
+                                'exam_control_status' => 'active',
+                                'pause_started_at' => null
+                            ]);
+                            if ($optional) {
+                                $sets = implode(', ', array_map(fn($column) => "`$column` = ?", array_keys($optional)));
+                                $pdo->prepare("UPDATE exams SET {$sets}, updated_at = NOW() WHERE id = ? AND (created_by = ? OR lecturer_id = ?)")
+                                    ->execute([...array_values($optional), $examId, $lecturerId, $lecturerId]);
+                            }
 
-                    if ($checkAccess->rowCount() == 0) {
-                        $accessStmt = $pdo->prepare("INSERT INTO exam_class_access (exam_id, class_code, class_name, access_granted) VALUES (?, ?, ?, 1)");
-                        $accessStmt->execute([$examId, $courseCode, $title]);
+                            // Also add to exam_class_access for course filtering
+                            $checkAccess = $pdo->prepare("SELECT id FROM exam_class_access WHERE exam_id = ? AND class_code = ?");
+                            $checkAccess->execute([$examId, $courseCode]);
+
+                            if ($checkAccess->rowCount() == 0) {
+                                $accessStmt = $pdo->prepare("INSERT INTO exam_class_access (exam_id, class_code, class_name, access_granted) VALUES (?, ?, ?, 1)");
+                                $accessStmt->execute([$examId, $courseCode, $title]);
+                            }
+
+                            qodaSyncExamQuestionDetails($pdo, (int)$examId, $questionsJson);
+                        } catch (Throwable $postPublishError) {
+                            if (!qodaIsStorageFullError($postPublishError)) {
+                                throw $postPublishError;
+                            }
+                            $publishWarning = $publishWarning ?: 'Exam published, but Railway MySQL is full so some secondary sync data could not be updated.';
+                        }
                     }
 
                     echo json_encode([
                         'success' => true,
-                        'message' => 'Exam published successfully',
+                        'message' => $publishWarning ?: 'Exam published successfully',
+                        'warning' => $publishWarning,
                         'exam_id' => $examId
                     ]);
                 } catch (Exception $e) {
                     error_log("Publish exam error: " . $e->getMessage());
-                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                    if (qodaIsStorageFullError($e)) {
+                        echo json_encode(['success' => false, 'error' => 'The Railway MySQL database storage is full. QODA tried a compact exam save, but MySQL still rejected the publish. Please free database storage or upgrade the Railway database, then publish again.']);
+                    } else {
+                        echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                    }
                 }
                 break;
 
@@ -2988,20 +4261,6 @@ case 'save_question_score':
         ");
         $stmt->execute([$submission_id, $question_index, $marking_scheme, $test_cases, $score, $feedback]);
         
-        // Update the submission answers with the score
-        $stmt2 = $pdo->prepare("SELECT answers FROM exam_submissions WHERE id = ?");
-        $stmt2->execute([$submission_id]);
-        $submission = $stmt2->fetch(PDO::FETCH_ASSOC);
-        
-        $answers = json_decode($submission['answers'], true);
-        if (!isset($answers['_scores'])) $answers['_scores'] = [];
-        $answers['_scores'][$question_index] = $score;
-        if (!isset($answers['_ai_feedback'])) $answers['_ai_feedback'] = [];
-        $answers['_ai_feedback'][$question_index] = $feedback;
-        
-        $stmt3 = $pdo->prepare("UPDATE exam_submissions SET answers = ? WHERE id = ?");
-        $stmt3->execute([json_encode($answers), $submission_id]);
-        
         echo json_encode(['success' => true]);
     } catch (Exception $e) {
         echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -3043,7 +4302,347 @@ case 'save_question_score':
                     $examId = $_POST['exam_id'];
                     $stmt = $pdo->prepare("UPDATE exams SET results_published = 1, results_published_at = NOW() WHERE id = ?");
                     $stmt->execute([$examId]);
+                    $pub = $pdo->prepare("
+                        INSERT INTO result_publications (exam_id, course_code, semester, published_by, published_at, notes)
+                        SELECT id, course_code, semester, ?, NOW(), 'Published from lecturer dashboard'
+                        FROM exams
+                        WHERE id = ?
+                    ");
+                    try {
+                        $pub->execute([$lecturerId, $examId]);
+                    } catch (Throwable $ignored) {
+                        error_log('Result publication log skipped: ' . $ignored->getMessage());
+                    }
                     echo json_encode(['success' => true]);
+                } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
+            case 'adjust_exam_time':
+                try {
+                    $examId = intval($_POST['exam_id'] ?? 0);
+                    $deltaMinutes = intval($_POST['delta_minutes'] ?? 0);
+                    $newEndInput = trim((string)($_POST['new_end_datetime'] ?? ''));
+                    $reason = trim((string)($_POST['reason'] ?? 'Time adjusted by lecturer'));
+
+                    $stmt = $pdo->prepare("SELECT id, start_datetime, end_datetime, duration_minutes FROM exams WHERE id = ? AND (lecturer_id = ? OR created_by = ?) LIMIT 1");
+                    $stmt->execute([$examId, $lecturerId, $lecturerId]);
+                    $exam = $stmt->fetch(PDO::FETCH_ASSOC);
+                    if (!$exam) {
+                        echo json_encode(['success' => false, 'error' => 'Exam not found or not allowed']);
+                        break;
+                    }
+
+                    $oldStart = $exam['start_datetime'] ?: null;
+                    $oldEnd = $exam['end_datetime'] ?: null;
+                    $startTs = $oldStart ? strtotime($oldStart) : time();
+                    $oldEndTs = $oldEnd ? strtotime($oldEnd) : ($startTs + (max(1, intval($exam['duration_minutes'] ?? 180)) * 60));
+                    $newEndTs = $newEndInput !== '' ? strtotime($newEndInput) : ($oldEndTs + ($deltaMinutes * 60));
+                    if (!$newEndTs || $newEndTs <= $startTs) {
+                        echo json_encode(['success' => false, 'error' => 'New end time must be after the start time']);
+                        break;
+                    }
+
+                    $newEnd = date('Y-m-d H:i:s', $newEndTs);
+                    $newDuration = max(1, (int)round(($newEndTs - $startTs) / 60));
+                    $pdo->beginTransaction();
+                    $upd = $pdo->prepare("UPDATE exams SET end_datetime = ?, duration_minutes = ?, updated_at = NOW() WHERE id = ?");
+                    $upd->execute([$newEnd, $newDuration, $examId]);
+                    $log = $pdo->prepare("
+                        INSERT INTO exam_time_adjustments
+                            (exam_id, adjusted_by, old_start_datetime, old_end_datetime, new_start_datetime, new_end_datetime, delta_minutes, reason)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ");
+                    $actualDelta = (int)round(($newEndTs - $oldEndTs) / 60);
+                    $log->execute([$examId, $lecturerId, $oldStart, $oldEnd ? date('Y-m-d H:i:s', $oldEndTs) : null, $oldStart, $newEnd, $actualDelta, $reason]);
+                    $pdo->commit();
+
+                    echo json_encode(['success' => true, 'new_end_datetime' => $newEnd, 'duration_minutes' => $newDuration, 'delta_minutes' => $actualDelta]);
+                } catch (Exception $e) {
+                    if ($pdo->inTransaction()) $pdo->rollBack();
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
+            case 'manage_exam_time':
+                try {
+                    $examId = intval($_POST['exam_id'] ?? 0);
+                    $control = strtolower(trim((string)($_POST['control'] ?? '')));
+                    $minutes = intval($_POST['minutes'] ?? 0);
+                    $newCutoffInput = normalizeDateTimeInput($_POST['cutoff_datetime'] ?? null);
+                    $message = trim((string)($_POST['message'] ?? ''));
+
+                    $stmt = $pdo->prepare("SELECT * FROM exams WHERE id = ? AND (lecturer_id = ? OR created_by = ?) LIMIT 1");
+                    $stmt->execute([$examId, $lecturerId, $lecturerId]);
+                    $exam = $stmt->fetch(PDO::FETCH_ASSOC);
+                    if (!$exam) {
+                        echo json_encode(['success' => false, 'error' => 'Exam not found or not allowed']);
+                        break;
+                    }
+
+                    $hasControlColumns = qodaColumnExists($pdo, 'exams', 'exam_control_status')
+                        && qodaColumnExists($pdo, 'exams', 'pause_started_at')
+                        && qodaColumnExists($pdo, 'exams', 'paused_seconds_total');
+                    $hasCutoff = qodaColumnExists($pdo, 'exams', 'cutoff_datetime');
+                    $oldStart = $exam['start_datetime'] ?: null;
+                    $oldEnd = $exam['end_datetime'] ?: null;
+                    $startTs = $oldStart ? strtotime($oldStart) : time();
+                    $oldEndTs = $oldEnd ? strtotime($oldEnd) : ($startTs + (max(1, intval($exam['duration_minutes'] ?? 180)) * 60));
+                    $newEndTs = $oldEndTs;
+                    $notice = '';
+
+                    if ($control === 'pause') {
+                        if (!$hasControlColumns) {
+                            echo json_encode(['success' => false, 'error' => 'Pause controls need the exam timing columns to be created first.']);
+                            break;
+                        }
+                        $pdo->prepare("UPDATE exams SET exam_control_status = 'paused', pause_started_at = COALESCE(pause_started_at, NOW()), updated_at = NOW() WHERE id = ?")
+                            ->execute([$examId]);
+                        $notice = 'The examination has been temporarily paused by the lecturer.';
+                    } elseif ($control === 'resume') {
+                        if (!$hasControlColumns) {
+                            echo json_encode(['success' => false, 'error' => 'Resume controls need the exam timing columns to be created first.']);
+                            break;
+                        }
+                        $pauseStarted = !empty($exam['pause_started_at']) ? strtotime($exam['pause_started_at']) : false;
+                        $pausedSeconds = $pauseStarted ? max(0, time() - $pauseStarted) : 0;
+                        $newEndTs = $oldEndTs + $pausedSeconds;
+                        $newEnd = date('Y-m-d H:i:s', $newEndTs);
+                        $newDuration = max(1, (int)round(($newEndTs - $startTs) / 60));
+                        $pdo->prepare("
+                            UPDATE exams
+                            SET exam_control_status = 'active',
+                                pause_started_at = NULL,
+                                paused_seconds_total = COALESCE(paused_seconds_total, 0) + ?,
+                                end_datetime = ?,
+                                duration_minutes = ?,
+                                updated_at = NOW()
+                            WHERE id = ?
+                        ")->execute([$pausedSeconds, $newEnd, $newDuration, $examId]);
+                        $notice = 'The examination timer has resumed.';
+                    } elseif (in_array($control, ['add_time', 'reduce_time'], true)) {
+                        $delta = $control === 'reduce_time' ? -abs($minutes) : abs($minutes);
+                        if ($delta === 0) {
+                            echo json_encode(['success' => false, 'error' => 'Enter the number of minutes to adjust.']);
+                            break;
+                        }
+                        $newEndTs = max($startTs + 60, $oldEndTs + ($delta * 60));
+                        $newEnd = date('Y-m-d H:i:s', $newEndTs);
+                        $newDuration = max(1, (int)round(($newEndTs - $startTs) / 60));
+                        $pdo->prepare("UPDATE exams SET end_datetime = ?, duration_minutes = ?, updated_at = NOW() WHERE id = ?")
+                            ->execute([$newEnd, $newDuration, $examId]);
+                        if ($hasCutoff && !empty($exam['cutoff_datetime'])) {
+                            $cutoffTs = strtotime($exam['cutoff_datetime']);
+                            if ($cutoffTs && $cutoffTs < $newEndTs) {
+                                $pdo->prepare("UPDATE exams SET cutoff_datetime = ? WHERE id = ?")->execute([$newEnd, $examId]);
+                            }
+                        }
+                        $notice = $delta > 0
+                            ? "The lecturer has added {$delta} minutes to this examination."
+                            : 'The lecturer has reduced the examination time.';
+                    } elseif ($control === 'extend_cutoff') {
+                        if (!$hasCutoff) {
+                            echo json_encode(['success' => false, 'error' => 'Cut-off control needs the cutoff_datetime column to be created first.']);
+                            break;
+                        }
+                        if (!$newCutoffInput || strtotime($newCutoffInput) === false) {
+                            echo json_encode(['success' => false, 'error' => 'Enter a valid cut-off date and time.']);
+                            break;
+                        }
+                        if (strtotime($newCutoffInput) < $oldEndTs) {
+                            echo json_encode(['success' => false, 'error' => 'Cut-off time cannot be earlier than the exam end time.']);
+                            break;
+                        }
+                        $pdo->prepare("UPDATE exams SET cutoff_datetime = ?, updated_at = NOW() WHERE id = ?")
+                            ->execute([$newCutoffInput, $examId]);
+                        $notice = 'The examination cut-off time has been extended.';
+                    } elseif ($control === 'reopen_submissions') {
+                        $pdo->prepare("
+                            UPDATE exam_submissions
+                            SET status = 'in_progress', submitted = 0, submitted_at = NULL, submittedAt = NULL, updated_at = NOW()
+                            WHERE exam_id = ? AND UPPER(COALESCE(status, '')) IN ('TIMED_OUT', 'SUBMITTED')
+                        ")->execute([$examId]);
+                        $notice = 'Submissions have been reopened by the lecturer.';
+                    } elseif ($control === 'announcement') {
+                        $notice = $message !== '' ? $message : 'Announcement from your lecturer.';
+                    } else {
+                        echo json_encode(['success' => false, 'error' => 'Unknown exam timing control.']);
+                        break;
+                    }
+
+                    if ($message !== '') {
+                        $notice = $message;
+                    }
+                    if ($notice !== '') {
+                        $students = $pdo->prepare("
+                            SELECT DISTINCT s.id
+                            FROM students s
+                            JOIN course_enrollments ce ON ce.student_id = s.id
+                            WHERE ce.course_code = ? AND ce.lecturer_id = ?
+                        ");
+                        $students->execute([$exam['course_code'] ?? '', $lecturerId]);
+                        $command = $pdo->prepare("INSERT INTO proctor_commands (exam_id, student_id, command_type, message, created_by) VALUES (?, ?, 'warning', ?, ?)");
+                        foreach ($students->fetchAll(PDO::FETCH_COLUMN) as $studentId) {
+                            $command->execute([$examId, (int)$studentId, $notice, $lecturerId]);
+                        }
+                    }
+
+                    if (in_array($control, ['resume', 'add_time', 'reduce_time'], true)) {
+                        try {
+                            $actualDelta = (int)round(($newEndTs - $oldEndTs) / 60);
+                            $log = $pdo->prepare("
+                                INSERT INTO exam_time_adjustments
+                                    (exam_id, adjusted_by, old_start_datetime, old_end_datetime, new_start_datetime, new_end_datetime, delta_minutes, reason)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            ");
+                            $log->execute([$examId, $lecturerId, $oldStart, $oldEnd ? date('Y-m-d H:i:s', $oldEndTs) : null, $oldStart, date('Y-m-d H:i:s', $newEndTs), $actualDelta, $control]);
+                        } catch (Throwable $logError) {
+                            error_log('Exam time control log skipped: ' . $logError->getMessage());
+                        }
+                    }
+
+                    echo json_encode(['success' => true, 'message' => $notice]);
+                } catch (Throwable $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
+            case 'force_submit_student':
+                try {
+                    $examId = intval($_POST['exam_id'] ?? 0);
+                    $studentId = intval($_POST['student_id'] ?? 0);
+                    $stmt = $pdo->prepare("
+                        UPDATE exam_submissions es
+                        JOIN exams e ON e.id = es.exam_id
+                        LEFT JOIN students s ON s.id = ? OR s.user_id = ?
+                        SET es.status = 'submitted',
+                            es.submitted = 1,
+                            es.submitted_at = COALESCE(es.submitted_at, NOW()),
+                            es.submittedAt = COALESCE(es.submittedAt, NOW()),
+                            es.updated_at = NOW()
+                        WHERE es.exam_id = ?
+                          AND (es.student_id = ? OR es.student_id = s.id OR es.student_id = s.user_id)
+                          AND (e.lecturer_id = ? OR e.created_by = ?)
+                    ");
+                    $stmt->execute([$studentId, $studentId, $examId, $studentId, $lecturerId, $lecturerId]);
+                    echo json_encode(['success' => true, 'affected' => $stmt->rowCount()]);
+                } catch (Throwable $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
+            case 'get_question_bank':
+                try {
+                    $course = trim((string)($_POST['course_code'] ?? ''));
+                    $language = trim((string)($_POST['language'] ?? ''));
+                    $semester = trim((string)($_POST['semester'] ?? ''));
+                    $year = trim((string)($_POST['academic_year'] ?? $_POST['year'] ?? ''));
+                    $search = strtolower(trim((string)($_POST['search'] ?? $_POST['topic'] ?? '')));
+                    $difficulty = strtolower(trim((string)($_POST['difficulty'] ?? '')));
+
+                    $examStmt = $pdo->prepare("
+                        SELECT id, title, course_code, questions, semester, academic_year, start_datetime, created_at
+                        FROM exams
+                        WHERE (lecturer_id = ? OR created_by = ?)
+                          AND questions IS NOT NULL
+                        ORDER BY created_at DESC
+                        LIMIT 250
+                    ");
+                    $examStmt->execute([$lecturerId, $lecturerId]);
+                    $items = [];
+                    foreach ($examStmt->fetchAll(PDO::FETCH_ASSOC) as $exam) {
+                        $questions = json_decode($exam['questions'] ?? '[]', true);
+                        if (!is_array($questions)) continue;
+                        foreach ($questions as $idx => $question) {
+                            $qCourse = (string)($exam['course_code'] ?? '');
+                            $qLanguage = (string)($question['language'] ?? $question['type'] ?? '');
+                            $qSemester = (string)($exam['semester'] ?? '');
+                            $qYear = (string)($exam['academic_year'] ?? '');
+                            $qDifficulty = strtolower((string)($question['difficulty'] ?? ''));
+                            $prompt = (string)($question['text'] ?? $question['prompt'] ?? $question['title'] ?? '');
+                            if ($course !== '' && strcasecmp($qCourse, $course) !== 0) continue;
+                            if ($language !== '' && strcasecmp($qLanguage, $language) !== 0) continue;
+                            if ($semester !== '' && strcasecmp($qSemester, $semester) !== 0) continue;
+                            if ($year !== '' && stripos($qYear, $year) === false && stripos((string)$exam['start_datetime'], $year) === false) continue;
+                            if ($difficulty !== '' && $qDifficulty !== $difficulty) continue;
+                            if ($search !== '' && stripos(strtolower($prompt . ' ' . json_encode($question)), $search) === false) continue;
+                            $items[] = [
+                                'source' => 'exam',
+                                'source_exam_id' => (int)$exam['id'],
+                                'source_exam_title' => $exam['title'],
+                                'question_index' => $idx,
+                                'course_code' => $qCourse,
+                                'course_name' => $exam['title'],
+                                'language' => $qLanguage,
+                                'semester' => $qSemester,
+                                'academic_year' => $qYear,
+                                'year' => $exam['start_datetime'] ? date('Y', strtotime($exam['start_datetime'])) : date('Y', strtotime($exam['created_at'] ?? 'now')),
+                                'difficulty' => $question['difficulty'] ?? '',
+                                'marks' => $question['marks'] ?? 0,
+                                'title' => $question['title'] ?? ('Question ' . ($idx + 1)),
+                                'prompt' => $prompt,
+                                'question' => $question
+                            ];
+                        }
+                    }
+
+                    echo json_encode(['success' => true, 'data' => $items]);
+                } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
+            case 'save_question_to_bank':
+                try {
+                    $courseCode = trim((string)($_POST['course_code'] ?? ''));
+                    $courseName = trim((string)($_POST['course_name'] ?? ''));
+                    $topic = trim((string)($_POST['topic'] ?? ''));
+                    $difficulty = trim((string)($_POST['difficulty'] ?? ''));
+                    $language = trim((string)($_POST['language'] ?? ''));
+                    $semester = trim((string)($_POST['semester'] ?? ''));
+                    $academicYear = trim((string)($_POST['academic_year'] ?? ''));
+                    $title = trim((string)($_POST['title'] ?? 'Coding Question'));
+                    $prompt = trim((string)($_POST['prompt'] ?? ''));
+                    $questionJson = (string)($_POST['question_json'] ?? '{}');
+                    $testCases = (string)($_POST['test_cases'] ?? '[]');
+                    $marks = floatval($_POST['marks'] ?? 0);
+                    $sourceExamId = intval($_POST['source_exam_id'] ?? 0) ?: null;
+
+                    if ($prompt === '') {
+                        echo json_encode(['success' => false, 'error' => 'Question text is required before saving to the question bank']);
+                        break;
+                    }
+
+                    json_decode($questionJson, true);
+                    if (json_last_error() !== JSON_ERROR_NONE) $questionJson = '{}';
+                    json_decode($testCases, true);
+                    if (json_last_error() !== JSON_ERROR_NONE) $testCases = '[]';
+
+                    $stmt = $pdo->prepare("
+                        INSERT INTO question_bank
+                            (lecturer_id, course_code, course_name, topic, difficulty, language, semester, academic_year,
+                             title, prompt, question_json, test_cases, marks, source_exam_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ");
+                    $stmt->execute([
+                        $lecturerId,
+                        $courseCode,
+                        $courseName,
+                        $topic,
+                        $difficulty,
+                        $language,
+                        $semester,
+                        $academicYear,
+                        $title,
+                        $prompt,
+                        $questionJson,
+                        $testCases,
+                        $marks,
+                        $sourceExamId
+                    ]);
+
+                    echo json_encode(['success' => true, 'id' => (int)$pdo->lastInsertId()]);
                 } catch (Exception $e) {
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
                 }
@@ -3195,12 +4794,110 @@ case 'save_question_score':
                 }
                 break;
 
+            case 'get_active_student_sessions':
+                try {
+                    qodaEnsureStudentSessionMonitorTables($pdo);
+                    $stmt = $pdo->prepare("
+                        SELECT
+                            sas.id,
+                            sas.student_id,
+                            sas.student_identifier,
+                            sas.device_id,
+                            sas.operating_system,
+                            sas.ip_address,
+                            sas.login_at,
+                            sas.last_seen,
+                            sas.locked_exam_id,
+                            s.full_name,
+                            s.level,
+                            s.programme
+                        FROM student_active_sessions sas
+                        JOIN students s ON s.id = sas.student_id
+                        WHERE sas.active = 1 AND s.lecturer_id = ?
+                        ORDER BY sas.last_seen DESC
+                    ");
+                    $stmt->execute([$lecturerId]);
+                    echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+                } catch (Throwable $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
+            case 'force_logout_student_session':
+                try {
+                    qodaEnsureStudentSessionMonitorTables($pdo);
+                    $studentId = intval($_POST['student_id'] ?? 0);
+                    $sessionRecordId = intval($_POST['session_record_id'] ?? 0);
+                    if ($studentId <= 0 && $sessionRecordId <= 0) {
+                        echo json_encode(['success' => false, 'error' => 'Student session is required']);
+                        break;
+                    }
+
+                    $where = $sessionRecordId > 0 ? 'sas.id = ?' : 'sas.student_id = ?';
+                    $param = $sessionRecordId > 0 ? $sessionRecordId : $studentId;
+                    $stmt = $pdo->prepare("
+                        UPDATE student_active_sessions sas
+                        JOIN students s ON s.id = sas.student_id
+                        SET sas.active = 0,
+                            sas.released_at = NOW(),
+                            sas.release_reason = 'lecturer_force_logout'
+                        WHERE $where AND s.lecturer_id = ? AND sas.active = 1
+                    ");
+                    $stmt->execute([$param, $lecturerId]);
+
+                    $event = $pdo->prepare("
+                        INSERT INTO student_session_events (student_id, event_type, details)
+                        VALUES (?, 'lecturer_force_logout', ?)
+                    ");
+                    $event->execute([$studentId ?: null, 'Lecturer terminated the active student session for emergency recovery or suspected multi-device use.']);
+
+                    echo json_encode(['success' => true, 'released' => $stmt->rowCount()]);
+                } catch (Throwable $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
+            case 'get_student_session_history':
+                try {
+                    qodaEnsureStudentSessionMonitorTables($pdo);
+                    $studentId = intval($_POST['student_id'] ?? 0);
+                    $stmt = $pdo->prepare("
+                        SELECT
+                            sse.event_type,
+                            sse.device_id,
+                            sse.operating_system,
+                            sse.ip_address,
+                            sse.exam_id,
+                            sse.details,
+                            sse.created_at
+                        FROM student_session_events sse
+                        JOIN students s ON s.id = sse.student_id
+                        WHERE s.lecturer_id = ? AND (? = 0 OR sse.student_id = ?)
+                        ORDER BY sse.created_at DESC
+                        LIMIT 120
+                    ");
+                    $stmt->execute([$lecturerId, $studentId, $studentId]);
+                    echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+                } catch (Throwable $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
             case 'update_exam':
                 try {
                     $examId = intval($_POST['exam_id'] ?? 0);
                     $duration = max(1, intval($_POST['duration'] ?? 180));
                     $startDatetime = normalizeDateTimeInput($_POST['start_datetime'] ?? null);
                     $endDatetime = normalizeExamEndTime($startDatetime, $_POST['end_datetime'] ?? null, $duration);
+                    $gracePeriod = max(0, intval($_POST['grace_period_minutes'] ?? 0));
+                    $cutoffDatetime = normalizeDateTimeInput($_POST['cutoff_datetime'] ?? null);
+                    if (!$cutoffDatetime && $endDatetime && $gracePeriod > 0) {
+                        $cutoffDatetime = date('Y-m-d H:i:s', strtotime($endDatetime) + ($gracePeriod * 60));
+                    }
+                    if ($cutoffDatetime && $endDatetime && strtotime($cutoffDatetime) < strtotime($endDatetime)) {
+                        $cutoffDatetime = $endDatetime;
+                    }
+                    $academicYear = trim($_POST['academic_year'] ?? '');
                     if ($startDatetime && $endDatetime) {
                         $duration = max(1, (int)round((strtotime($endDatetime) - strtotime($startDatetime)) / 60));
                     }
@@ -3224,6 +4921,7 @@ case 'save_question_score':
                 semester = ?,
                 exam_type = ?,
                 school_type = ?,
+                academic_year = ?,
                 level = ?,
                 exam_code = ?,
                 auto_grading_enabled = ?,
@@ -3235,7 +4933,7 @@ case 'save_question_score':
             WHERE id = ? AND (created_by = ? OR lecturer_id = ?)
         ");
 
-                    $stmt->execute([
+                    $updateParams = [
                         $_POST['title'] ?? '',
                         $_POST['course_code'] ?? '',
                         $duration,
@@ -3253,6 +4951,7 @@ case 'save_question_score':
                         $_POST['semester'] ?? '',
                         $_POST['exam_type'] ?? '',
                         $_POST['school_type'] ?? '',
+                        $academicYear,
                         $_POST['level'] ?? '',
                         $_POST['exam_code'] ?? '',
                         intval($_POST['auto_grading_enabled'] ?? 0),
@@ -3262,7 +4961,28 @@ case 'save_question_score':
                         $examId,
                         $lecturerId,
                         $lecturerId
+                    ];
+                    try {
+                        $stmt->execute($updateParams);
+                    } catch (Throwable $storageError) {
+                        if (!qodaIsStorageFullError($storageError)) {
+                            throw $storageError;
+                        }
+                        $updateParams[7] = qodaCompactQuestionsForExamStorage((string)($_POST['questions'] ?? '[]'));
+                        $stmt->execute($updateParams);
+                    }
+
+                    $optional = qodaExamOptionalColumnValues($pdo, [
+                        'grace_period_minutes' => $gracePeriod,
+                        'cutoff_datetime' => $cutoffDatetime
                     ]);
+                    if ($optional) {
+                        $sets = implode(', ', array_map(fn($column) => "`$column` = ?", array_keys($optional)));
+                        $pdo->prepare("UPDATE exams SET {$sets}, updated_at = NOW() WHERE id = ? AND (created_by = ? OR lecturer_id = ?)")
+                            ->execute([...array_values($optional), $examId, $lecturerId, $lecturerId]);
+                    }
+
+                    qodaSyncExamQuestionDetails($pdo, (int)$examId, $_POST['questions'] ?? '[]');
 
                     echo json_encode(['success' => true]);
                 } catch (Exception $e) {
@@ -3422,11 +5142,13 @@ function createCourseTable($courseCode)
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Qoda | Lecturer Dashboard</title>
+    <link rel="icon" type="image/png" href="../assets/qoda-logo.png">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs/loader.js"></script>
+    <script src="/socket.io/socket.io.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
     /* =========================================================
@@ -3721,19 +5443,22 @@ function createCourseTable($courseCode)
     .header-logo {
         width: 48px;
         height: 48px;
-        background: linear-gradient(135deg, #4f46e5, #06b6d4);
+        background: var(--card);
         border-radius: 14px;
         display: flex;
         align-items: center;
         justify-content: center;
         box-shadow: 0 4px 10px rgba(79, 70, 229, .3);
         flex-shrink: 0;
+        overflow: hidden;
+        border: 1px solid var(--border);
     }
 
-    .header-logo span {
-        font-size: 26px;
-        font-weight: 800;
-        color: #fff;
+    .header-logo img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
     }
 
     .header-typing {
@@ -3927,8 +5652,9 @@ function createCourseTable($courseCode)
             height: 42px;
         }
 
-        .header-logo span {
-            font-size: 22px;
+        .header-logo img {
+            width: 100%;
+            height: 100%;
         }
 
 
@@ -4087,7 +5813,10 @@ function createCourseTable($courseCode)
         pointer-events: none;
     }
 
-    .nav-icon:hover .tooltip-text {
+    .nav-icon:hover .tooltip-text,
+    .profile-icon:hover .tooltip-text,
+    .theme-switch-icon:hover .tooltip-text,
+    .logout-icon:hover .tooltip-text {
         opacity: 1;
         visibility: visible;
     }
@@ -4482,6 +6211,79 @@ function createCourseTable($courseCode)
         align-items: center;
         justify-content: space-between;
         margin-bottom: 20px;
+    }
+
+    .proctoring-control-panel {
+        display: grid;
+        grid-template-columns: minmax(280px, 420px) 1fr;
+        gap: 16px;
+        align-items: stretch;
+        background: linear-gradient(135deg, rgba(59, 130, 246, 0.08), rgba(16, 185, 129, 0.08));
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 16px;
+        margin-bottom: 18px;
+    }
+
+    .proctoring-select-card,
+    .proctoring-actions-card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 14px;
+    }
+
+    .proctoring-select-card label {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: .04em;
+        text-transform: uppercase;
+        margin-bottom: 8px;
+    }
+
+    .proctoring-exam-select {
+        width: 100%;
+        min-height: 46px;
+        padding: 0 14px;
+        border-radius: 12px;
+        border: 2px solid rgba(59, 130, 246, 0.25);
+        background: var(--input-bg, var(--bg));
+        color: var(--text);
+        font-weight: 700;
+        outline: none;
+    }
+
+    .proctoring-exam-select:focus {
+        border-color: #3b82f6;
+        box-shadow: 0 0 0 4px rgba(59, 130, 246, .14);
+    }
+
+    .proctoring-actions-title {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: .04em;
+        text-transform: uppercase;
+        margin-bottom: 10px;
+    }
+
+    .proctoring-button-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 10px;
+    }
+
+    .proctoring-button-grid .btn {
+        width: 100%;
+        justify-content: center;
+    }
+
+    @media (max-width: 900px) {
+        .proctoring-control-panel {
+            grid-template-columns: 1fr;
+        }
     }
 
     .sticky-actions {
@@ -6776,9 +8578,10 @@ function createCourseTable($courseCode)
     /* Proctoring Grid Styles */
     .student-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-        gap: 16px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 18px;
         margin-top: 20px;
+        align-items: start;
     }
 
     .student-proctor-card {
@@ -6800,7 +8603,7 @@ function createCourseTable($courseCode)
         background: #1e1e1e;
         aspect-ratio: 16 / 9;
         height: auto;
-        min-height: 170px;
+        min-height: 220px;
         overflow: hidden;
     }
 
@@ -6853,14 +8656,49 @@ function createCourseTable($courseCode)
     }
 
     /* Full screen modal */
+    #fullScreenProctorModal {
+        padding: 0 !important;
+        align-items: stretch !important;
+        justify-content: stretch !important;
+    }
+
     #fullScreenProctorModal .modal-content {
         padding: 0;
         background: var(--panel);
+        width: 100vw !important;
+        height: 100vh !important;
+        max-width: none !important;
+        max-height: 100vh !important;
+        border-radius: 0 !important;
+        overflow: hidden;
     }
 
     #fullScreenContent {
         background: #000;
-        min-height: 500px;
+        min-height: 0;
+        flex: 1 1 auto;
+        display: flex;
+        align-items: stretch;
+        justify-content: stretch;
+        overflow: hidden;
+    }
+
+    #fullScreenStreamContainer,
+    #fullScreenImg {
+        width: 100%;
+        height: 100%;
+    }
+
+    #fullScreenImg {
+        object-fit: contain;
+        image-rendering: auto;
+        background: #000;
+    }
+
+    @media (max-width: 900px) {
+        .student-grid {
+            grid-template-columns: 1fr;
+        }
     }
 
 
@@ -7096,6 +8934,188 @@ function createCourseTable($courseCode)
         display: flex;
         justify-content: space-between;
         align-items: center;
+    }
+
+    .exam-created-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+        gap: 14px;
+        align-items: stretch;
+        margin-top: 18px;
+    }
+
+    .exam-created-card {
+        background: #ffffff;
+        color: #0f172a;
+        border: 1px solid #dbe3ef;
+        border-top: 5px solid var(--accent-blue);
+        border-radius: 12px;
+        padding: 16px;
+        box-shadow: var(--shadow);
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        min-height: 100%;
+        cursor: pointer;
+        transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+    }
+
+    .exam-created-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 16px 34px rgba(15, 23, 42, .12);
+    }
+
+    .exam-created-card.is-expanded {
+        cursor: default;
+        grid-column: span 2;
+    }
+
+    .exam-created-card.status-ongoing { border-top: 5px solid #10b981 !important; }
+    .exam-created-card.status-scheduled { border-top: 5px solid #3b82f6 !important; }
+    .exam-created-card.status-completed { border-top: 5px solid #64748b !important; }
+    .exam-created-card.status-draft { border-top: 5px solid #f59e0b !important; }
+    .exam-created-card.status-published { border-top: 5px solid #8b5cf6 !important; }
+    .exam-created-card.status-ongoing,
+    .exam-created-card.status-scheduled,
+    .exam-created-card.status-completed,
+    .exam-created-card.status-draft,
+    .exam-created-card.status-published {
+        background: #ffffff !important;
+        color: #0f172a !important;
+        border-left: 1px solid #dbe3ef !important;
+        border-right: 1px solid #dbe3ef !important;
+        border-bottom: 1px solid #dbe3ef !important;
+    }
+
+    .exam-created-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+    }
+
+    .exam-created-title {
+        margin: 0;
+        font-size: 18px;
+        line-height: 1.25;
+        color: #0f172a;
+    }
+
+    .exam-created-subtitle {
+        margin-top: 6px;
+        color: #475569;
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: .01em;
+    }
+
+    .exam-created-hint {
+        color: #64748b;
+        font-size: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding-top: 4px;
+        border-top: 1px solid #e2e8f0;
+    }
+
+    .exam-created-toggle {
+        color: var(--accent-blue);
+        font-weight: 800;
+        white-space: nowrap;
+    }
+
+    .exam-created-card.is-expanded .exam-created-toggle {
+        color: #10b981;
+    }
+
+    .exam-created-details {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        padding-top: 4px;
+    }
+
+    .exam-created-details[hidden] {
+        display: none;
+    }
+
+    .exam-created-meta {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+    }
+
+    .exam-created-meta-item {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 10px;
+        padding: 9px 10px;
+        min-width: 0;
+    }
+
+    .exam-created-meta-item small {
+        display: block;
+        color: #64748b;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: .03em;
+        margin-bottom: 4px;
+    }
+
+    .exam-created-meta-item strong {
+        color: #0f172a;
+        font-size: 13px;
+        word-break: break-word;
+    }
+
+    .exam-created-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: auto;
+    }
+
+    .exam-instance-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+        gap: 16px;
+    }
+
+    .exam-instance-card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-left: 5px solid var(--accent-blue);
+        border-radius: 14px;
+        padding: 16px;
+        box-shadow: var(--shadow);
+    }
+
+    .question-bank-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+        gap: 12px;
+    }
+
+    .question-bank-card {
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 14px;
+    }
+
+    @media (max-width: 720px) {
+        .exam-created-grid,
+        .exam-created-meta,
+        .exam-instance-grid,
+        .question-bank-grid {
+            grid-template-columns: 1fr;
+        }
+
+        .exam-created-card.is-expanded {
+            grid-column: auto;
+        }
     }
 
     .back-to-courses-btn {
@@ -7664,6 +9684,669 @@ function createCourseTable($courseCode)
         filter: invert(0);
     }
 
+    /* Modern coding-question authoring workspace */
+    #qList {
+        gap: 22px;
+    }
+
+    .qoda-author-card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        box-shadow: 0 18px 55px rgba(15, 23, 42, .08);
+        overflow: hidden;
+    }
+
+    .qoda-q-header {
+        position: relative;
+        z-index: 1;
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 16px;
+        padding: 18px 20px;
+        background: var(--panel);
+        background: color-mix(in srgb, var(--panel) 92%, var(--accent) 8%);
+        border-bottom: 1px solid var(--border);
+    }
+
+    .qoda-q-meta {
+        min-width: 0;
+        flex: 1 1 auto;
+    }
+
+    .qoda-q-badges {
+        display: flex;
+        flex-wrap: nowrap;
+        gap: 8px;
+        align-items: center;
+        min-width: 0;
+        overflow-x: auto;
+        padding-bottom: 2px;
+        scrollbar-width: thin;
+    }
+
+    .qoda-badge {
+        flex: 0 0 auto;
+        border-radius: 999px;
+        padding: 7px 10px;
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: .02em;
+        text-transform: uppercase;
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid var(--border);
+    }
+
+    .qoda-badge.primary {
+        background: linear-gradient(135deg, #0284c7, #7c3aed);
+        color: white;
+        border: 0;
+    }
+
+    .qoda-badge.success {
+        background: rgba(16, 185, 129, .16);
+        color: #059669;
+        border-color: rgba(16, 185, 129, .34);
+    }
+
+    .qoda-badge.warning {
+        background: rgba(245, 158, 11, .16);
+        color: #b45309;
+        border-color: rgba(245, 158, 11, .35);
+    }
+
+    .qoda-badge.progress {
+        background: rgba(59, 130, 246, .14);
+        color: #1d4ed8;
+        border-color: rgba(59, 130, 246, .35);
+        white-space: nowrap;
+    }
+
+    .qoda-icon-actions {
+        display: flex;
+        flex-wrap: wrap;
+        flex: 0 0 auto;
+        justify-content: flex-end;
+        gap: 8px;
+    }
+
+    .qoda-icon-actions .btn {
+        min-height: 38px;
+    }
+
+    .qoda-author-body {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(300px, 390px);
+        gap: 18px;
+        padding: 18px;
+        align-items: start;
+    }
+
+    .qoda-author-main {
+        display: grid;
+        gap: 14px;
+        min-width: 0;
+    }
+
+    .qoda-author-section {
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        background: var(--bg);
+        overflow: hidden;
+    }
+
+    .qoda-author-section summary {
+        cursor: pointer;
+        list-style: none;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 14px;
+        padding: 15px 17px;
+        font-weight: 800;
+        color: var(--text);
+    }
+
+    .qoda-author-section summary::-webkit-details-marker {
+        display: none;
+    }
+
+    .qoda-author-section summary::after {
+        content: "\f078";
+        font-family: "Font Awesome 6 Free";
+        font-weight: 900;
+        color: var(--muted);
+        transition: transform .2s ease;
+    }
+
+    .qoda-author-section[open] summary::after {
+        transform: rotate(180deg);
+    }
+
+    .qoda-section-body {
+        padding: 0 17px 17px;
+        display: grid;
+        gap: 14px;
+    }
+
+    .qoda-field-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+        gap: 12px;
+    }
+
+    .qoda-field label {
+        display: block;
+        margin-bottom: 7px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 800;
+        text-transform: uppercase;
+        letter-spacing: .03em;
+    }
+
+    .qoda-field input,
+    .qoda-field select,
+    .qoda-field textarea {
+        width: 100%;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 11px 12px;
+        color: var(--text);
+        background: var(--input-bg);
+        outline: none;
+    }
+
+    .qoda-field textarea {
+        min-height: 88px;
+        resize: vertical;
+        line-height: 1.55;
+    }
+
+    .qoda-rich-wrap {
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        overflow: hidden;
+        background: var(--input-bg);
+    }
+
+    .qoda-rich-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        padding: 8px;
+        border-bottom: 1px solid var(--border);
+        background: color-mix(in srgb, var(--panel) 88%, var(--accent) 12%);
+    }
+
+    .qoda-rich-toolbar button {
+        border: 1px solid var(--border);
+        border-radius: 9px;
+        min-width: 34px;
+        min-height: 32px;
+        color: var(--text);
+        background: var(--panel);
+        cursor: pointer;
+    }
+
+    .qoda-rich-editor {
+        min-height: 118px;
+        padding: 13px;
+        color: var(--text);
+        line-height: 1.6;
+        outline: none;
+    }
+
+    .qoda-rich-editor:empty::before {
+        content: attr(data-placeholder);
+        color: var(--muted);
+    }
+
+    .qoda-rich-editor pre,
+    .qoda-preview-panel pre {
+        white-space: pre-wrap;
+        background: #0f172a;
+        color: #e2e8f0;
+        border-radius: 10px;
+        padding: 12px;
+        overflow: auto;
+    }
+
+    .qoda-rich-editor table,
+    .qoda-preview-panel table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 8px 0;
+    }
+
+    .qoda-rich-editor table[data-qoda-numbered="1"] td:first-child,
+    .qoda-rich-editor table[data-qoda-numbered="1"] th:first-child,
+    .qoda-preview-panel table[data-qoda-numbered="1"] td:first-child,
+    .qoda-preview-panel table[data-qoda-numbered="1"] th:first-child {
+        width: 48px;
+        text-align: center;
+        color: var(--muted);
+        font-weight: 800;
+    }
+
+    .qoda-rich-editor td,
+    .qoda-rich-editor th,
+    .qoda-preview-panel td,
+    .qoda-preview-panel th {
+        border: 1px solid var(--border);
+        padding: 8px;
+    }
+
+    .qoda-rich-editor img,
+    .qoda-preview-panel img {
+        max-width: 100%;
+        height: auto;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        display: block;
+        margin: 10px 0;
+    }
+
+    .qoda-case-card,
+    .qoda-rubric-row {
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 13px;
+        background: var(--panel);
+        display: grid;
+        gap: 12px;
+    }
+
+    .qoda-case-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+    }
+
+    .qoda-case-actions {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+    }
+
+    .qoda-toggle-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+        color: var(--text);
+        font-weight: 700;
+    }
+
+    .qoda-preview-panel {
+        position: sticky;
+        top: 146px;
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        background: var(--panel);
+        min-height: 520px;
+        max-height: calc(100vh - 170px);
+        overflow: auto;
+    }
+
+    .qoda-preview-head {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        padding: 14px 16px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+        font-weight: 900;
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+    }
+
+    .qoda-preview-content {
+        padding: 16px;
+        display: grid;
+        gap: 14px;
+        color: var(--text);
+    }
+
+    .qoda-validation-list {
+        display: grid;
+        gap: 8px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+    }
+
+    .qoda-validation-list li {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        color: var(--muted);
+        font-size: 13px;
+    }
+
+    .qoda-validation-list li.ready {
+        color: #059669;
+    }
+
+    .qoda-validation-list li.missing {
+        color: #dc2626;
+    }
+
+    .qoda-validation-panel {
+        margin: 14px 18px 0;
+        padding: 14px;
+        border: 1px solid rgba(59, 130, 246, .25);
+        border-radius: 12px;
+        background: color-mix(in srgb, var(--panel) 88%, #dbeafe 12%);
+        display: grid;
+        gap: 12px;
+    }
+
+    .qoda-validation-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        font-weight: 900;
+        color: var(--text);
+    }
+
+    .qoda-validation-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+        gap: 8px;
+    }
+
+    .qoda-validation-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 34px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: var(--bg);
+        font-size: 13px;
+        font-weight: 800;
+    }
+
+    .qoda-validation-item.ready {
+        color: #047857;
+        border-color: rgba(16, 185, 129, .35);
+        background: rgba(16, 185, 129, .1);
+    }
+
+    .qoda-validation-item.warning {
+        color: #b45309;
+        border-color: rgba(245, 158, 11, .35);
+        background: rgba(245, 158, 11, .12);
+    }
+
+    .qoda-validation-item.missing {
+        color: #dc2626;
+        border-color: rgba(239, 68, 68, .35);
+        background: rgba(239, 68, 68, .1);
+    }
+
+    .qoda-validation-progress {
+        font-weight: 900;
+        color: #1d4ed8;
+    }
+
+    .qoda-publish-toolbar {
+        position: sticky;
+        bottom: 0;
+        z-index: 7;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        padding: 14px 18px;
+        border-top: 1px solid var(--border);
+        background: color-mix(in srgb, var(--panel) 94%, var(--accent) 6%);
+        flex-wrap: wrap;
+    }
+
+    .qoda-toolbar-actions {
+        display: flex;
+        gap: 9px;
+        flex-wrap: wrap;
+    }
+
+    .qoda-autosave {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 700;
+    }
+
+    .qoda-required {
+        box-shadow: 0 0 0 2px rgba(239, 68, 68, .2);
+    }
+
+    .qoda-code-shell {
+        border: 1px solid #2d2d30;
+        border-radius: 10px;
+        overflow: hidden;
+        background: #1e1e1e;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, .04);
+    }
+
+    .qoda-code-head {
+        display: flex;
+        align-items: stretch;
+        gap: 0;
+        min-height: 34px;
+        color: #d4d4d4;
+        background: #252526;
+        border-bottom: 1px solid #2d2d30;
+        font-size: 12px;
+        font-weight: 700;
+    }
+
+    .qoda-code-tab {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        min-width: 0;
+        max-width: min(360px, 70%);
+        height: 34px;
+        padding: 0 12px;
+        color: #d4d4d4;
+        background: #1e1e1e;
+        border-right: 1px solid #333337;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .qoda-code-close {
+        color: #a6a6a6;
+        font-size: 13px;
+        line-height: 1;
+    }
+
+    .qoda-code-status {
+        margin-left: auto;
+        display: inline-flex;
+        align-items: center;
+        padding: 0 12px;
+        color: #9ca3af;
+        font-size: 11px;
+        white-space: nowrap;
+    }
+
+    .qoda-code-editor {
+        width: 100%;
+        min-height: 320px;
+        resize: none;
+        border: 0;
+        outline: none;
+        padding: 12px 14px 12px 56px;
+        color: #d4d4d4;
+        background:
+            linear-gradient(90deg, #252526 0 42px, #3c3c3c 42px 43px, transparent 43px),
+            #1e1e1e;
+        font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+        font-size: 14px;
+        line-height: 22px;
+        tab-size: 4;
+        white-space: pre;
+        overflow: auto;
+    }
+
+    .qoda-monaco-editor {
+        display: none;
+        width: 100%;
+        min-height: 320px;
+        height: 320px;
+        border: 0;
+    }
+
+    .qoda-code-shell.monaco-ready .qoda-code-editor {
+        display: none;
+    }
+
+    .qoda-code-shell.monaco-ready .qoda-monaco-editor {
+        display: block;
+    }
+
+    body:not(.dark) .qoda-code-shell,
+    body:not(.dark) .qoda-code-head,
+    body:not(.dark) .qoda-code-editor {
+        color: #d4d4d4;
+        background-color: #1e1e1e;
+    }
+
+    .qoda-template-layout {
+        display: grid;
+        grid-template-columns: 270px minmax(0, 1fr);
+        gap: 16px;
+    }
+
+    .qoda-template-filter {
+        display: grid;
+        gap: 12px;
+        align-content: start;
+        padding: 14px;
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        background: var(--bg);
+    }
+
+    .qoda-template-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+        gap: 12px;
+    }
+
+    .qoda-template-card {
+        cursor: pointer;
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 15px;
+        background: var(--panel);
+        color: var(--text);
+        display: grid;
+        gap: 10px;
+        transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+    }
+
+    .qoda-template-card:hover {
+        transform: translateY(-2px);
+        border-color: var(--accent);
+        box-shadow: 0 16px 35px rgba(15, 23, 42, .12);
+    }
+
+    .qoda-template-tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+    }
+
+    .qoda-template-tag {
+        border-radius: 999px;
+        padding: 4px 8px;
+        background: color-mix(in srgb, var(--accent) 14%, transparent);
+        color: var(--text);
+        font-size: 11px;
+        font-weight: 800;
+    }
+
+    .tooltip-text {
+        white-space: normal;
+        min-width: 190px;
+        max-width: 240px;
+        text-align: left;
+        line-height: 1.35;
+        padding: 10px 12px;
+    }
+
+    .tooltip-text strong {
+        display: block;
+        font-size: 12px;
+        margin-bottom: 3px;
+    }
+
+    .tooltip-text small {
+        display: block;
+        font-size: 11px;
+        opacity: .8;
+        font-weight: 500;
+    }
+
+    @media (max-width: 1180px) {
+        .qoda-author-body {
+            grid-template-columns: 1fr;
+        }
+
+        .qoda-preview-panel {
+            position: relative;
+            top: auto;
+            max-height: none;
+            min-height: 300px;
+        }
+
+        .qoda-q-header {
+            top: 0;
+            position: relative;
+        }
+
+        .qoda-template-layout {
+            grid-template-columns: 1fr;
+        }
+    }
+
+    @media (max-width: 860px) {
+        .main {
+            margin-left: 0;
+            padding: 12px;
+        }
+
+        .qoda-q-header,
+        .qoda-publish-toolbar {
+            align-items: stretch;
+            flex-direction: column;
+        }
+
+        .qoda-icon-actions,
+        .qoda-toolbar-actions {
+            justify-content: flex-start;
+        }
+
+        .qoda-field-grid {
+            grid-template-columns: 1fr;
+        }
+
+        .panel,
+        .rowgrid > * {
+            min-width: 0;
+        }
+    }
     </style>
 </head>
 
@@ -7674,7 +10357,7 @@ function createCourseTable($courseCode)
                 <i class="fas fa-bars"></i>
             </button>
             <div class="header-logo">
-                <span>Q</span>
+                <img src="../assets/qoda-logo.png" alt="QODA logo">
             </div>
             <div class="header-typing">QODA PU</div>
         </div>
@@ -7701,48 +10384,49 @@ function createCourseTable($courseCode)
             </div>
 
             <div class="sidebar-top">
-                <div class="profile-icon" onclick="handleNavClick(this, 'profile')">
+                <div class="profile-icon" title="Profile" onclick="handleNavClick(this, 'profile')">
                     <?php if (!empty($lecturerData['profile_pic'])): ?>
                     <img src="<?php echo htmlspecialchars($lecturerData['profile_pic']); ?>" alt="Profile">
                     <?php else: ?>
                     <i class="fas fa-user"></i>
                     <?php endif; ?>
+                    <span class="tooltip-text">Profile</span>
                 </div>
             </div>
 
             <nav class="sidebar-nav">
-                <div class="nav-icon" data-tooltip="Dashboard" onclick="handleNavClick(this, 'dashboard')">
+                <div class="nav-icon" data-tooltip="Dashboard" title="Dashboard" onclick="handleNavClick(this, 'dashboard')">
                     <i class="fas fa-home"></i>
                     <span class="tooltip-text">Dashboard</span>
                 </div>
 
-                <div class="nav-icon has-submenu" data-submenu="examSubmenu" onclick="toggleSubmenuPanel(this)">
+                <div class="nav-icon has-submenu" data-submenu="examSubmenu" title="Exam Management" onclick="toggleSubmenuPanel(this)">
                     <i class="fas fa-file-alt"></i>
                     <span class="tooltip-text">Exam Management</span>
                 </div>
 
-                <div class="nav-icon has-submenu" data-submenu="studentSubmenu" onclick="toggleSubmenuPanel(this)">
+                <div class="nav-icon has-submenu" data-submenu="studentSubmenu" title="Student Management" onclick="toggleSubmenuPanel(this)">
                     <i class="fas fa-users"></i>
                     <span class="tooltip-text">Student Management</span>
                 </div>
 
-                <div class="nav-icon has-submenu" data-submenu="monitorSubmenu" onclick="toggleSubmenuPanel(this)">
+                <div class="nav-icon has-submenu" data-submenu="monitorSubmenu" title="Monitoring" onclick="toggleSubmenuPanel(this)">
                     <i class="fas fa-eye"></i>
                     <span class="tooltip-text">Monitoring</span>
                 </div>
 
-                <div class="nav-icon has-submenu" data-submenu="accountSubmenu" onclick="toggleSubmenuPanel(this)">
+                <div class="nav-icon has-submenu" data-submenu="accountSubmenu" title="Account" onclick="toggleSubmenuPanel(this)">
                     <i class="fas fa-user-circle"></i>
                     <span class="tooltip-text">Account</span>
                 </div>
             </nav>
 
             <div class="sidebar-bottom">
-                <div class="theme-switch-icon" onclick="toggleTheme()">
+                <div class="theme-switch-icon" title="Switch Theme" onclick="toggleTheme()">
                     <i class="fas fa-palette"></i>
                     <span class="tooltip-text">Switch Theme</span>
                 </div>
-                <div class="logout-icon" onclick="logout()">
+                <div class="logout-icon" title="Logout" onclick="logout()">
                     <i class="fas fa-sign-out-alt"></i>
                     <span class="tooltip-text">Logout</span>
                 </div>
@@ -8093,7 +10777,7 @@ function createCourseTable($courseCode)
                         </div>
                         <button class="btn primary animate-pulse-slow" onclick="newExam()">✨ + Create New Exam</button>
                     </div>
-                    <table class="table" id="examsTable"></table>
+                    <div id="examsTable" class="exam-created-grid"></div>
                 </div>
             </section>
 
@@ -8160,26 +10844,55 @@ function createCourseTable($courseCode)
                                 <small>Optional custom exam code</small>
                             </div>
 
+                            <!-- Exam Schedule -->
+                            <div class="field">
+                                <label>Exam Date</label>
+                                <input id="bExamDate" type="date"
+                                    onchange="syncStartDateTimeFromParts(); syncEndTimeFromDuration(); syncCutoffFromGrace();">
+                                <small>Calendar date for this examination</small>
+                            </div>
+
+                            <div class="field">
+                                <label>Start Time</label>
+                                <input id="bStartTime" type="time"
+                                    onchange="syncStartDateTimeFromParts(); syncEndTimeFromDuration(); syncCutoffFromGrace();">
+                                <small>Time students may begin writing</small>
+                            </div>
+
                             <!-- Duration -->
                             <div class="field required">
                                 <label>⏱️ Duration (minutes) <span class="required-star"></span></label>
                                 <input id="bDuration" type="number" min="1" value="180" placeholder="180"
-                                    onchange="updateExamField('durationMins', parseInt(this.value) || 180); syncEndTimeFromDuration();">
+                                    onchange="updateExamField('durationMins', parseInt(this.value) || 180); syncEndTimeFromDuration(); syncCutoffFromGrace();">
                             </div>
 
                             <!-- Start Date/Time -->
                             <div class="field">
                                 <label>📅 Start Date/Time</label>
                                 <input id="bStartAt" type="datetime-local"
-                                    onchange="updateExamField('startAtISO', this.value); syncDurationFromStartEnd();">
+                                    onchange="updateExamField('startAtISO', this.value); syncSchedulePartsFromStart(); syncDurationFromStartEnd(); syncCutoffFromGrace();">
                                 <small>Leave empty for immediate availability</small>
                             </div>
 
                             <div class="field">
                                 <label>End Date/Time</label>
                                 <input id="bEndAt" type="datetime-local"
-                                    onchange="updateExamField('endAtISO', this.value); syncDurationFromStartEnd();">
+                                    onchange="updateExamField('endAtISO', this.value); syncDurationFromStartEnd(); syncCutoffFromGrace();">
                                 <small>Leave empty to use the duration from the start time</small>
+                            </div>
+
+                            <div class="field">
+                                <label>Grace Period (Optional)</label>
+                                <input id="bGracePeriod" type="number" min="0" value="0" placeholder="0"
+                                    onchange="updateExamField('gracePeriodMinutes', parseInt(this.value) || 0); syncCutoffFromGrace();">
+                                <small>Extra minutes allowed after the exam end before final cut-off</small>
+                            </div>
+
+                            <div class="field">
+                                <label>Cut-Off Date and Time</label>
+                                <input id="bCutoffAt" type="datetime-local"
+                                    onchange="updateExamField('cutoffAtISO', this.value);">
+                                <small>Students cannot submit after this time unless you extend it</small>
                             </div>
 
                             <!-- Exam Password -->
@@ -8313,6 +11026,12 @@ function createCourseTable($courseCode)
                                 </select>
                             </div>
 
+                            <div class="field">
+                                <label>Academic Year / Session</label>
+                                <input id="academic_year" type="text" placeholder="e.g., 2026/2027"
+                                    onchange="updateExamField('academic_year', this.value)">
+                            </div>
+
                             <!-- Exam Type -->
                             <div class="field required">
                                 <label>📝 Exam Type <span class="required-star"></span></label>
@@ -8421,6 +11140,9 @@ function createCourseTable($courseCode)
                                 <button class="quick-question-btn code" onclick="addFirstQuestion('code')">
                                     <i class="fas fa-code" style="margin-right: 8px;"></i> Add Coding Question
                                 </button>
+                                <button class="quick-question-btn code" onclick="openQuestionBankModal()">
+                                    <i class="fas fa-database" style="margin-right: 8px;"></i> Question Bank
+                                </button>
                             </div>
                         </div>
 
@@ -8432,6 +11154,9 @@ function createCourseTable($courseCode)
                             <div class="qtype-buttons">
                                 <button class="qtype-btn code" onclick="addQuestion('code')">
                                     <i class="fas fa-code"></i> Coding Question
+                                </button>
+                                <button class="qtype-btn code" onclick="openQuestionBankModal()">
+                                    <i class="fas fa-database"></i> Question Bank
                                 </button>
                             </div>
                         </div>
@@ -8597,6 +11322,12 @@ function createCourseTable($courseCode)
                                 <button type="button" class="btn btn-outline" onclick="resetFilters()">
                                     <i class="fas fa-undo"></i> Reset Filters
                                 </button>
+                                <button type="button" class="btn warn" onclick="showActiveStudentSessionsModal()">
+                                    <i class="fas fa-desktop"></i> Active Sessions
+                                </button>
+                                <button type="button" class="btn primary" onclick="bulkMigrateShownStudents()">
+                                    <i class="fas fa-level-up-alt"></i> Migrate All Shown
+                                </button>
                             </div>
                             <div style="display: flex; gap: 10px;">
                                 <button class="btn ok" onclick="exportStudentsToExcelWithTemplate()">
@@ -8756,7 +11487,8 @@ function createCourseTable($courseCode)
                                 <label>Staff ID</label>
                                 <input id="profileStaffId"
                                     value="<?php echo isset($lecturerData['staff_id']) ? htmlspecialchars($lecturerData['staff_id']) : ''; ?>"
-                                    class="form-input" placeholder="e.g., PULC/IT/00001" />
+                                    class="form-input" placeholder="e.g., PULC/IT/00001" readonly />
+                                <small style="font-size: 11px; color: var(--muted);">Staff ID is your permanent lecturer identifier.</small>
                             </div>
                             <div class="field">
                                 <label>Department</label>
@@ -8802,6 +11534,35 @@ function createCourseTable($courseCode)
                             <small style="font-size: 11px; color: var(--muted);">One course per line or
                                 comma-separated</small>
                         </div>
+                    </div>
+
+                    <div style="background: var(--bg); border-radius: 12px; padding: 16px; margin: 16px 0;">
+                        <div class="panel-title" style="margin-bottom: 12px;">Add Teaching Course</div>
+                        <div class="rowgrid">
+                            <div class="field">
+                                <label>Course Code</label>
+                                <input id="teachingCourseCode" class="form-input" placeholder="e.g., PBIT102" />
+                            </div>
+                            <div class="field">
+                                <label>Course Name</label>
+                                <input id="teachingCourseName" class="form-input" placeholder="e.g., C Programming" />
+                            </div>
+                            <div class="field">
+                                <label>Level</label>
+                                <select id="teachingCourseLevel" class="form-input">
+                                    <option value="">Select level</option>
+                                    <option value="100">Level 100</option>
+                                    <option value="200">Level 200</option>
+                                    <option value="300">Level 300</option>
+                                    <option value="400">Level 400</option>
+                                    <option value="500">Level 500</option>
+                                </select>
+                            </div>
+                        </div>
+                        <button class="btn primary" onclick="saveTeachingCourse()" style="margin-top: 10px;">
+                            <i class="fas fa-plus"></i> Add Course
+                        </button>
+                        <div id="teachingCoursesList" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:12px;"></div>
                     </div>
 
                     <button class="btn primary" onclick="saveProfile()" style="margin-bottom: 30px;">
@@ -8857,6 +11618,9 @@ function createCourseTable($courseCode)
                     <div class="hint" style="margin-top: 20px;">
                         <strong>Note:</strong> Lecturer accounts now manage their own profile details.
                     </div>
+                    <button class="btn danger" onclick="deleteLecturerAccount()" style="margin-top: 14px;">
+                        <i class="fas fa-user-times"></i> Delete My Account
+                    </button>
                 </div>
             </section>
 
@@ -8875,21 +11639,38 @@ function createCourseTable($courseCode)
                         <button class="btn primary" onclick="refreshMonitoring()">🔄 Refresh</button>
                     </div>
 
+                    <div class="toolbar" style="margin-top:12px;">
+                        <button class="btn warn" onclick="controlMonitoringExam('pause')"><i class="fas fa-pause"></i> Pause Exam</button>
+                        <button class="btn ok" onclick="controlMonitoringExam('resume')"><i class="fas fa-play"></i> Resume Exam</button>
+                        <button class="btn primary" onclick="promptAddMonitoringTime()"><i class="fas fa-plus"></i> Add Time</button>
+                        <button class="btn" onclick="promptExtendMonitoringCutoff()"><i class="fas fa-calendar-plus"></i> Extend Cut-Off</button>
+                        <button class="btn" onclick="promptMonitoringAnnouncement()"><i class="fas fa-bullhorn"></i> Send Announcement</button>
+                        <button class="btn danger" onclick="forceSubmitSelectedMonitoringStudent()"><i class="fas fa-paper-plane"></i> Force Submit Selected Student</button>
+                    </div>
+
                     <div id="monitoringStats" class="stats-grid">
                         <div class="stat-card">
-                            <div class="stat-label">Active Students</div>
+                            <div class="stat-label">Total Registered</div>
+                            <div class="stat-value" id="registeredStudents">0</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Currently Online</div>
                             <div class="stat-value" id="activeStudents">0</div>
                         </div>
                         <div class="stat-card">
-                            <div class="stat-label">Completed</div>
+                            <div class="stat-label">Currently Writing</div>
+                            <div class="stat-value" id="writingStudents">0</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Submitted</div>
                             <div class="stat-value" id="completedStudents">0</div>
                         </div>
                         <div class="stat-card">
-                            <div class="stat-label">Warnings</div>
-                            <div class="stat-value" id="warningCount">0</div>
+                            <div class="stat-label">Disconnected</div>
+                            <div class="stat-value" id="disconnectedStudents">0</div>
                         </div>
                         <div class="stat-card">
-                            <div class="stat-label">Cheating Attempts</div>
+                            <div class="stat-label">Flagged</div>
                             <div class="stat-value" id="cheatingCount">0</div>
                         </div>
                     </div>
@@ -8907,28 +11688,48 @@ function createCourseTable($courseCode)
                     </div>
                     <div class="crumb">Home / Proctoring</div>
 
-                    <div class="toolbar">
-                        <select id="proctoringExamSelect" onchange="loadProctoringData()" style="min-width: 250px;">
-                            <option value="">Select Exam to Proctor</option>
-                        </select>
-                        <button class="btn primary" onclick="startProctoring()">
-                            <i class="fas fa-play"></i> Start Proctoring
-                        </button>
-                        <button class="btn danger" onclick="stopProctoring()">
-                            <i class="fas fa-stop"></i> Stop Proctoring
-                        </button>
-                        <button class="btn ok" onclick="unlockAllScreens()">
-                            <i class="fas fa-unlock"></i> Unlock All
-                        </button>
-                        <button class="btn" onclick="refreshProctoring()">
-                            <i class="fas fa-sync-alt"></i> Refresh
-                        </button>
-                        <button class="btn warn" onclick="sendWarningToAllProctoring()">
-                            <i class="fas fa-exclamation-triangle"></i> Warn All
-                        </button>
-                        <button class="btn" onclick="viewViolationEvidence()">
-                            <i class="fas fa-folder-open"></i> Evidence
-                        </button>
+                    <div class="proctoring-control-panel">
+                        <div class="proctoring-select-card">
+                            <label for="proctoringExamSelect"><i class="fas fa-clipboard-list"></i> Select Exam To Proctor</label>
+                            <select id="proctoringExamSelect" class="proctoring-exam-select" onchange="loadProctoringData()">
+                                <option value="">Select Exam to Proctor</option>
+                            </select>
+                        </div>
+                        <div class="proctoring-actions-card">
+                            <div class="proctoring-actions-title">Live Proctoring Controls</div>
+                            <div class="proctoring-button-grid">
+                                <button class="btn primary" onclick="startProctoring()">
+                                    <i class="fas fa-play"></i> Start
+                                </button>
+                                <button class="btn warn" onclick="controlProctoringExam('pause')">
+                                    <i class="fas fa-pause"></i> Pause Exam
+                                </button>
+                                <button class="btn ok" onclick="controlProctoringExam('resume')">
+                                    <i class="fas fa-play"></i> Resume Exam
+                                </button>
+                                <button class="btn primary" onclick="promptAddProctoringTimeAll()">
+                                    <i class="fas fa-clock"></i> Add Time To All
+                                </button>
+                                <button class="btn" onclick="promptProctoringMessageAll()">
+                                    <i class="fas fa-bullhorn"></i> Message All
+                                </button>
+                                <button class="btn ok" onclick="unlockAllScreens()">
+                                    <i class="fas fa-unlock"></i> Unlock All
+                                </button>
+                                <button class="btn warn" onclick="sendWarningToAllProctoring()">
+                                    <i class="fas fa-exclamation-triangle"></i> Warn All
+                                </button>
+                                <button class="btn" onclick="refreshProctoring()">
+                                    <i class="fas fa-sync-alt"></i> Refresh
+                                </button>
+                                <button class="btn" onclick="viewViolationEvidence()">
+                                    <i class="fas fa-folder-open"></i> Evidence
+                                </button>
+                                <button class="btn info" onclick="reviewProctoredCourses()">
+                                    <i class="fas fa-history"></i> Review Courses
+                                </button>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Proctoring Stats -->
@@ -8955,9 +11756,17 @@ function createCourseTable($courseCode)
                         </div>
                     </div>
 
+                    <div id="lockedStudentsPanel" class="qcard" style="display:none; margin-bottom: 20px; padding: 16px;">
+                        <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px;">
+                            <strong style="color:var(--text);"><i class="fas fa-lock"></i> Locked Screens</strong>
+                            <small style="color:var(--muted);">Click a student to review the evidence that led to the lock.</small>
+                        </div>
+                        <div id="lockedStudentsList" style="display:flex; flex-wrap:wrap; gap:10px;"></div>
+                    </div>
+
                     <!-- Student Grid View -->
                     <div id="proctoringGrid" class="student-grid"
-                        style="display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 20px;">
+                        style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: start;">
                         <div style="text-align: center; padding: 60px; grid-column: 1/-1;">
                             <i class="fas fa-desktop"
                                 style="font-size: 48px; color: var(--muted); margin-bottom: 15px;"></i>
@@ -8975,7 +11784,7 @@ function createCourseTable($courseCode)
     </div>
 
     <div id="fullScreenProctorModal" class="modal" style="display:none;">
-        <div class="modal-content" style="width: min(1200px, 96vw); height: 92vh; display:flex; flex-direction:column; padding:0; overflow:hidden;">
+        <div class="modal-content" style="width: 100vw; height: 100vh; display:flex; flex-direction:column; padding:0; overflow:hidden;">
             <div class="modal-header" style="display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 18px; border-bottom:1px solid var(--border);">
                 <div>
                     <h3 id="fullScreenStudentName" style="margin:0;">Student Screen</h3>
@@ -8990,7 +11799,64 @@ function createCourseTable($courseCode)
                     <button class="btn" onclick="closeFullScreenProctorModal()"><i class="fas fa-times"></i> Close</button>
                 </div>
             </div>
-            <div id="fullScreenContent" style="flex:1; min-height:0; background:#000;"></div>
+            <div id="fullScreenContent" style="flex:1; min-height:0; background:#000; display:flex; align-items:stretch; justify-content:stretch; overflow:hidden;"></div>
+        </div>
+    </div>
+
+    <div id="questionBankModal" class="modal" style="display:none;">
+        <div class="modal-content" style="width: 1100px; max-width: 96%; max-height: 90vh; overflow-y: auto;">
+            <div class="modal-header" style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:16px;">
+                <div>
+                    <h3 style="margin:0;"><i class="fas fa-database"></i> Question Bank</h3>
+                    <small style="color:var(--muted);">Reuse previous questions, then edit them before publishing the new exam.</small>
+                </div>
+                <button type="button" class="btn" onclick="closeQuestionBankModal()"><i class="fas fa-times"></i> Close</button>
+            </div>
+            <div class="rowgrid" style="margin-bottom:14px;">
+                <div class="field">
+                    <label>Search</label>
+                    <input id="qbSearch" type="text" placeholder="Topic, keyword, question text..." oninput="debouncedQuestionBankSearch()">
+                </div>
+                <div class="field">
+                    <label>Course Code</label>
+                    <input id="qbCourse" type="text" placeholder="e.g., PBIT102" oninput="debouncedQuestionBankSearch()">
+                </div>
+                <div class="field">
+                    <label>Language</label>
+                    <select id="qbLanguage" onchange="loadQuestionBank()">
+                        <option value="">All Languages</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <label>Semester</label>
+                    <select id="qbSemester" onchange="loadQuestionBank()">
+                        <option value="">All Semesters</option>
+                        <option value="First Semester">First Semester</option>
+                        <option value="Second Semester">Second Semester</option>
+                        <option value="Summer School">Summer School</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <label>Year / Session</label>
+                    <input id="qbYear" type="text" placeholder="2026 or 2026/2027" oninput="debouncedQuestionBankSearch()">
+                </div>
+                <div class="field">
+                    <label>Difficulty</label>
+                    <select id="qbDifficulty" onchange="loadQuestionBank()">
+                        <option value="">Any</option>
+                        <option value="easy">Easy</option>
+                        <option value="medium">Medium</option>
+                        <option value="hard">Hard</option>
+                    </select>
+                </div>
+            </div>
+            <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:16px;">
+                <button class="btn primary" onclick="loadQuestionBank()"><i class="fas fa-search"></i> Search Bank</button>
+                <button class="btn" onclick="clearQuestionBankFilters()"><i class="fas fa-undo"></i> Reset</button>
+            </div>
+            <div id="questionBankResults" class="question-bank-grid">
+                <div class="empty-state" style="grid-column:1/-1;">Search the bank to find reusable questions.</div>
+            </div>
         </div>
     </div>
 
@@ -9102,6 +11968,35 @@ function createCourseTable($courseCode)
                     </button>
                 </div>
             </form>
+        </div>
+    </div>
+
+    <div id="migrateLevelModal" class="modal" style="display:none;">
+        <div class="modal-content" style="width: 420px; max-width: 92%;">
+            <div class="modal-header"
+                style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;padding-bottom:12px;border-bottom:1px solid var(--border);">
+                <h3 style="font-size:20px;font-weight:700;color:var(--accent-blue);">
+                    <i class="fas fa-level-up-alt"></i> Migrate Student Level
+                </h3>
+                <button type="button" onclick="closeMigrateLevelModal()"
+                    style="background:none;border:0;font-size:28px;cursor:pointer;color:var(--text-secondary);">&times;</button>
+            </div>
+            <input type="hidden" id="migrateStudentId">
+            <p id="migrateStudentName" style="font-weight:700;margin-bottom:14px;"></p>
+            <div class="field">
+                <label>New Level</label>
+                <select id="migrateStudentLevel" class="form-input">
+                    <option value="100">100 Level</option>
+                    <option value="200">200 Level</option>
+                    <option value="300">300 Level</option>
+                    <option value="400">400 Level</option>
+                    <option value="500">500 Level</option>
+                </select>
+            </div>
+            <div class="modal-actions" style="display:flex;justify-content:flex-end;gap:10px;margin-top:18px;">
+                <button type="button" class="btn btn-outline" onclick="closeMigrateLevelModal()">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="submitMigrateLevel()">Migrate Level</button>
+            </div>
         </div>
     </div>
 
@@ -9468,6 +12363,11 @@ function createCourseTable($courseCode)
 
 
     <script>
+    window.QODA_DEBUG = window.QODA_DEBUG || new URLSearchParams(window.location.search).get('debug') === '1';
+    if (!window.QODA_DEBUG && window.console) {
+        console.log = function() {};
+        console.debug = function() {};
+    }
     // ============================================
     // 1. GLOBAL VARIABLES & CONSTANTS
     // ============================================
@@ -9480,14 +12380,20 @@ function createCourseTable($courseCode)
     const K_SETTINGS = "qoda_settings_v1";
     const K_MONITORING = "qoda_monitoring_v1";
     const K_THEME = "qoda_theme_v1";
+    const K_EXAM_DRAFTS = "qoda_exam_drafts_v2";
+    const K_LAST_BUILDER_EXAM = "qoda_last_builder_exam_id";
+    const screenMonitorSocketToken = <?php echo json_encode(qodaCreateSocketToken([
+        'role' => 'lecturer',
+        'lecturer_id' => (string)$lecturerId,
+    ])); ?>;
 
     const routes = ["exams", "builder", "submissions", "marking", "results",
         "students", "student-details", "profile", "monitoring", "proctoring"
     ];
 
     const codingLanguagesList = [
-        "Python", "JavaScript", "PHP", "Java", "C", "C++",
-        "C#", "VB.NET", "SQL", "HTML", "CSS"
+        "Python", "Java", "JavaScript", "C", "C++",
+        "C#", "PHP", "VB.NET", "SQL", "HTML/CSS/JS"
     ];
 
     let routeState = {
@@ -9515,6 +12421,8 @@ function createCourseTable($courseCode)
     let codingSchemes = [];
     let shortSchemes = [];
     let monitoringInterval = null;
+    let currentMonitoringExam = null;
+    let activeMonitoringStudents = [];
     let proctoringInterval = null;
     let currentScreenStudent = null;
     let allStudents = [];
@@ -9527,6 +12435,18 @@ function createCourseTable($courseCode)
     let activeProctoringStudents = [];
     let proctoringStreams = {};
     let currentFullScreenStudent = null;
+    let lastViolationTotalsByStudent = {};
+    const proctorGridWebrtcPeers = {};
+    const proctorGridWebrtcRetryAt = {};
+    let screenMonitorSocket = null;
+    let screenMonitorExamId = null;
+    const QODA_WEBRTC_ICE_SERVERS = [
+        { urls: 'stun:openrelay.metered.ca:80' },
+        { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turns:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
+    ];
 
     const submenusData = {
         'examSubmenu': {
@@ -9788,8 +12708,11 @@ function createCourseTable($courseCode)
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
+                    'Cache-Control': 'no-store',
+                    'Pragma': 'no-cache',
                 },
-                body: formData
+                body: formData,
+                cache: 'no-store'
             });
             const text = await response.text();
             try {
@@ -9827,6 +12750,64 @@ function createCourseTable($courseCode)
         return getExams().find(e => parseInt(e.id) === numericId) || null;
     }
 
+    function getDraftBackups() {
+        return readJSON(K_EXAM_DRAFTS, []);
+    }
+
+    function setDraftBackups(drafts) {
+        writeJSON(K_EXAM_DRAFTS, drafts);
+    }
+
+    function getLocalDraftById(id) {
+        const numericId = parseInt(id);
+        return getDraftBackups().find(exam => parseInt(exam.id) === numericId) || null;
+    }
+
+    function backupExamDraft(exam = null) {
+        const target = exam || findExam(currentExamId);
+        if (!target || !target.id) return;
+        const copy = JSON.parse(JSON.stringify(target));
+        copy.localDraftSavedAt = new Date().toISOString();
+        const drafts = getDraftBackups().filter(draft => parseInt(draft.id) !== parseInt(copy.id));
+        drafts.unshift(copy);
+        setDraftBackups(drafts.slice(0, 25));
+        localStorage.setItem(K_LAST_BUILDER_EXAM, String(copy.id));
+        localStorage.setItem("currentView", "builder");
+        localStorage.setItem("currentRouteParams", JSON.stringify({ id: copy.id }));
+    }
+
+    function removeDraftBackup(...ids) {
+        const numericIds = ids.map(id => parseInt(id)).filter(id => !Number.isNaN(id));
+        if (!numericIds.length) return;
+        setDraftBackups(getDraftBackups().filter(draft => !numericIds.includes(parseInt(draft.id))));
+    }
+
+    function mergeExamsWithLocalDrafts(serverExams) {
+        const merged = [...serverExams];
+        const byId = new Map(merged.map((exam, index) => [parseInt(exam.id), index]));
+        const localOnly = [];
+        const localOnlyIds = new Set();
+        [...getExams(), ...getDraftBackups()].forEach(draft => {
+            const id = parseInt(draft?.id);
+            if (Number.isNaN(id)) return;
+            if (id >= 0) return;
+            const existingIndex = byId.get(id);
+            if (existingIndex === undefined) {
+                if (!localOnlyIds.has(id)) {
+                    localOnlyIds.add(id);
+                    localOnly.push(draft);
+                }
+                return;
+            }
+            merged[existingIndex] = { ...merged[existingIndex], ...draft };
+        });
+        const publishedServerIds = serverExams
+            .filter(exam => exam.published == 1 || String(exam.status || '').toLowerCase() === 'published')
+            .map(exam => exam.id);
+        removeDraftBackup(...publishedServerIds);
+        return [...localOnly, ...merged];
+    }
+
     async function loadExamsList() {
         showLoading('Loading exams...');
         try {
@@ -9850,10 +12831,14 @@ function createCourseTable($courseCode)
                         id: exam.id,
                         exam_code: exam.exam_code || exam.exam_id || '',
                         title: exam.title || '',
+                        courseName: exam.course_name || exam.course_title || '',
                         courseCode: exam.course_code || '',
                         durationMins: exam.duration_minutes || 180,
                         startAtISO: exam.start_datetime || '',
                         endAtISO: exam.end_datetime || '',
+                        gracePeriodMinutes: parseInt(exam.grace_period_minutes || 0, 10),
+                        cutoffAtISO: exam.cutoff_datetime || '',
+                        examControlStatus: exam.exam_control_status || 'active',
                         instructions: exam.instructions || '',
                         markingScheme: exam.marking_scheme || '',
                         published: exam.published == 1,
@@ -9869,16 +12854,22 @@ function createCourseTable($courseCode)
                         exam_type: exam.exam_type || '',
                         school_type: exam.school_type || '',
                         level: exam.level || '',
+                        academic_year: exam.academic_year || '',
                         auto_grading_enabled: exam.auto_grading_enabled || 0,
                         partial_grading_enabled: exam.partial_grading_enabled || 0,
                         show_correct_answers: exam.show_correct_answers || 0,
-                        allow_review: exam.allow_review !== null ? exam.allow_review : 1
+                        allow_review: exam.allow_review !== null ? exam.allow_review : 1,
+                        assignedStudentsCount: parseInt(exam.assigned_students_count || 0, 10),
+                        submittedStudentsCount: parseInt(exam.submitted_students_count || 0, 10),
+                        resultsPublished: parseInt(exam.results_published || 0, 10) === 1
                     };
                 });
-                setExams(exams);
-                renderExamsTable(exams);
-                populateProctoringExamSelect(exams);
-                return exams;
+                const mergedExams = mergeExamsWithLocalDrafts(exams);
+                setExams(mergedExams);
+                renderExamsTable(mergedExams);
+                populateProctoringExamSelect(mergedExams);
+                populateMonitoringExamSelect(mergedExams);
+                return mergedExams;
             } else {
                 toast('❌ Failed to load exams: ' + (data.error || 'Unknown error'));
                 renderExamsTable([]);
@@ -10030,10 +13021,10 @@ function createCourseTable($courseCode)
                    <button class="btn" onclick="copyExamLinkFixed(currentExamId, document.getElementById('bTitle')?.value || 'Exam')">
     <i class="fas fa-link"></i> Copy Exam Link
 </button>
-                    ${showCompletedButton ? 
+                    ${showCompletedButton ?
                         `<button class="btn success" disabled style="background:#10b981; opacity:0.7;">
                             ✅ Completed <i class="fas fa-check-circle"></i>
-                        </button>` : 
+                        </button>` :
                         `<button class="btn ${exam.published && examState !== 'ongoing' ? 'warn' : 'ok'}" onclick="togglePublish(${exam.id})" ${!canEdit ? 'disabled' : ''}>
                             ${exam.published ? (examState === 'ongoing' ? '🔴 Ongoing' : '📦 Unpublish') : '🚀 Publish'}
                         </button>`
@@ -10046,6 +13037,261 @@ function createCourseTable($courseCode)
         tableContainer.innerHTML =
             `<thead><tr><th>Exam</th><th>ID</th><th>Questions/Marks</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows}</tbody>`;
 
+    }
+
+    function renderExamsTable(exams) {
+        const tableContainer = document.getElementById("examsTable");
+        if (!tableContainer) return;
+
+        if (!exams || exams.length === 0) {
+            tableContainer.innerHTML =
+                `<div class="empty-state" style="grid-column:1/-1;">No exams yet. Click "Create New Exam" to get started.</div>`;
+            return;
+        }
+
+        tableContainer.innerHTML = exams.map(exam => {
+            const examState = getExamRuntimeState(exam);
+            const stateLabel = examState === 'scheduled' ? 'Upcoming' :
+                examState === 'ongoing' ? 'Ongoing' :
+                examState === 'completed' ? 'Written/Completed' :
+                examState === 'published' ? 'Published' : 'Draft';
+            const stateClass = `status-${examState}`;
+            const dates = getExamCardDateParts(exam);
+            const totalMarks = calculateEffectiveExamMarks(exam);
+            const assigned = parseInt(exam.assignedStudentsCount || exam.assigned_students_count || 0, 10);
+            const submitted = parseInt(exam.submittedStudentsCount || exam.submitted_students_count || 0, 10);
+            const title = exam.title || '(untitled)';
+            const courseName = exam.courseName || exam.course_name || title;
+            const courseCode = exam.courseCode || exam.course_code || 'No course';
+            const examCode = exam.exam_code || exam.exam_id || exam.id;
+            const canDelete = examState !== 'ongoing';
+
+            return `
+            <article class="exam-created-card ${stateClass}" onclick="showExamDetailsPopup(event, ${exam.id})" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){showExamDetailsPopup(event, ${exam.id}); event.preventDefault();}">
+                <div class="exam-created-header">
+                    <div>
+                        <h3 class="exam-created-title">${escapeHTML(courseName)}</h3>
+                        <div class="exam-created-subtitle">${escapeHTML(courseCode)}</div>
+                    </div>
+                    <span class="tag ${stateClass}">${escapeHTML(stateLabel)}</span>
+                </div>
+                <div class="exam-created-hint">
+                    <span>Click card to view details</span>
+                    <span class="exam-created-toggle">Open details</span>
+                </div>
+                <div class="exam-created-details" id="examDetails_${exam.id}" hidden>
+                    <div class="exam-created-meta">
+                        <div class="exam-created-meta-item"><small>Exam Title</small><strong>${escapeHTML(title)}</strong></div>
+                        <div class="exam-created-meta-item"><small>Exam Code</small><strong>${escapeHTML(String(examCode))}</strong></div>
+                        <div class="exam-created-meta-item"><small>Date</small><strong>${escapeHTML(dates.date)}</strong></div>
+                        <div class="exam-created-meta-item"><small>Start Time</small><strong>${escapeHTML(dates.startTime)}</strong></div>
+                        <div class="exam-created-meta-item"><small>End Time</small><strong>${escapeHTML(dates.endTime)}</strong></div>
+                        <div class="exam-created-meta-item"><small>Month / Year</small><strong>${escapeHTML(dates.monthYear)}</strong></div>
+                        <div class="exam-created-meta-item"><small>Semester</small><strong>${escapeHTML(exam.semester || 'Not set')}</strong></div>
+                        <div class="exam-created-meta-item"><small>School Type</small><strong>${escapeHTML(exam.school_type || 'Not set')}</strong></div>
+                        <div class="exam-created-meta-item"><small>Academic Year</small><strong>${escapeHTML(exam.academic_year || dates.year || 'Not set')}</strong></div>
+                        <div class="exam-created-meta-item"><small>Questions / Marks</small><strong>${(exam.questions || []).length} / ${totalMarks}</strong></div>
+                        <div class="exam-created-meta-item"><small>Assigned / Submitted</small><strong>${assigned} / ${submitted}</strong></div>
+                    </div>
+                    <div class="exam-created-actions">
+                        <button class="btn" onclick="previewCompletedExam(${exam.id})"><i class="fas fa-eye"></i> View Details</button>
+                        <button class="btn primary" onclick="openBuilder(${exam.id})"><i class="fas fa-edit"></i> Edit Exam</button>
+                        <button class="btn" onclick="openExamSubmissions(${exam.id})"><i class="fas fa-inbox"></i> View Submissions</button>
+                        <button class="btn ok" onclick="openExamProctoring(${exam.id})"><i class="fas fa-desktop"></i> Monitor Exam</button>
+                        <button class="btn" onclick="copyExamLinkFixed(${exam.id}, decodeURIComponent('${encodeURIComponent(title)}'))"><i class="fas fa-link"></i> Copy Link</button>
+                        <button class="btn warn" onclick="reuseExam(${exam.id})"><i class="fas fa-copy"></i> Reuse Exam</button>
+                        ${examState === 'ongoing' ? `<button class="btn warn" onclick="adjustExamTime(${exam.id})"><i class="fas fa-clock"></i> Adjust Time</button>` : ''}
+                        <button class="btn danger" onclick="deleteExam(${exam.id})" ${!canDelete ? 'disabled' : ''}><i class="fas fa-trash"></i> Delete Exam</button>
+                    </div>
+                </div>
+            </article>`;
+        }).join('');
+    }
+
+    function toggleExamCardDetails(event, examId) {
+        showExamDetailsPopup(event, examId);
+    }
+
+    function closeExamDetailsPopup() {
+        const modal = document.getElementById('examDetailsPopup');
+        if (modal) modal.remove();
+    }
+
+    function showExamDetailsPopup(event, examId) {
+        const interactive = event?.target?.closest?.('button, a, input, select, textarea, .exam-created-actions');
+        if (interactive) return;
+
+        const exam = findExam(examId);
+        if (!exam) {
+            toast('Exam not found');
+            return;
+        }
+
+        closeExamDetailsPopup();
+        const examState = getExamRuntimeState(exam);
+        const stateLabel = examState === 'scheduled' ? 'Upcoming' :
+            examState === 'ongoing' ? 'Ongoing' :
+            examState === 'completed' ? 'Written/Completed' :
+            examState === 'published' ? 'Published' : 'Draft';
+        const dates = getExamCardDateParts(exam);
+        const totalMarks = calculateEffectiveExamMarks(exam);
+        const assigned = parseInt(exam.assignedStudentsCount || exam.assigned_students_count || 0, 10);
+        const submitted = parseInt(exam.submittedStudentsCount || exam.submitted_students_count || 0, 10);
+        const title = exam.title || '(untitled)';
+        const courseName = exam.courseName || exam.course_name || title;
+        const courseCode = exam.courseCode || exam.course_code || 'No course';
+        const examCode = exam.exam_code || exam.exam_id || exam.id;
+        const canDelete = examState !== 'ongoing';
+
+        const modal = document.createElement('div');
+        modal.id = 'examDetailsPopup';
+        modal.style.cssText = 'position:fixed;inset:0;background:rgba(15,23,42,.66);z-index:10070;display:flex;align-items:center;justify-content:center;padding:22px;';
+        modal.innerHTML = `
+            <div style="background:#ffffff;color:#0f172a;border-radius:18px;max-width:860px;width:100%;max-height:90vh;overflow:auto;box-shadow:0 30px 80px rgba(15,23,42,.35);border:1px solid #dbe3ef;">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;padding:22px 24px;border-bottom:1px solid #e2e8f0;background:#f8fafc;border-radius:18px 18px 0 0;">
+                    <div>
+                        <h2 style="margin:0 0 6px;font-size:24px;color:#0f172a;">${escapeHTML(courseName)}</h2>
+                        <div style="font-weight:800;color:#475569;">${escapeHTML(courseCode)} | ${escapeHTML(title)}</div>
+                    </div>
+                    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:flex-end;">
+                        <span class="tag status-${examState}">${escapeHTML(stateLabel)}</span>
+                        <button class="btn" onclick="closeExamDetailsPopup()">Close</button>
+                    </div>
+                </div>
+                <div style="padding:22px 24px;">
+                    <div class="exam-created-meta" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));">
+                        <div class="exam-created-meta-item"><small>Exam Code</small><strong>${escapeHTML(String(examCode))}</strong></div>
+                        <div class="exam-created-meta-item"><small>Date</small><strong>${escapeHTML(dates.date)}</strong></div>
+                        <div class="exam-created-meta-item"><small>Start Time</small><strong>${escapeHTML(dates.startTime)}</strong></div>
+                        <div class="exam-created-meta-item"><small>End Time</small><strong>${escapeHTML(dates.endTime)}</strong></div>
+                        <div class="exam-created-meta-item"><small>Month / Year</small><strong>${escapeHTML(dates.monthYear)}</strong></div>
+                        <div class="exam-created-meta-item"><small>Semester</small><strong>${escapeHTML(exam.semester || 'Not set')}</strong></div>
+                        <div class="exam-created-meta-item"><small>School Type</small><strong>${escapeHTML(exam.school_type || 'Not set')}</strong></div>
+                        <div class="exam-created-meta-item"><small>Academic Year</small><strong>${escapeHTML(exam.academic_year || dates.year || 'Not set')}</strong></div>
+                        <div class="exam-created-meta-item"><small>Questions / Marks</small><strong>${(exam.questions || []).length} / ${totalMarks}</strong></div>
+                        <div class="exam-created-meta-item"><small>Assigned / Submitted</small><strong>${assigned} / ${submitted}</strong></div>
+                    </div>
+                    <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:20px;">
+                        <button class="btn" onclick="closeExamDetailsPopup(); previewCompletedExam(${exam.id})"><i class="fas fa-eye"></i> Preview</button>
+                        <button class="btn primary" onclick="closeExamDetailsPopup(); openBuilder(${exam.id})"><i class="fas fa-edit"></i> Edit Exam</button>
+                        <button class="btn" onclick="closeExamDetailsPopup(); openExamSubmissions(${exam.id})"><i class="fas fa-inbox"></i> View Submissions</button>
+                        <button class="btn ok" onclick="closeExamDetailsPopup(); openExamProctoring(${exam.id})"><i class="fas fa-desktop"></i> Monitor Exam</button>
+                        <button class="btn" onclick="copyExamLinkFixed(${exam.id}, decodeURIComponent('${encodeURIComponent(title)}'))"><i class="fas fa-link"></i> Copy Link</button>
+                        <button class="btn warn" onclick="closeExamDetailsPopup(); reuseExam(${exam.id})"><i class="fas fa-copy"></i> Reuse Exam</button>
+                        ${examState === 'ongoing' ? `<button class="btn warn" onclick="closeExamDetailsPopup(); adjustExamTime(${exam.id})"><i class="fas fa-clock"></i> Adjust Time</button>` : ''}
+                        <button class="btn danger" onclick="closeExamDetailsPopup(); deleteExam(${exam.id})" ${!canDelete ? 'disabled' : ''}><i class="fas fa-trash"></i> Delete Exam</button>
+                    </div>
+                </div>
+            </div>
+        `;
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) closeExamDetailsPopup();
+        });
+        document.body.appendChild(modal);
+    }
+
+    function parseExamDateTime(value) {
+        if (!value) return null;
+        const date = new Date(String(value).replace(' ', 'T'));
+        return Number.isNaN(date.getTime()) ? null : date;
+    }
+
+    function getExamCardDateParts(exam) {
+        const start = parseExamDateTime(exam.startAtISO || exam.start_datetime);
+        let end = parseExamDateTime(exam.endAtISO || exam.end_datetime);
+        if (start && (!end || end <= start)) {
+            end = new Date(start.getTime() + ((parseInt(exam.durationMins || exam.duration_minutes, 10) || 180) * 60000));
+        }
+        const dateFormatter = new Intl.DateTimeFormat(undefined, { year: 'numeric', month: 'short', day: '2-digit' });
+        const timeFormatter = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
+        return {
+            date: start ? dateFormatter.format(start) : 'Not scheduled',
+            startTime: start ? timeFormatter.format(start) : 'Not set',
+            endTime: end ? timeFormatter.format(end) : 'Not set',
+            monthYear: start ? start.toLocaleString(undefined, { month: 'long', year: 'numeric' }) : 'Not set',
+            year: start ? String(start.getFullYear()) : ''
+        };
+    }
+
+    function openExamSubmissions(examId) {
+        sessionStorage.setItem('currentSubmissionView', 'exam_instance');
+        sessionStorage.setItem('currentSubmissionExamId', String(examId));
+        go('submissions');
+        loadSubmissions().then(() => {
+            const groups = window.courseGroupsData || {};
+            for (const course of Object.values(groups)) {
+                const instance = Object.values(course.instances || {}).find(item => String(item.examId) === String(examId));
+                if (instance) {
+                    showExamInstanceDetails(course.courseKey, instance.instanceKey);
+                    return;
+                }
+            }
+        });
+    }
+
+    function openExamProctoring(examId) {
+        go('proctoring');
+        const select = document.getElementById('proctoringExamSelect');
+        if (select) {
+            select.value = String(examId);
+            if (typeof startProctoring === 'function') startProctoring();
+        }
+    }
+
+    async function adjustExamTime(examId) {
+        const minutesRaw = prompt('Enter minutes to adjust the exam time. Use +15 to add time or -10 to reduce time:', '+15');
+        if (minutesRaw === null) return;
+        const delta = parseInt(minutesRaw, 10);
+        if (!Number.isFinite(delta) || delta === 0) {
+            toast('Please enter a valid positive or negative number of minutes.');
+            return;
+        }
+        const reason = prompt('Reason for this time adjustment:', 'Lecturer time adjustment') || 'Lecturer time adjustment';
+        const result = await apiRequest('adjust_exam_time', {
+            exam_id: examId,
+            delta_minutes: delta,
+            reason
+        });
+        if (result.success) {
+            toast(`Exam time adjusted by ${delta} minute(s).`);
+            await loadExamsList();
+        } else {
+            toast('Unable to adjust time: ' + (result.error || 'Unknown error'));
+        }
+    }
+
+    async function reuseExam(examId) {
+        const approved = await confirmPopup(
+            'Reuse this exam as a new draft? You can change the date, time, school type, semester, academic year, and assigned students before publishing.',
+            'Reuse exam',
+            'Create Draft'
+        );
+        if (!approved) return;
+        const source = getExams().find(exam => String(exam.id) === String(examId));
+        if (!source) {
+            toast('Exam not found.');
+            return;
+        }
+        const copy = JSON.parse(JSON.stringify(source));
+        copy.id = -Date.now();
+        copy.title = `${source.title || 'Exam'} (Reuse Draft)`;
+        copy.exam_code = '';
+        copy.published = false;
+        copy.startAtISO = '';
+        copy.endAtISO = '';
+        copy.gracePeriodMinutes = 0;
+        copy.cutoffAtISO = '';
+        copy.submittedStudentsCount = 0;
+        copy.assignedStudentsCount = 0;
+        copy.questions = (copy.questions || []).map(question => ({ ...question, id: uid('Q') }));
+        const exams = getExams();
+        exams.unshift(copy);
+        setExams(exams);
+        currentExamId = copy.id;
+        populateBuilderForm(copy);
+        renderQuestions();
+        go('builder', { id: copy.id });
+        toast('Reusable draft created. Set the new schedule and publish when ready.');
     }
 
     function getExamRuntimeState(exam) {
@@ -10075,6 +13321,205 @@ function createCourseTable($courseCode)
         }
     }
 
+    function populateMonitoringExamSelect(exams = getExams()) {
+        const select = document.getElementById('monitoringExamSelect');
+        if (!select) return;
+        const selected = select.value;
+        const monitorable = exams.filter(exam => exam.published || ['ongoing', 'published', 'scheduled'].includes(getExamRuntimeState(exam)));
+        select.innerHTML = '<option value="">Select Exam to Monitor</option>' + monitorable.map(exam =>
+            `<option value="${exam.id}">${escapeHTML(exam.title || 'Untitled Exam')} (${escapeHTML(exam.courseCode || 'No course')})</option>`
+        ).join('');
+        if (selected && monitorable.some(exam => String(exam.id) === String(selected))) {
+            select.value = selected;
+        }
+    }
+
+    async function loadMonitoringData() {
+        const select = document.getElementById('monitoringExamSelect');
+        const examId = select ? select.value : '';
+        currentMonitoringExam = examId || null;
+        if (monitoringInterval) {
+            clearInterval(monitoringInterval);
+            monitoringInterval = null;
+        }
+        if (!currentMonitoringExam) {
+            activeMonitoringStudents = [];
+            updateMonitoringDashboard([]);
+            renderMonitoringGrid([]);
+            return;
+        }
+        await refreshMonitoring();
+        monitoringInterval = setInterval(refreshMonitoring, 5000);
+    }
+
+    async function refreshMonitoring() {
+        if (!currentMonitoringExam) {
+            const select = document.getElementById('monitoringExamSelect');
+            currentMonitoringExam = select ? select.value : null;
+        }
+        if (!currentMonitoringExam) return;
+
+        try {
+            const examResult = await apiRequest('get_exam_details', { exam_id: currentMonitoringExam });
+            if (!examResult.success || !examResult.data) {
+                toast('Could not load exam monitoring details.');
+                return;
+            }
+            const studentsResult = await apiRequest('get_course_students', {
+                course_code: examResult.data.course_code,
+                exam_id: currentMonitoringExam
+            });
+            const sessionsResult = await apiRequest('get_active_sessions', { exam_id: currentMonitoringExam });
+            const students = studentsResult.success && Array.isArray(studentsResult.data) ? studentsResult.data : [];
+            const sessions = sessionsResult.success && Array.isArray(sessionsResult.data) ? sessionsResult.data : [];
+            activeMonitoringStudents = students.map(student => {
+                const session = sessions.find(row => String(row.student_id) === String(student.id));
+                const submitted = isSubmittedProctorRecord(session);
+                const online = !!session && (parseInt(session.screen_sharing_active || 0, 10) === 1 || !!session.last_activity);
+                const flagged = session ? parseInt(session.violations || 0, 10) : 0;
+                return {
+                    id: student.id,
+                    student_id: student.student_id,
+                    full_name: student.full_name,
+                    level: student.level,
+                    online,
+                    writing: online && !submitted,
+                    submitted,
+                    disconnected: !online && !submitted,
+                    flagged,
+                    lastActivity: session ? (session.latest_snapshot_at || session.last_activity || '') : ''
+                };
+            });
+            updateMonitoringDashboard(activeMonitoringStudents);
+            renderMonitoringGrid(activeMonitoringStudents);
+        } catch (error) {
+            console.error('Monitoring refresh failed:', error);
+            toast('Live monitoring refresh failed.');
+        }
+    }
+
+    function updateMonitoringDashboard(students) {
+        const total = students.length;
+        const online = students.filter(student => student.online).length;
+        const writing = students.filter(student => student.writing).length;
+        const submitted = students.filter(student => student.submitted).length;
+        const disconnected = students.filter(student => student.disconnected).length;
+        const flagged = students.filter(student => student.flagged > 0).length;
+        const setText = (id, value) => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = value;
+        };
+        setText('registeredStudents', total);
+        setText('activeStudents', online);
+        setText('writingStudents', writing);
+        setText('completedStudents', submitted);
+        setText('disconnectedStudents', disconnected);
+        setText('cheatingCount', flagged);
+        setText('warningCount', flagged);
+    }
+
+    function renderMonitoringGrid(students) {
+        const grid = document.getElementById('studentMonitoringGrid');
+        if (!grid) return;
+        if (!students.length) {
+            grid.innerHTML = '<div class="empty-state" style="grid-column:1/-1;"><i class="fas fa-user-clock"></i><p>Select an exam or wait for enrolled students to appear.</p></div>';
+            return;
+        }
+        grid.innerHTML = students.map(student => {
+            const state = student.submitted ? 'Submitted' : (student.writing ? 'Writing' : (student.online ? 'Online' : 'Disconnected'));
+            const color = student.submitted ? '#10b981' : (student.writing ? '#2563eb' : (student.online ? '#14b8a6' : '#ef4444'));
+            return `
+                <label class="student-monitor-card ${student.flagged > 0 ? 'warning' : ''}" style="display:block;cursor:pointer;">
+                    <input type="radio" name="monitoringStudent" value="${student.id}" style="margin-right:8px;">
+                    <strong>${escapeHTML(student.full_name || 'Student')}</strong>
+                    <div style="color:var(--muted);font-size:12px;margin:4px 0;">${escapeHTML(student.student_id || '')} ${student.level ? '- Level ' + escapeHTML(student.level) : ''}</div>
+                    <span class="tag" style="background:${color};color:white;">${state}</span>
+                    ${student.flagged > 0 ? `<span class="tag" style="background:#f59e0b;color:#111827;">${student.flagged} flag(s)</span>` : ''}
+                    <div style="font-size:12px;color:var(--muted);margin-top:8px;">Last activity: ${student.lastActivity ? escapeHTML(new Date(String(student.lastActivity).replace(' ', 'T')).toLocaleString()) : 'No activity yet'}</div>
+                </label>
+            `;
+        }).join('');
+    }
+
+    async function controlMonitoringExam(control, extra = {}) {
+        if (!currentMonitoringExam) {
+            toast('Select an exam to control first.');
+            return;
+        }
+        const result = await apiRequest('manage_exam_time', {
+            exam_id: currentMonitoringExam,
+            control,
+            ...extra
+        });
+        toast(result.success ? (result.message || 'Exam timing updated.') : (result.error || 'Could not update exam timing.'));
+        if (result.success) refreshMonitoring();
+    }
+
+    function promptAddMonitoringTime() {
+        const minutes = parseInt(prompt('Add how many minutes? Use 5, 10, 15, or any custom number.', '10') || '0', 10);
+        if (minutes > 0) controlMonitoringExam('add_time', { minutes });
+    }
+
+    function promptExtendMonitoringCutoff() {
+        const value = prompt('Enter the new cut-off date and time in YYYY-MM-DD HH:MM format.');
+        if (value) controlMonitoringExam('extend_cutoff', { cutoff_datetime: value.replace('T', ' ') });
+    }
+
+    function promptMonitoringAnnouncement() {
+        const message = prompt('Announcement to send to all students in this exam:');
+        if (message) controlMonitoringExam('announcement', { message });
+    }
+
+    function sendWarningToAll() {
+        if (!currentMonitoringExam) {
+            toast('Select an exam first.');
+            return;
+        }
+        controlMonitoringExam('announcement', {
+            message: 'Warning: Please follow exam rules. Screen sharing and tab switching are being monitored.'
+        });
+    }
+
+    async function lockAllScreens() {
+        if (!currentMonitoringExam) {
+            toast('Select an exam first.');
+            return;
+        }
+        const targets = activeMonitoringStudents.filter(student => student.online || student.writing);
+        if (!targets.length) {
+            toast('No online students to lock right now.');
+            return;
+        }
+        if (!(await confirmPopup(`Lock screens for ${targets.length} online student(s)?`, 'Lock screens', 'Lock Screens'))) return;
+        for (const student of targets) {
+            await apiRequest('lock_student_screen', {
+                exam_id: currentMonitoringExam,
+                student_id: student.id
+            });
+        }
+        toast('Screen lock command sent to online students.');
+        refreshMonitoring();
+    }
+
+    async function forceSubmitSelectedMonitoringStudent() {
+        if (!currentMonitoringExam) {
+            toast('Select an exam first.');
+            return;
+        }
+        const selected = document.querySelector('input[name="monitoringStudent"]:checked');
+        if (!selected) {
+            toast('Select a student card first.');
+            return;
+        }
+        if (!(await confirmPopup('Force submit this student from the latest saved answers?', 'Force submit student', 'Force Submit'))) return;
+        const result = await apiRequest('force_submit_student', {
+            exam_id: currentMonitoringExam,
+            student_id: selected.value
+        });
+        toast(result.success ? 'Student force-submitted from latest saved answers.' : (result.error || 'Force submit failed.'));
+        refreshMonitoring();
+    }
+
     function copyExamLinkFixed(examId, examTitle) {
         // Get the correct base URL - this ensures it works from any page
         const currentPath = window.location.pathname;
@@ -10099,10 +13544,9 @@ function createCourseTable($courseCode)
         // Copy to clipboard
         navigator.clipboard.writeText(examUrl).then(() => {
             // Show success message with the URL
-            toast(`✅ Exam link copied!\n\n📎 ${examUrl}\n\nShare this link with students`, 5000);
+            toast('✅ Exam link copied');
 
             // Optional: Show a modal with the link for easy copying
-            showLinkModal(examUrl, examTitle);
         }).catch(() => {
             // Fallback for older browsers
             const textarea = document.createElement('textarea');
@@ -10113,10 +13557,26 @@ function createCourseTable($courseCode)
             textarea.select();
             document.execCommand('copy');
             document.body.removeChild(textarea);
-            toast(`✅ Exam link copied to clipboard!\n\nShare: ${examUrl}`, 5000);
-            showLinkModal(examUrl, examTitle);
+            toast('✅ Exam link copied');
         });
     }
+
+    copyExamLinkFixed = function(examId, examTitle) {
+        const currentPath = window.location.pathname;
+        const pathParts = currentPath.split('/');
+        pathParts.pop();
+        const examUrl = `${window.location.origin}${pathParts.join('/')}/exam_interface.php?exam_id=${examId}`;
+        navigator.clipboard.writeText(examUrl).catch(() => {
+            const textarea = document.createElement('textarea');
+            textarea.value = examUrl;
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textarea);
+        });
+    };
 
     // Optional: Show a modal with the link for easy copying
     function showLinkModal(examUrl, examTitle) {
@@ -10274,7 +13734,7 @@ function createCourseTable($courseCode)
         if (!approved) return;
 
         const tempId = -Date.now();
-        const exams = getExams().filter(e => parseInt(e.id) > 0);
+        const exams = getExams();
         const exam = {
             id: tempId,
             exam_code: `EX-DRAFT-${Math.abs(tempId)}`,
@@ -10283,6 +13743,8 @@ function createCourseTable($courseCode)
             durationMins: 180,
             startAtISO: '',
             endAtISO: '',
+            gracePeriodMinutes: 0,
+            cutoffAtISO: '',
             instructions: '- Attempt ALL questions...',
             markingScheme: '',
             published: false,
@@ -10297,6 +13759,7 @@ function createCourseTable($courseCode)
             semester: '',
             exam_type: '',
             school_type: '',
+            academic_year: '',
             level: '',
             auto_grading_enabled: 1,
             partial_grading_enabled: 0,
@@ -10306,8 +13769,10 @@ function createCourseTable($courseCode)
 
         exams.unshift(exam);
         setExams(exams);
+        backupExamDraft(exam);
         currentExamId = tempId;
         sessionStorage.setItem('currentExamId', tempId);
+        localStorage.setItem(K_LAST_BUILDER_EXAM, String(tempId));
         sessionStorage.setItem('currentView', 'builder');
         sessionStorage.setItem('currentRouteParams', JSON.stringify({ id: tempId }));
         resetExamBuilderForm();
@@ -10358,6 +13823,25 @@ function createCourseTable($courseCode)
         showLoading('Loading exam...');
 
         try {
+            const localDraft = getLocalDraftById(examId) || findExam(examId);
+            if (localDraft && (parseInt(examId) < 0 || localDraft.localDraftSavedAt)) {
+                const exams = getExams();
+                const existingIndex = exams.findIndex(exam => parseInt(exam.id) === parseInt(localDraft.id));
+                if (existingIndex >= 0) exams[existingIndex] = localDraft;
+                else exams.unshift(localDraft);
+                setExams(exams);
+                currentExamId = parseInt(localDraft.id);
+                sessionStorage.setItem('currentExamId', currentExamId);
+                localStorage.setItem(K_LAST_BUILDER_EXAM, String(currentExamId));
+                sessionStorage.setItem('currentView', 'builder');
+                sessionStorage.setItem('currentRouteParams', JSON.stringify({ id: currentExamId }));
+                populateBuilderForm(localDraft);
+                renderQuestions();
+                go('builder', { id: currentExamId });
+                hideLoading();
+                return;
+            }
+
             const result = await apiRequest('get_exams');
 
             if (result.success && result.data) {
@@ -10377,7 +13861,9 @@ function createCourseTable($courseCode)
                     }
                     return {
                         id: exam.id,
+                        exam_code: exam.exam_code || exam.exam_id || '',
                         title: exam.title || '',
+                        courseName: exam.course_name || exam.course_title || '',
                         courseCode: exam.course_code || '',
                         durationMins: exam.duration_minutes || 180,
                         startAtISO: exam.start_datetime || '',
@@ -10397,20 +13883,26 @@ function createCourseTable($courseCode)
                         exam_type: exam.exam_type || '',
                         school_type: exam.school_type || '',
                         level: exam.level || '',
+                        academic_year: exam.academic_year || '',
                         auto_grading_enabled: exam.auto_grading_enabled || 0,
                         partial_grading_enabled: exam.partial_grading_enabled || 0,
                         show_correct_answers: exam.show_correct_answers || 0,
-                        allow_review: exam.allow_review !== null ? exam.allow_review : 1
+                        allow_review: exam.allow_review !== null ? exam.allow_review : 1,
+                        assignedStudentsCount: parseInt(exam.assigned_students_count || 0, 10),
+                        submittedStudentsCount: parseInt(exam.submitted_students_count || 0, 10),
+                        resultsPublished: parseInt(exam.results_published || 0, 10) === 1
                     };
                 });
 
-                setExams(exams);
-                const exam = exams.find(e => parseInt(e.id) === parseInt(examId));
+                const mergedExams = mergeExamsWithLocalDrafts(exams);
+                setExams(mergedExams);
+                const exam = mergedExams.find(e => parseInt(e.id) === parseInt(examId));
 
                 if (exam) {
                     console.log("Found exam with questions:", exam.questions.length);
                     currentExamId = parseInt(exam.id);
                     sessionStorage.setItem('currentExamId', currentExamId);
+                    localStorage.setItem(K_LAST_BUILDER_EXAM, String(currentExamId));
                     sessionStorage.setItem('currentView', 'builder');
                     populateBuilderForm(exam);
                     setTimeout(() => {
@@ -10458,14 +13950,19 @@ function createCourseTable($courseCode)
         const codeInput = document.getElementById("bCode");
         const durationInput = document.getElementById("bDuration");
         const instructionsInput = document.getElementById("bInstructions");
+        const examDateInput = document.getElementById("bExamDate");
+        const startTimeInput = document.getElementById("bStartTime");
         const startAtInput = document.getElementById("bStartAt");
         const endAtInput = document.getElementById("bEndAt");
+        const graceInput = document.getElementById("bGracePeriod");
+        const cutoffInput = document.getElementById("bCutoffAt");
         const questionsToAnswerInput = document.getElementById("bQuestionsToAnswer");
         const examPasswordInput = document.getElementById("examPassword");
         const schoolNameInput = document.getElementById("school_name");
         const facultyNameInput = document.getElementById("faculty_name");
         const departmentInput = document.getElementById("department");
         const semesterSelect = document.getElementById("semester");
+        const academicYearInput = document.getElementById("academic_year");
         const examTypeSelect = document.getElementById("exam_type");
         const schoolTypeSelect = document.getElementById("school_type");
         const levelSelect = document.getElementById("level");
@@ -10491,9 +13988,20 @@ function createCourseTable($courseCode)
             startAtInput.value = exam.startAtISO ? exam.startAtISO.slice(0, 16) : "";
             updateExamField('startAtISO', exam.startAtISO || "");
         }
+        if (examDateInput || startTimeInput) {
+            syncSchedulePartsFromStart();
+        }
         if (endAtInput) {
             endAtInput.value = exam.endAtISO ? exam.endAtISO.slice(0, 16) : "";
             updateExamField('endAtISO', exam.endAtISO || "");
+        }
+        if (graceInput) {
+            graceInput.value = parseInt(exam.gracePeriodMinutes || 0, 10);
+            updateExamField('gracePeriodMinutes', parseInt(exam.gracePeriodMinutes || 0, 10));
+        }
+        if (cutoffInput) {
+            cutoffInput.value = exam.cutoffAtISO ? exam.cutoffAtISO.slice(0, 16) : "";
+            updateExamField('cutoffAtISO', exam.cutoffAtISO || "");
         }
         if (questionsToAnswerInput) {
             questionsToAnswerInput.value = exam.questionsToAnswer || 0;
@@ -10519,6 +14027,10 @@ function createCourseTable($courseCode)
         if (semesterSelect && exam.semester) {
             semesterSelect.value = exam.semester;
             updateExamField('semester', exam.semester);
+        }
+        if (academicYearInput) {
+            academicYearInput.value = exam.academic_year || "";
+            updateExamField('academic_year', exam.academic_year || "");
         }
         if (examTypeSelect && exam.exam_type) {
             examTypeSelect.value = exam.exam_type;
@@ -10594,6 +14106,25 @@ function createCourseTable($courseCode)
         updateExamField('endAtISO', endField.value);
     }
 
+    function syncSchedulePartsFromStart() {
+        const startField = document.getElementById('bStartAt');
+        const dateField = document.getElementById('bExamDate');
+        const timeField = document.getElementById('bStartTime');
+        if (!startField || !startField.value) return;
+        const [datePart, timePart = ''] = startField.value.split('T');
+        if (dateField) dateField.value = datePart || '';
+        if (timeField) timeField.value = timePart.slice(0, 5);
+    }
+
+    function syncStartDateTimeFromParts() {
+        const startField = document.getElementById('bStartAt');
+        const dateField = document.getElementById('bExamDate');
+        const timeField = document.getElementById('bStartTime');
+        if (!startField || !dateField || !timeField || !dateField.value || !timeField.value) return;
+        startField.value = `${dateField.value}T${timeField.value}`;
+        updateExamField('startAtISO', startField.value);
+    }
+
     function syncEndTimeFromDuration() {
         const startField = document.getElementById('bStartAt');
         const endField = document.getElementById('bEndAt');
@@ -10606,6 +14137,23 @@ function createCourseTable($courseCode)
         endField.value = toDateTimeLocalValue(end);
         updateExamField('durationMins', minutes);
         updateExamField('endAtISO', endField.value);
+    }
+
+    function syncCutoffFromGrace() {
+        const endField = document.getElementById('bEndAt');
+        const cutoffField = document.getElementById('bCutoffAt');
+        const graceField = document.getElementById('bGracePeriod');
+        if (!endField || !cutoffField || !graceField || !endField.value) return;
+        const grace = parseInt(graceField.value, 10) || 0;
+        if (grace <= 0 && cutoffField.value) {
+            updateExamField('cutoffAtISO', cutoffField.value);
+            return;
+        }
+        const end = new Date(endField.value);
+        if (Number.isNaN(end.getTime())) return;
+        const cutoff = new Date(end.getTime() + grace * 60000);
+        cutoffField.value = toDateTimeLocalValue(cutoff);
+        updateExamField('cutoffAtISO', cutoffField.value);
     }
 
     function toDateTimeLocalValue(date) {
@@ -10627,6 +14175,8 @@ function createCourseTable($courseCode)
             return false;
         }
 
+        backupExamDraft(exam);
+
         try {
             const questionsJSON = JSON.stringify(exam.questions || []);
             const selectedGradingMode = exam.gradingMode || document.getElementById('gradingMode')?.value || 'auto';
@@ -10641,6 +14191,8 @@ function createCourseTable($courseCode)
                     duration: exam.durationMins || 180,
                     start_datetime: exam.startAtISO || '',
                     end_datetime: exam.endAtISO || '',
+                    grace_period_minutes: exam.gracePeriodMinutes || 0,
+                    cutoff_datetime: exam.cutoffAtISO || '',
                     instructions: exam.instructions || '',
                     marking_scheme: exam.markingScheme || '',
                     questions: questionsJSON,
@@ -10653,6 +14205,7 @@ function createCourseTable($courseCode)
                     semester: exam.semester || '',
                     exam_type: exam.exam_type || '',
                     school_type: exam.school_type || '',
+                    academic_year: exam.academic_year || '',
                     level: exam.level || '',
                     exam_password: exam.exam_password || '',
                     auto_grading_enabled: autoGradingEnabled,
@@ -10668,12 +14221,15 @@ function createCourseTable($courseCode)
 
                 const oldId = currentExamId;
                 currentExamId = parseInt(created.exam_id);
+                removeDraftBackup(oldId);
                 exam.id = currentExamId;
                 exam.exam_code = created.exam_code || exam.exam_code || '';
                 const tempIndex = exams.findIndex(e => parseInt(e.id) === parseInt(oldId));
                 if (tempIndex >= 0) exams[tempIndex] = exam;
                 setExams(exams);
+                backupExamDraft(exam);
                 sessionStorage.setItem('currentExamId', currentExamId);
+                localStorage.setItem(K_LAST_BUILDER_EXAM, String(currentExamId));
                 sessionStorage.setItem('currentRouteParams', JSON.stringify({ id: currentExamId }));
             }
 
@@ -10684,6 +14240,8 @@ function createCourseTable($courseCode)
                 duration: exam.durationMins || 180,
                 start_datetime: exam.startAtISO || '',
                 end_datetime: exam.endAtISO || '',
+                grace_period_minutes: exam.gracePeriodMinutes || 0,
+                cutoff_datetime: exam.cutoffAtISO || '',
                 instructions: exam.instructions || '',
                 marking_scheme: exam.markingScheme || '',
                 questions: questionsJSON,
@@ -10696,6 +14254,7 @@ function createCourseTable($courseCode)
                 semester: exam.semester || '',
                 exam_type: exam.exam_type || '',
                 school_type: exam.school_type || '',
+                academic_year: exam.academic_year || '',
                 level: exam.level || '',
                 exam_password: exam.exam_password || '',
                 auto_grading_enabled: autoGradingEnabled,
@@ -10712,6 +14271,7 @@ function createCourseTable($courseCode)
                 if (idx >= 0) {
                     exams[idx] = exam;
                     setExams(exams);
+                    backupExamDraft(exam);
                 }
                 return true;
             } else {
@@ -10877,25 +14437,29 @@ function createCourseTable($courseCode)
         const instructions = document.getElementById('bInstructions')?.value || '';
         const startDatetime = document.getElementById('bStartAt')?.value || null;
         const endDatetime = document.getElementById('bEndAt')?.value || null;
+        const gracePeriod = parseInt(document.getElementById('bGracePeriod')?.value) || 0;
+        const cutoffDatetime = document.getElementById('bCutoffAt')?.value || null;
         const questionsToAnswer = parseInt(document.getElementById('bQuestionsToAnswer')?.value) || 0;
         const examPassword = document.getElementById('examPassword')?.value || '';
 
         // Academic Information
         const semester = document.getElementById('semester')?.value || '';
+        const academicYear = document.getElementById('academic_year')?.value || '';
         const examType = document.getElementById('exam_type')?.value || '';
         const schoolType = document.getElementById('school_type')?.value || '';
         const level = document.getElementById('level')?.value || '';
 
-        const selectedGradingMode = document.getElementById('gradingMode')?.value || exam?.gradingMode || 'auto';
-        const autoGradingEnabled = selectedGradingMode === 'manual' ? 0 : 1;
-        const partialGradingEnabled = selectedGradingMode === 'hybrid' ? 1 : 0;
-        const showCorrectAnswers = 0;
-        const allowReview = 1;
+        saveAllFormDataToExam();
 
         // Get questions
         const exams = getExams();
         const exam = exams.find(e => parseInt(e.id) === parseInt(currentExamId));
         const questions = exam?.questions || [];
+        const selectedGradingMode = document.getElementById('gradingMode')?.value || exam?.gradingMode || 'auto';
+        const autoGradingEnabled = selectedGradingMode === 'manual' ? 0 : 1;
+        const partialGradingEnabled = selectedGradingMode === 'hybrid' ? 1 : 0;
+        const showCorrectAnswers = 0;
+        const allowReview = 1;
 
         const totalMarks = calculateEffectiveExamMarks(questions, questionsToAnswer);
 
@@ -10932,6 +14496,8 @@ function createCourseTable($courseCode)
             duration: duration,
             start_datetime: startDatetime,
             end_datetime: endDatetime,
+            grace_period_minutes: gracePeriod,
+            cutoff_datetime: cutoffDatetime,
             instructions: instructions,
             marking_scheme: exam?.markingScheme || '',
             questions: JSON.stringify(questions),
@@ -10942,6 +14508,7 @@ function createCourseTable($courseCode)
             faculty_name: '',
             department: '',
             semester: semester,
+            academic_year: academicYear,
             exam_type: examType,
             school_type: schoolType,
             level: level,
@@ -10962,8 +14529,10 @@ function createCourseTable($courseCode)
             console.log("✅ API Response:", result);
 
             if (result.success) {
+                removeDraftBackup(currentExamId, result.exam_id);
+                localStorage.removeItem(K_LAST_BUILDER_EXAM);
                 // Show success message
-                showMessage("✅ Exam Published Successfully!", "success");
+                showMessage(result.warning ? "⚠️ " + result.message : "✅ " + (result.message || "Exam Published Successfully!"), result.warning ? "info" : "success");
 
                 // Reset the form
                 resetExamBuilderForm();
@@ -11487,6 +15056,21 @@ function createCourseTable($courseCode)
         });
     }
 
+    copyExamLink = function(examId, examTitle) {
+        const base = window.location.origin + window.location.pathname.replace('lecturer_dashboard.php', '');
+        const link = `${base}exam_interface.php?exam_id=${examId}`;
+        navigator.clipboard.writeText(link).catch(() => {
+            const el = document.createElement('textarea');
+            el.value = link;
+            el.style.position = 'fixed';
+            el.style.opacity = '0';
+            document.body.appendChild(el);
+            el.select();
+            document.execCommand('copy');
+            document.body.removeChild(el);
+        });
+    };
+
     function toggleShuffle() {
         shuffleEnabled = !shuffleEnabled;
         const btn = document.getElementById('shuffleBtn');
@@ -11669,10 +15253,37 @@ function createCourseTable($courseCode)
         if (lang.includes('php')) return 'php';
         if (lang.includes('java')) return 'java';
         if (lang.includes('c++') || lang.includes('cpp')) return 'cpp';
+        if (lang.includes('c#') || lang.includes('csharp')) return 'csharp';
+        if (lang.includes('vb')) return 'vb';
+        if (lang.includes('sql')) return 'sql';
+        if (lang.includes('html/css/js')) return 'html';
         if (lang === 'c') return 'c';
         if (lang.includes('html')) return 'html';
         if (lang.includes('css')) return 'css';
         return 'plaintext';
+    }
+
+    function qodaLanguageExtension(language) {
+        const lang = monacoLanguageFromQuestion(language);
+        const extensions = {
+            python: 'py',
+            javascript: 'js',
+            php: 'php',
+            java: 'java',
+            cpp: 'cpp',
+            csharp: 'cs',
+            vb: 'vb',
+            sql: 'sql',
+            html: 'html',
+            css: 'css',
+            c: 'c'
+        };
+        return extensions[lang] || 'txt';
+    }
+
+    function qodaCodeFileName(q, field) {
+        const ext = qodaLanguageExtension(q?.language || 'plaintext');
+        return `${field === 'starterCode' ? 'starter' : 'solution'}.${ext}`;
     }
 
     function addQuestionToExam(exams, idx) {
@@ -11752,6 +15363,7 @@ function createCourseTable($courseCode)
             ).join('');
             console.log(`Rendered ${exam.questions.length} coding questions`);
             refreshQuestionAnswerRuleHint();
+            setTimeout(initQodaModelSolutionEditors, 0);
         }
     }
 
@@ -11920,29 +15532,6 @@ function createCourseTable($courseCode)
         </div>`;
 
 
-
-        // Add this after the test cases section in renderCodingQuestionCard
-        html += `
-    <div class="field" style="margin-bottom: 20px;">
-        <label style="display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px;">
-            <i class="fas fa-clipboard-list"></i> Marking Scheme
-        </label>
-        <div class="structured-toolbar">
-            <button type="button" class="btn small" onclick="insertQuestionFieldStructuredLine('${q.id}', 'markingScheme', 'number')"><i class="fas fa-list-ol"></i> Numbering</button>
-            <button type="button" class="btn small" onclick="insertQuestionFieldStructuredLine('${q.id}', 'markingScheme', 'bullet')"><i class="fas fa-list-ul"></i> Bullets</button>
-        </div>
-        <textarea id="markingScheme_${q.id}" onchange="updateQuestion('${q.id}', 'markingScheme', this.value)" onkeydown="handleStructuredTextareaKeydown(event, this, 'markingScheme', '${q.id}')" rows="4"
-            style="width: 100%; padding: 12px; border-radius: 12px; border: 2px solid var(--border); background: var(--input-bg); color: var(--text);"
-            placeholder="Enter marking scheme criteria (one per line)...
-- Correct syntax (2 marks)
-- Logic implementation (3 marks)
-- Edge cases handled (1 mark)
-- Code efficiency (1 mark)
-- Comments and readability (1 mark)">${escapeHTML(q.markingScheme || '')}</textarea>
-        <small style="display: block; margin-top: 8px; color: var(--muted);">
-            <i class="fas fa-info-circle"></i> Define criteria for AI grading
-        </small>
-    </div>`;
 
         return html;
     }
@@ -12215,6 +15804,123 @@ function createCourseTable($courseCode)
         if (field === 'hidden') renderQuestions();
     }
 
+    let questionBankSearchTimer = null;
+    let questionBankItems = [];
+
+    function openQuestionBankModal() {
+        if (!currentExamId) {
+            toast('Open or create an exam before using the question bank.');
+            return;
+        }
+        populateQuestionBankLanguageFilter();
+        const currentExam = findExam(currentExamId);
+        const courseInput = document.getElementById('qbCourse');
+        const semesterInput = document.getElementById('qbSemester');
+        const yearInput = document.getElementById('qbYear');
+        if (courseInput && currentExam?.courseCode && !courseInput.value) courseInput.value = currentExam.courseCode;
+        if (semesterInput && currentExam?.semester && !semesterInput.value) semesterInput.value = currentExam.semester;
+        if (yearInput && currentExam?.academic_year && !yearInput.value) yearInput.value = currentExam.academic_year;
+        const modal = document.getElementById('questionBankModal');
+        if (modal) modal.style.display = 'flex';
+        loadQuestionBank();
+    }
+
+    function closeQuestionBankModal() {
+        const modal = document.getElementById('questionBankModal');
+        if (modal) modal.style.display = 'none';
+    }
+
+    function populateQuestionBankLanguageFilter() {
+        const select = document.getElementById('qbLanguage');
+        if (!select || select.dataset.ready === '1') return;
+        select.innerHTML = '<option value="">All Languages</option>' + codingLanguagesList.map(lang =>
+            `<option value="${escapeHTML(lang)}">${escapeHTML(lang)}</option>`
+        ).join('');
+        select.dataset.ready = '1';
+    }
+
+    function debouncedQuestionBankSearch() {
+        clearTimeout(questionBankSearchTimer);
+        questionBankSearchTimer = setTimeout(loadQuestionBank, 350);
+    }
+
+    async function loadQuestionBank() {
+        const results = document.getElementById('questionBankResults');
+        if (!results) return;
+        results.innerHTML = '<div class="empty-state" style="grid-column:1/-1;">Loading question bank...</div>';
+        const response = await apiRequest('get_question_bank', {
+            search: document.getElementById('qbSearch')?.value || '',
+            course_code: document.getElementById('qbCourse')?.value || '',
+            language: document.getElementById('qbLanguage')?.value || '',
+            semester: document.getElementById('qbSemester')?.value || '',
+            academic_year: document.getElementById('qbYear')?.value || '',
+            difficulty: document.getElementById('qbDifficulty')?.value || ''
+        });
+        if (!response.success) {
+            results.innerHTML = `<div class="empty-state" style="grid-column:1/-1;">${escapeHTML(response.error || 'Could not load question bank.')}</div>`;
+            return;
+        }
+        questionBankItems = response.data || [];
+        if (!questionBankItems.length) {
+            results.innerHTML = '<div class="empty-state" style="grid-column:1/-1;">No matching questions found.</div>';
+            return;
+        }
+        results.innerHTML = questionBankItems.map((item, index) => `
+            <article class="question-bank-card">
+                <div style="display:flex; justify-content:space-between; gap:10px; align-items:flex-start;">
+                    <strong>${escapeHTML(item.title || `Question ${index + 1}`)}</strong>
+                    <span class="tag">${escapeHTML(item.language || 'Code')}</span>
+                </div>
+                <div class="small" style="margin:8px 0;">
+                    ${escapeHTML(item.course_code || 'No course')} | ${escapeHTML(item.semester || 'No semester')} | ${escapeHTML(item.academic_year || item.year || 'No year')}
+                </div>
+                <div style="max-height:120px; overflow:auto; white-space:pre-wrap; color:var(--text); font-size:13px; margin-bottom:10px;">
+                    ${escapeHTML(item.prompt || '')}
+                </div>
+                <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+                    <span class="small">${parseFloat(item.marks || 0)} marks ${item.difficulty ? '| ' + escapeHTML(item.difficulty) : ''}</span>
+                    <button class="btn primary small" onclick="reuseQuestionFromBank(${index})"><i class="fas fa-plus"></i> Use Question</button>
+                </div>
+            </article>
+        `).join('');
+    }
+
+    function clearQuestionBankFilters() {
+        ['qbSearch', 'qbCourse', 'qbYear'].forEach(id => {
+            const field = document.getElementById(id);
+            if (field) field.value = '';
+        });
+        ['qbLanguage', 'qbSemester', 'qbDifficulty'].forEach(id => {
+            const field = document.getElementById(id);
+            if (field) field.value = '';
+        });
+        loadQuestionBank();
+    }
+
+    async function reuseQuestionFromBank(index) {
+        const item = questionBankItems[index];
+        if (!item || !currentExamId) return;
+        const exams = getExams();
+        const examIndex = exams.findIndex(e => parseInt(e.id) === parseInt(currentExamId));
+        if (examIndex < 0) return;
+        const original = item.question || {};
+        const question = JSON.parse(JSON.stringify(original));
+        question.id = uid('Q');
+        question.text = question.text || item.prompt || '';
+        question.title = question.title || item.title || '';
+        question.type = question.type || 'code';
+        question.language = question.language || item.language || 'Python';
+        question.marks = parseFloat(question.marks || item.marks || 5);
+        question.testCases = Array.isArray(question.testCases) ? question.testCases : [];
+        question.gradingMode = question.gradingMode || 'auto';
+        exams[examIndex].questions = exams[examIndex].questions || [];
+        exams[examIndex].questions.push(question);
+        setExams(exams);
+        renderQuestions();
+        await saveExamToDatabase();
+        toast('Question added from bank. You can edit it before publishing.');
+    }
+
     function updateCodeLanguage(questionId, language) {
         console.log("Updating language to:", language);
 
@@ -12234,6 +15940,7 @@ function createCourseTable($courseCode)
         q.language = language;
 
         setExams(exams);
+        backupExamDraft(exams[idx]);
         saveExamToDatabase().then(() => {
             console.log("Exam saved with new language");
         });
@@ -12888,34 +16595,165 @@ function createCourseTable($courseCode)
         return palette[Math.abs(hash) % palette.length];
     }
 
+    function submittedDateValue(submission) {
+        return submission?.submitted_exact || submission?.submittedAt || submission?.submitted_at || submission?.updated_at || '';
+    }
+
+    function parseQodaDate(value) {
+        if (!value) return null;
+        const date = new Date(String(value).replace(' ', 'T'));
+        return Number.isNaN(date.getTime()) ? null : date;
+    }
+
+    function formatQodaDateTime(value) {
+        const date = parseQodaDate(value);
+        return date ? date.toLocaleString() : 'Not set';
+    }
+
+    function submissionStatusPriority(status) {
+        status = normalizeSubmissionStatus(status);
+        if (['GRADED', 'MARKED', 'MANUALLY_GRADED'].includes(status)) return 5;
+        if (status === 'AUTO_GRADED') return 4;
+        if (['SUBMITTED', 'TIMED_OUT'].includes(status)) return 3;
+        return 1;
+    }
+
+    function dedupeSubmissionsByExamStudent(submissions) {
+        const map = new Map();
+        (submissions || []).forEach(sub => {
+            const status = normalizeSubmissionStatus(sub.status);
+            if (['IN_PROGRESS', 'DRAFT', 'AUTOSAVED'].includes(status)) return;
+            const studentKey = sub.student_id || sub.student_identifier || sub.student_name || 'unknown';
+            const key = `${sub.exam_id || 'exam'}::${studentKey}`;
+            const existing = map.get(key);
+            if (!existing) {
+                map.set(key, sub);
+                return;
+            }
+            const currentPriority = submissionStatusPriority(sub.status);
+            const existingPriority = submissionStatusPriority(existing.status);
+            const currentTime = parseQodaDate(submittedDateValue(sub))?.getTime() || 0;
+            const existingTime = parseQodaDate(submittedDateValue(existing))?.getTime() || 0;
+            if (currentPriority > existingPriority || (currentPriority === existingPriority && (currentTime > existingTime || Number(sub.id || 0) > Number(existing.id || 0)))) {
+                map.set(key, sub);
+            }
+        });
+        return Array.from(map.values());
+    }
+
+    function getExamInstanceMeta(sub) {
+        const examDetail = examDetailsCache[sub.exam_id] || sub || {};
+        const startValue = examDetail.start_datetime || sub.start_datetime || '';
+        const endValue = examDetail.end_datetime || sub.end_datetime || '';
+        const startDate = parseQodaDate(startValue);
+        const endDate = parseQodaDate(endValue);
+        const courseCode = examDetail.course_code || sub.course_code || 'Unknown';
+        const courseName = examDetail.course_name || sub.course_name || examDetail.title || sub.exam_title || 'Unknown Course';
+        return {
+            examId: String(sub.exam_id || examDetail.id || ''),
+            courseCode,
+            courseName,
+            examCode: examDetail.exam_code || sub.exam_code || examDetail.exam_id || '',
+            level: examDetail.level || sub.level || 'N/A',
+            semester: examDetail.semester || sub.semester || 'N/A',
+            schoolType: examDetail.school_type || sub.school_type || 'Regular',
+            academicYear: examDetail.academic_year || sub.academic_year || `${new Date().getFullYear()}/${new Date().getFullYear() + 1}`,
+            examType: examDetail.exam_type || sub.exam_type || '',
+            startValue,
+            endValue,
+            startLabel: formatQodaDateTime(startValue),
+            endLabel: formatQodaDateTime(endValue),
+            month: startDate ? startDate.toLocaleString(undefined, { month: 'long' }) : 'Not set',
+            year: startDate ? String(startDate.getFullYear()) : '',
+            dateLabel: startDate ? startDate.toLocaleDateString() : 'Not set',
+            timeLabel: startDate ? startDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Not set',
+            endTimeLabel: endDate ? endDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Not set',
+            examDetail
+        };
+    }
+
+    function getCourseGroupKey(meta) {
+        return `${meta.courseCode}::${meta.courseName}`;
+    }
+
+    function getExamInstanceKey(meta) {
+        return [
+            meta.examId,
+            meta.courseCode,
+            meta.courseName,
+            meta.startValue || 'no-start',
+            meta.endValue || 'no-end',
+            meta.schoolType,
+            meta.semester,
+            meta.academicYear
+        ].join('::');
+    }
+
+    function getClassScoreForSubmission(sub) {
+        const grading = getSubmissionGrading(sub);
+        if (sub.class_score !== undefined && sub.class_score !== null && sub.class_score !== '') {
+            return clampScore(sub.class_score, 0, 40);
+        }
+        if (grading.class_score !== undefined && grading.class_score !== null && grading.class_score !== '') {
+            return clampScore(grading.class_score, 0, 40);
+        }
+        return clampScore(studentClassScores[`${sub.exam_id}:${sub.student_identifier}`] ?? studentClassScores[sub.student_identifier] ?? 0, 0, 40);
+    }
+
     // Render course cards (first view - shows which courses have submissions)
     // Render course cards (first view - ONLY CARDS, no filters or tables)
     function renderCourseCardsView(submissions) {
         const container = document.getElementById('submissionsContainer');
         if (!container) return;
 
-        // Group submissions by course
+        // Group submitted rows by course, then by exact exam instance.
         const groupedByCourse = {};
-        submissions.forEach(sub => {
-            const examDetail = examDetailsCache[sub.exam_id];
-            const courseCode = examDetail ? examDetail.course_code : (sub.course_code || 'Unknown');
-            const courseName = examDetail ? examDetail.title : (sub.exam_title || 'Unknown Course');
-            const courseKey = `${courseCode}::${courseName}`;
-            const level = examDetail ? examDetail.level : 'N/A';
-            const semester = examDetail ? examDetail.semester : 'N/A';
+        dedupeSubmissionsByExamStudent(submissions).forEach(sub => {
+            const meta = getExamInstanceMeta(sub);
+            const courseKey = getCourseGroupKey(meta);
+            const instanceKey = getExamInstanceKey(meta);
 
             if (!groupedByCourse[courseKey]) {
                 groupedByCourse[courseKey] = {
                     courseKey: courseKey,
-                    courseCode: courseCode,
-                    courseName: courseName,
-                    level: level,
-                    semester: semester,
+                    courseCode: meta.courseCode,
+                    courseName: meta.courseName,
+                    level: meta.level,
+                    semester: meta.semester,
                     submissions: [],
-                    examDetail: examDetail
+                    instances: {},
+                    examDetail: meta.examDetail
+                };
+            }
+            if (!groupedByCourse[courseKey].instances[instanceKey]) {
+                groupedByCourse[courseKey].instances[instanceKey] = {
+                    instanceKey,
+                    isExamInstance: true,
+                    parentCourseKey: courseKey,
+                    courseKey: instanceKey,
+                    courseCode: meta.courseCode,
+                    courseName: meta.courseName,
+                    level: meta.level,
+                    semester: meta.semester,
+                    academicYear: meta.academicYear,
+                    schoolType: meta.schoolType,
+                    month: meta.month,
+                    year: meta.year,
+                    startLabel: meta.startLabel,
+                    endLabel: meta.endLabel,
+                    dateLabel: meta.dateLabel,
+                    timeLabel: meta.timeLabel,
+                    endTimeLabel: meta.endTimeLabel,
+                    examCode: meta.examCode,
+                    examId: meta.examId,
+                    startValue: meta.startValue,
+                    endValue: meta.endValue,
+                    submissions: [],
+                    examDetail: meta.examDetail
                 };
             }
             groupedByCourse[courseKey].submissions.push(sub);
+            groupedByCourse[courseKey].instances[instanceKey].submissions.push(sub);
         });
 
         // Store globally
@@ -12983,7 +16821,8 @@ function createCourseTable($courseCode)
 
         for (const [courseKey, course] of filteredCourses) {
             const courseCode = course.courseCode;
-            const courseSubmissions = course.submissions;
+            const courseSubmissions = dedupeSubmissionsByExamStudent(course.submissions);
+            const instances = Object.values(course.instances || {});
 
             // Calculate statistics
             let totalScore = 0;
@@ -13040,7 +16879,7 @@ function createCourseTable($courseCode)
                 
                 <div class="course-card-footer" style="padding: 15px 20px; background: var(--bg); display: flex; justify-content: space-between; align-items: center;">
                     <div style="font-size: 12px; color: var(--muted);">
-                        <i class="fas fa-calendar"></i> ${escapeHTML(course.semester)}
+                        <i class="fas fa-calendar"></i> ${instances.length} exam instance${instances.length === 1 ? '' : 's'}
                     </div>
                     <div style="font-size: 12px; color: ${levelColor};">
                         Click to view <i class="fas fa-arrow-right"></i>
@@ -13069,21 +16908,119 @@ function createCourseTable($courseCode)
         sessionStorage.setItem('currentSubmissionView', 'course_detail');
         sessionStorage.setItem('currentCourseCode', courseCode);
 
-        // Render the full submission page for this course
-        renderFullSubmissionPage(course);
+        renderExamInstancesPage(course);
+    }
+
+    function renderExamInstancesPage(course) {
+        const container = document.getElementById('submissionsContainer');
+        if (!container) return;
+        const instances = Object.values(course.instances || {}).sort((a, b) => {
+            const ad = parseQodaDate(a.startValue || a.startLabel)?.getTime() || 0;
+            const bd = parseQodaDate(b.startValue || b.startLabel)?.getTime() || 0;
+            return bd - ad;
+        });
+        const color = courseAccentColor(course.courseCode, course.courseName);
+        let html = `
+        <div style="margin-bottom:20px;">
+            <button class="back-to-courses-btn" onclick="goBackToCourses()">
+                <i class="fas fa-arrow-left"></i> Back to All Courses
+            </button>
+        </div>
+        <div style="background:linear-gradient(135deg, ${color}, ${color}dd); color:white; border-radius:16px; padding:24px; margin-bottom:20px;">
+            <h2 style="margin:0 0 6px 0;">${escapeHTML(course.courseName)}</h2>
+            <div style="opacity:.95;">${escapeHTML(course.courseCode)} | ${instances.length} exam instance${instances.length === 1 ? '' : 's'}</div>
+        </div>
+        <div class="courses-grid">`;
+
+        if (instances.length === 0) {
+            html += `
+            <div style="grid-column:1/-1; text-align:center; padding:50px; background:var(--panel); border:1px solid var(--border); border-radius:16px;">
+                <i class="fas fa-folder-open" style="font-size:42px; color:var(--muted);"></i>
+                <h3>No submitted exam instances yet</h3>
+            </div>`;
+        }
+
+        instances.forEach(instance => {
+            const submissions = dedupeSubmissionsByExamStudent(instance.submissions);
+            const graded = submissions.filter(s => isGradedSubmission(s.status)).length;
+            const avg = submissions.length ? roundToWholeNumber(submissions.reduce((sum, sub) => sum + getSubmissionScoreParts(sub).totalScore, 0) / submissions.length) : 0;
+            html += `
+            <div class="course-card" style="cursor:auto;">
+                <div class="course-card-header" style="background:linear-gradient(135deg, ${color}, ${color}dd);">
+                    <h3 style="margin:0; font-size:18px;">${escapeHTML(instance.examCode || ('Exam #' + instance.examId))}</h3>
+                    <p style="margin:8px 0 0 0; opacity:.95;">${escapeHTML(instance.schoolType)} | ${escapeHTML(instance.semester)} | ${escapeHTML(instance.academicYear)}</p>
+                </div>
+                <div style="padding:18px; display:grid; gap:10px;">
+                    <div><strong>Date:</strong> ${escapeHTML(instance.dateLabel)} (${escapeHTML(instance.month)} ${escapeHTML(instance.year)})</div>
+                    <div><strong>Time:</strong> ${escapeHTML(instance.timeLabel)} - ${escapeHTML(instance.endTimeLabel)}</div>
+                    <div><strong>Students Submitted:</strong> ${submissions.length}</div>
+                    <div><strong>Graded:</strong> ${graded}/${submissions.length} | <strong>Average:</strong> ${avg}%</div>
+                </div>
+                <div style="padding:0 18px 18px; display:flex; gap:8px; flex-wrap:wrap;">
+                    <button class="btn primary" onclick='showExamInstanceDetails(${JSON.stringify(course.courseKey)}, ${JSON.stringify(instance.instanceKey)})'>
+                        <i class="fas fa-table"></i> View Score Sheet
+                    </button>
+                    <button class="btn success" onclick='publishSingleExamInstance(${JSON.stringify(instance.examId)}, ${JSON.stringify(instance.courseName)})'>
+                        <i class="fas fa-bullhorn"></i> Publish Result
+                    </button>
+                    <button class="btn danger" onclick='deleteExamInstanceSubmissions(${JSON.stringify(instance.examId)}, ${JSON.stringify(instance.courseCode)})'>
+                        <i class="fas fa-trash"></i> Delete Submissions
+                    </button>
+                </div>
+            </div>`;
+        });
+
+        html += `</div>`;
+        container.innerHTML = html;
+    }
+
+    function showExamInstanceDetails(courseKey, instanceKey) {
+        const course = window.courseGroupsData[courseKey];
+        const instance = course?.instances?.[instanceKey];
+        if (!instance) {
+            toast('Exam instance not found');
+            return;
+        }
+        currentCourseData = instance;
+        sessionStorage.setItem('currentSubmissionView', 'exam_instance');
+        sessionStorage.setItem('currentCourseCode', courseKey);
+        sessionStorage.setItem('currentExamInstanceKey', instanceKey);
+        sessionStorage.setItem('currentSubmissionExamId', String(instance.examId || ''));
+        renderFullSubmissionPage(instance);
+    }
+
+    async function publishSingleExamInstance(examId, courseName) {
+        if (!confirm(`Publish results for ${courseName}? Students will be able to view them.`)) return;
+        showLoading('Publishing result...');
+        const result = await apiRequest('publish_results', { exam_id: examId });
+        hideLoading();
+        toast(result.success ? 'Result published' : ('Publish failed: ' + (result.error || 'Unknown error')));
+    }
+
+    async function deleteExamInstanceSubmissions(examId, courseCode) {
+        if (!confirm(`Delete all submissions for this ${courseCode} exam instance? This cannot be undone.`)) return;
+        showLoading('Deleting submissions...');
+        const result = await apiRequest('delete_course_submissions', { exam_ids: JSON.stringify([Number(examId)]) });
+        hideLoading();
+        if (result.success) {
+            toast(`Deleted ${result.deleted || 0} submission(s)`);
+            await loadSubmissions();
+        } else {
+            toast('Delete failed: ' + (result.error || 'Unknown error'));
+        }
     }
 
     // Render the complete submission page (all filters, stats, table) for a specific course
     function renderFullSubmissionPage(course) {
         const container = document.getElementById('submissionsContainer');
-        const courseSubmissions = course.submissions;
+        const courseSubmissions = dedupeSubmissionsByExamStudent(course.submissions);
         const examDetail = course.examDetail;
 
         // Filter submissions for this course only
         const filteredSubmissions = originalSubmissionsData.filter(s => {
             const examDetail2 = examDetailsCache[s.exam_id];
             const subCourseCode = examDetail2 ? examDetail2.course_code : (s.course_code || '');
-            const subCourseName = examDetail2 ? examDetail2.title : (s.exam_title || '');
+            const subCourseName = examDetail2 ? (examDetail2.course_name || examDetail2.title) : (s.course_name || s.exam_title || '');
             return subCourseCode === course.courseCode && subCourseName === course.courseName;
         });
 
@@ -13123,8 +17060,9 @@ function createCourseTable($courseCode)
         const passRate = studentCount > 0 ? roundToWholeNumber((passed / studentCount) * 100) : 0;
 
         // Check if all students have class scores
-        const allHaveClassScores = courseSubmissions.every(sub => studentClassScores[sub.student_identifier] !==
-            undefined);
+        const allHaveClassScores = courseSubmissions.every(sub => getSubmissionGrading(sub).class_score !== undefined ||
+            studentClassScores[`${sub.exam_id}:${sub.student_identifier}`] !== undefined ||
+            studentClassScores[sub.student_identifier] !== undefined);
 
         // Get course details for header
         const schoolName = examDetail?.school_name || 'Pentecost University';
@@ -13134,7 +17072,7 @@ function createCourseTable($courseCode)
         const semester = examDetail?.semester || course.semester;
         const academicYear = examDetail?.academic_year || `${new Date().getFullYear()}/${new Date().getFullYear() + 1}`;
         const intake = examDetail?.intake || '1';
-        const courseName = examDetail?.title || course.courseName;
+        const courseName = examDetail?.course_name || examDetail?.title || course.courseName;
         const courseCode = examDetail?.course_code || course.courseCode;
         const courseKey = course.courseKey || `${courseCode}::${courseName}`;
 
@@ -13183,10 +17121,6 @@ function createCourseTable($courseCode)
                         style="background: linear-gradient(135deg, #f59e0b, #d97706); color: white;">
                         <i class="fas fa-calculator"></i> Grade Calculator
                     </button>
-                    <button class="btn" onclick="openPrintModal()"
-                        style="background: linear-gradient(135deg, #6b7280, #4b5563); color: white;">
-                        <i class="fas fa-print"></i> Print Score Sheet
-                    </button>
                     <button class="btn warn" onclick='downloadCourseSubmissions(${JSON.stringify(courseKey)})'
                         style="background: linear-gradient(135deg, #8b5cf6, #7c3aed); color: white;">
                         <i class="fas fa-folder-download"></i> Download All Submissions (ZIP)
@@ -13196,7 +17130,7 @@ function createCourseTable($courseCode)
         </div>
         
         <!-- Class Score Entry Section -->
-        <div style="background: linear-gradient(135deg, rgba(59,130,246,0.1), rgba(139,92,246,0.1)); border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid var(--border);">
+        <div class="course-class-score-panel" style="background: linear-gradient(135deg, rgba(59,130,246,0.1), rgba(139,92,246,0.1)); border-radius: 12px; padding: 20px; margin: 20px 0; border: 1px solid var(--border);">
             <h4 style="margin: 0 0 15px 0;"><i class="fas fa-chart-line"></i> Class Score Entry (Max 40 points)</h4>
             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px;">
                 <div class="field" style="margin-bottom: 0;">
@@ -13247,7 +17181,7 @@ function createCourseTable($courseCode)
         </div>
         
         <!-- Grade Distribution -->
-        <div style="background: var(--panel); border-radius: 16px; padding: 20px; margin-bottom: 20px; border: 1px solid var(--border);">
+        <div class="course-grade-distribution-panel" style="background: var(--panel); border-radius: 16px; padding: 20px; margin: 20px 0; border: 1px solid var(--border);">
             <h4 style="margin: 0 0 15px 0;"><i class="fas fa-chart-pie"></i> Grade Distribution</h4>
             <div style="display: flex; gap: 15px; flex-wrap: wrap; justify-content: space-between;">
                 <div style="text-align: center; min-width: 70px; padding: 10px;  border-radius: 12px;">
@@ -13320,6 +17254,7 @@ function createCourseTable($courseCode)
                         <th style="border: 1px solid #000; padding: 12px; text-align: center;">Grade</th>
                         <th style="border: 1px solid #000; padding: 12px; text-align: center;">GP</th>
                         <th style="border: 1px solid #000; padding: 12px; text-align: center;">Status</th>
+                        <th style="border: 1px solid #000; padding: 12px; text-align: center;">Submitted</th>
                         <th style="border: 1px solid #000; padding: 12px; text-align: center;">Actions</th>
                     </tr>
                 </thead>
@@ -13346,7 +17281,7 @@ function createCourseTable($courseCode)
             }
 
             const scoreColor = totalScore >= 70 ? '#10b981' : (totalScore >= 50 ? '#f59e0b' : '#ef4444');
-            const hasClassScore = studentClassScores[studentId] !== undefined;
+            const submittedLabel = formatQodaDateTime(submittedDateValue(sub));
 
             html += `
             <tr data-student-name="${studentName.toLowerCase()}" data-student-id="${studentId.toLowerCase()}" data-status="${status}">
@@ -13381,16 +17316,18 @@ function createCourseTable($courseCode)
                 <td style="border: 1px solid #000; padding: 12px; text-align: center;">
                     <span class="tag ${statusClass}">${statusText}</span>
                 </td>
+                <td style="border: 1px solid #000; padding: 12px; text-align: center;">
+                    <small>${escapeHTML(submittedLabel)}</small>
+                </td>
                 <td style="border: 1px solid #000; padding: 12px; text-align: center; white-space: nowrap;">
                     <button class="btn primary small" onclick="openQuestionReview(${sub.id})" 
                         style="padding: 6px 12px; margin: 2px;">
                         <i class="fas fa-eye"></i> Review & Mark
                     </button>
-
-<button class="btn info small" onclick="openFullIDE(${sub.id}, '${escapeHTML(sub.student_name)}', '${escapeHTML(sub.student_identifier)}')" style="margin-left: 5px;">
-    <i class="fas fa-code"></i> IDE Compiler
-</button>
-                    
+                    <button class="btn danger small" onclick="deleteSubmissionFromCurrentView(${sub.id})"
+                        style="padding: 6px 12px; margin: 2px;">
+                        <i class="fas fa-trash"></i> Delete
+                    </button>
                     <button class="btn success small" onclick="downloadSubmission(${sub.id})" 
                         style="padding: 6px 12px; margin: 2px;">
                         <i class="fas fa-download"></i> Download ZIP
@@ -13404,7 +17341,7 @@ function createCourseTable($courseCode)
                 </tbody>
                 <tfoot style="background: #f9f9f9;">
                     <tr>
-                        <td colspan="9" style="border: 1px solid #000; padding: 8px; text-align: right;"><strong>Total Students:</strong></td>
+                        <td colspan="10" style="border: 1px solid #000; padding: 8px; text-align: right;"><strong>Total Students:</strong></td>
                         <td style="border: 1px solid #000; padding: 8px; text-align: center;"><strong>${studentCount}</strong></td>
                     </tr>
                 </tfoot>
@@ -13413,9 +17350,34 @@ function createCourseTable($courseCode)
     `;
 
         container.innerHTML = html;
+        const courseTable = container.querySelector('#courseSubmissionsTable');
+        const courseClassPanel = container.querySelector('.course-class-score-panel');
+        const courseGradePanel = container.querySelector('.course-grade-distribution-panel');
+        const tableWrap = courseTable?.closest('div');
+        if (tableWrap && courseClassPanel) {
+            tableWrap.insertAdjacentElement('afterend', courseClassPanel);
+        }
+        if (courseClassPanel && courseGradePanel) {
+            courseClassPanel.insertAdjacentElement('afterend', courseGradePanel);
+        } else if (tableWrap && courseGradePanel) {
+            tableWrap.insertAdjacentElement('afterend', courseGradePanel);
+        }
 
         // Store current course code for filters
         window.currentCourseCode = courseCode;
+    }
+
+    async function deleteSubmissionFromCurrentView(submissionId) {
+        if (!confirm('Delete this student submission? This cannot be undone.')) return;
+        showLoading('Deleting submission...');
+        const result = await apiRequest('delete_student_submission', { submission_id: submissionId });
+        hideLoading();
+        if (result.success) {
+            toast('Submission deleted');
+            await loadSubmissions();
+        } else {
+            toast('Delete failed: ' + (result.error || 'Unknown error'));
+        }
     }
 
     // Filter submissions within the current course view
@@ -13491,7 +17453,7 @@ function createCourseTable($courseCode)
             return;
         }
 
-        const course = window.courseGroupsData[courseCode];
+        const course = window.courseGroupsData[courseCode] || currentCourseData;
         const submission = course.submissions.find(s => s.student_identifier === studentId);
 
         if (!submission) {
@@ -13513,7 +17475,9 @@ function createCourseTable($courseCode)
 
     // Edit class score for a student
     async function editClassScoreForCourse(studentId, studentName, courseCode) {
-        const currentScore = studentClassScores[studentId] || 0;
+        const course = window.courseGroupsData[courseCode] || currentCourseData;
+        const submissionForScore = course?.submissions?.find(s => s.student_identifier === studentId);
+        const currentScore = submissionForScore ? getClassScoreForSubmission(submissionForScore) : (studentClassScores[studentId] || 0);
         const newScore = prompt(`Enter class score for ${studentName} (0-40):`, currentScore);
 
         if (newScore !== null) {
@@ -13527,8 +17491,6 @@ function createCourseTable($courseCode)
                 toast('❌ Class score cannot exceed 40');
                 return;
             }
-
-            const course = window.courseGroupsData[courseCode];
             const submission = course.submissions.find(s => s.student_identifier === studentId);
             if (submission) {
                 await persistClassScore(submission, scoreNum);
@@ -13548,6 +17510,8 @@ function createCourseTable($courseCode)
         // Clear session storage
         sessionStorage.removeItem('currentSubmissionView');
         sessionStorage.removeItem('currentCourseCode');
+        sessionStorage.removeItem('currentExamInstanceKey');
+        sessionStorage.removeItem('currentSubmissionExamId');
 
         // Clear search inputs
         const courseSearch = document.getElementById('courseSearchInput');
@@ -13592,14 +17556,15 @@ function createCourseTable($courseCode)
 
     // Mark all submissions in a course as graded
     async function markAllCourseAsGraded(courseCode) {
-        const course = window.courseGroupsData[courseCode];
+        const course = window.courseGroupsData[courseCode] || currentCourseData;
         if (!course) return;
 
         const courseSubmissions = course.submissions;
 
         // Check if all students have class scores
-        const allHaveClassScores = courseSubmissions.every(s => studentClassScores[s.student_identifier] !==
-            undefined);
+        const allHaveClassScores = courseSubmissions.every(s => getSubmissionGrading(s).class_score !== undefined ||
+            studentClassScores[`${s.exam_id}:${s.student_identifier}`] !== undefined ||
+            studentClassScores[s.student_identifier] !== undefined);
 
         if (!allHaveClassScores) {
             toast('❌ Please fill in class scores for all students in this course first');
@@ -13617,7 +17582,7 @@ function createCourseTable($courseCode)
                 submission.status = 'GRADED';
 
                 const examScore = roundToWholeNumber(convertTo60Scale(parseFloat(submission.percentage) || 0));
-                const classScore = studentClassScores[submission.student_identifier] || 0;
+                const classScore = getClassScoreForSubmission(submission);
                 const totalScore = roundToWholeNumber(convertTo100Scale(examScore, classScore));
                 const gradeInfo = getGradeInfo(totalScore);
 
@@ -13645,7 +17610,7 @@ function createCourseTable($courseCode)
 
     // Download all submissions for a course
     async function downloadCourseSubmissions(courseCode) {
-        const course = window.courseGroupsData[courseCode];
+        const course = window.courseGroupsData[courseCode] || currentCourseData;
         if (!course) return;
 
         const courseSubmissions = course.submissions;
@@ -13700,7 +17665,7 @@ function createCourseTable($courseCode)
 
     // Export course to Excel
     function exportCourseToExcel(courseCode) {
-        const course = window.courseGroupsData[courseCode];
+        const course = window.courseGroupsData[courseCode] || currentCourseData;
         if (!course) return;
 
         const exportData = course.submissions.map(sub => {
@@ -13747,6 +17712,7 @@ function createCourseTable($courseCode)
     let currentSemester = '';
     let currentCourseCode = '';
     let currentSearchTerm = '';
+    let currentResultTimeFrame = '';
 
     // Initialize results page
     async function initResultsPage() {
@@ -13880,6 +17846,19 @@ function createCourseTable($courseCode)
                     <input type="text" id="resultSearchInput" placeholder="Search by Student ID or Name..." 
                         style="width: 100%; padding: 12px; border-radius: 10px; border: 2px solid var(--border); background: var(--input-bg);">
                 </div>
+                <div class="field" style="margin-bottom: 0;">
+                    <label style="display: block; margin-bottom: 8px; font-weight: 600;">
+                        <i class="fas fa-clock"></i> Time Frame
+                    </label>
+                    <select id="resultTimeFrameSelect" style="width: 100%; padding: 12px; border-radius: 10px; border: 2px solid var(--border); background: var(--input-bg);">
+                        <option value="">All Dates</option>
+                        <option value="today">Today</option>
+                        <option value="7">Last 7 Days</option>
+                        <option value="30">Last 30 Days</option>
+                        <option value="month">This Month</option>
+                        <option value="year">This Year</option>
+                    </select>
+                </div>
             </div>
             <div style="display: flex; gap: 12px; justify-content: flex-end;">
                 <button class="btn" onclick="resetResultsFilters()">
@@ -13901,10 +17880,12 @@ function createCourseTable($courseCode)
         const semesterSelect = document.getElementById('resultSemesterSelect');
         const courseSelect = document.getElementById('resultCourseSelect');
         const searchInput = document.getElementById('resultSearchInput');
+        const timeFrameSelect = document.getElementById('resultTimeFrameSelect');
 
         currentSemester = semesterSelect ? semesterSelect.value : '';
         currentCourseCode = courseSelect ? courseSelect.value : '';
         currentSearchTerm = searchInput ? searchInput.value : '';
+        currentResultTimeFrame = timeFrameSelect ? timeFrameSelect.value : '';
 
         renderResultsTable();
     }
@@ -13914,14 +17895,17 @@ function createCourseTable($courseCode)
         currentSemester = '';
         currentCourseCode = '';
         currentSearchTerm = '';
+        currentResultTimeFrame = '';
 
         const semesterSelect = document.getElementById('resultSemesterSelect');
         const courseSelect = document.getElementById('resultCourseSelect');
         const searchInput = document.getElementById('resultSearchInput');
+        const timeFrameSelect = document.getElementById('resultTimeFrameSelect');
 
         if (semesterSelect) semesterSelect.value = '';
         if (courseSelect) courseSelect.value = '';
         if (searchInput) searchInput.value = '';
+        if (timeFrameSelect) timeFrameSelect.value = '';
 
         const tableContainer = document.getElementById('resultsTableContainer');
         if (tableContainer) {
@@ -13942,22 +17926,22 @@ function createCourseTable($courseCode)
 
     function getSubmissionScoreParts(sub) {
         const grading = getSubmissionGrading(sub);
-        const classSource = grading.class_score ?? studentClassScores[sub.student_identifier] ?? 0;
+        const classSource = sub.class_score ?? grading.class_score ?? studentClassScores[`${sub.exam_id}:${sub.student_identifier}`] ?? studentClassScores[sub.student_identifier] ?? 0;
         const classScore = clampScore(classSource, 0, 40);
 
         let examScore;
-        if (grading.exam_score !== undefined && grading.exam_score !== null && grading.exam_score !== '') {
-            examScore = clampScore(grading.exam_score, 0, 60);
-        } else if (sub.exam_score !== undefined && sub.exam_score !== null && sub.exam_score !== '') {
+        if (sub.exam_score !== undefined && sub.exam_score !== null && sub.exam_score !== '') {
             examScore = clampScore(sub.exam_score, 0, 60);
+        } else if (grading.exam_score !== undefined && grading.exam_score !== null && grading.exam_score !== '') {
+            examScore = clampScore(grading.exam_score, 0, 60);
         } else {
             examScore = clampScore(convertTo60Scale(parseFloat(sub.percentage) || 0), 0, 60);
         }
 
         const totalScore = clampScore(examScore + classScore, 0, 100);
         const fallbackGradeInfo = getGradeInfo(totalScore);
-        const grade = grading.grade || fallbackGradeInfo.grade;
-        const gradePoint = parseFloat(grading.grade_point ?? fallbackGradeInfo.gradePoint);
+        const grade = sub.grade || grading.grade || fallbackGradeInfo.grade;
+        const gradePoint = parseFloat(sub.grade_point ?? grading.grade_point ?? fallbackGradeInfo.gradePoint);
         return { classScore, examScore, totalScore, grade, gradePoint };
     }
 
@@ -13978,6 +17962,27 @@ function createCourseTable($courseCode)
             });
         }
 
+        if (currentResultTimeFrame) {
+            const now = new Date();
+            const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+            const startOfYear = new Date(now.getFullYear(), 0, 1);
+            filteredSubmissions = filteredSubmissions.filter(sub => {
+                const examDetail = examDetailsCache[sub.exam_id] || {};
+                const examDate = parseQodaDate(examDetail.start_datetime || sub.start_datetime || submittedDateValue(sub));
+                if (!examDate) return false;
+                if (currentResultTimeFrame === 'today') return examDate >= startOfToday;
+                if (currentResultTimeFrame === 'month') return examDate >= startOfMonth;
+                if (currentResultTimeFrame === 'year') return examDate >= startOfYear;
+                const days = parseInt(currentResultTimeFrame, 10);
+                if (!Number.isNaN(days)) {
+                    const since = new Date(now.getTime() - (days * 24 * 60 * 60 * 1000));
+                    return examDate >= since;
+                }
+                return true;
+            });
+        }
+
         if (currentSearchTerm) {
             const searchLower = currentSearchTerm.toLowerCase();
             filteredSubmissions = filteredSubmissions.filter(sub =>
@@ -13987,12 +17992,15 @@ function createCourseTable($courseCode)
         }
 
         const groups = {};
-        filteredSubmissions.forEach(sub => {
+        dedupeSubmissionsByExamStudent(filteredSubmissions).forEach(sub => {
             const examDetail = examDetailsCache[sub.exam_id] || {};
             const courseCode = examDetail.course_code || sub.course_code || 'N/A';
-            const courseName = examDetail.title || sub.exam_title || 'Unknown Course';
+            const courseName = examDetail.course_name || sub.course_name || examDetail.title || sub.exam_title || 'Unknown Course';
             const semester = examDetail.semester || 'N/A';
-            const key = `${courseName}::${courseCode}::${semester}`;
+            const startValue = examDetail.start_datetime || sub.start_datetime || '';
+            const schoolType = examDetail.school_type || sub.school_type || 'Weekend';
+            const academicYear = examDetail.academic_year || sub.academic_year || '';
+            const key = `${courseName}::${courseCode}::${semester}::${schoolType}::${academicYear}::${startValue}::${sub.exam_id}`;
 
             if (!groups[key]) {
                 groups[key] = {
@@ -14000,10 +18008,12 @@ function createCourseTable($courseCode)
                     courseName,
                     courseCode,
                     semester,
+                    startDateTime: startValue,
+                    dateLabel: formatQodaDateTime(startValue),
                     level: examDetail.level || 'N/A',
-                    academicYear: examDetail.academic_year || '',
+                    academicYear,
                     programme: examDetail.programme || examDetail.department || 'BIT',
-                    schoolType: examDetail.school_type || examDetail.school || 'Weekend',
+                    schoolType,
                     schoolName: examDetail.school_name || 'PENTECOST UNIVERSITY',
                     intake: examDetail.intake || '0',
                     examIds: [],
@@ -14034,7 +18044,7 @@ function createCourseTable($courseCode)
         });
 
         return Object.values(groups).sort((a, b) =>
-            `${a.courseName} ${a.courseCode} ${a.semester}`.localeCompare(`${b.courseName} ${b.courseCode} ${b.semester}`)
+            `${a.courseName} ${a.courseCode} ${a.semester} ${a.startDateTime}`.localeCompare(`${b.courseName} ${b.courseCode} ${b.semester} ${b.startDateTime}`)
         );
     }
 
@@ -14073,13 +18083,13 @@ function createCourseTable($courseCode)
                             <h2 style="margin: 0 0 8px 0;">${escapeHTML(group.courseName)}</h2>
                             <h3 style="margin: 0 0 8px 0;">SCORE SHEET</h3>
                             <p style="margin: 0; opacity: 0.95;">Course Code: ${escapeHTML(group.courseCode)} | Semester: ${escapeHTML(group.semester)} | Level: ${escapeHTML(group.level)}</p>
+                            <p style="margin: 6px 0 0; opacity: 0.9;">${escapeHTML(group.schoolType)} | ${escapeHTML(group.academicYear || 'Academic year not set')} | ${escapeHTML(group.dateLabel)}</p>
                             <p style="margin: 6px 0 0; opacity: 0.85;">${group.submissions.length} student submission(s)</p>
                         </div>
                         <div class="result-sheet-actions" style="display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end;">
                             <button class="btn ok small" onclick="publishCourseResults('${keyToken}')"><i class="fas fa-upload"></i> Publish</button>
                             <button class="btn success small" onclick="exportCourseResultsToExcel('${keyToken}')"><i class="fas fa-file-excel"></i> Excel</button>
                             <button class="btn primary small" onclick="printCourseResults('${keyToken}')"><i class="fas fa-print"></i> Print</button>
-                            <button class="btn danger small" onclick="deleteCourseSubmissions('${keyToken}')"><i class="fas fa-trash"></i> Delete Course Submissions</button>
                         </div>
                     </div>
                 </div>
@@ -14426,6 +18436,7 @@ function createCourseTable($courseCode)
         const previousCourse = currentCourseCode;
         const previousSemester = currentSemester;
         const previousSearch = currentSearchTerm;
+        const previousTimeFrame = currentResultTimeFrame;
         showLoading('Deleting submission...');
         const result = await apiRequest('delete_student_submission', { submission_id: submissionId });
         hideLoading();
@@ -14435,12 +18446,15 @@ function createCourseTable($courseCode)
             currentCourseCode = previousCourse;
             currentSemester = previousSemester;
             currentSearchTerm = previousSearch;
+            currentResultTimeFrame = previousTimeFrame;
             const courseSelect = document.getElementById('resultCourseSelect');
             const semesterSelect = document.getElementById('resultSemesterSelect');
             const searchInput = document.getElementById('resultSearchInput');
+            const timeFrameSelect = document.getElementById('resultTimeFrameSelect');
             if (courseSelect) courseSelect.value = currentCourseCode;
             if (semesterSelect) semesterSelect.value = currentSemester;
             if (searchInput) searchInput.value = currentSearchTerm;
+            if (timeFrameSelect) timeFrameSelect.value = currentResultTimeFrame;
             renderResultsTable();
         } else {
             toast('Delete failed: ' + (result.error || 'Unknown error'));
@@ -14458,6 +18472,7 @@ function createCourseTable($courseCode)
         const previousCourse = currentCourseCode;
         const previousSemester = currentSemester;
         const previousSearch = currentSearchTerm;
+        const previousTimeFrame = currentResultTimeFrame;
         showLoading('Deleting course submissions...');
         const result = await apiRequest('delete_course_submissions', { exam_ids: JSON.stringify(group.examIds) });
         hideLoading();
@@ -14467,12 +18482,15 @@ function createCourseTable($courseCode)
             currentCourseCode = previousCourse;
             currentSemester = previousSemester;
             currentSearchTerm = previousSearch;
+            currentResultTimeFrame = previousTimeFrame;
             const courseSelect = document.getElementById('resultCourseSelect');
             const semesterSelect = document.getElementById('resultSemesterSelect');
             const searchInput = document.getElementById('resultSearchInput');
+            const timeFrameSelect = document.getElementById('resultTimeFrameSelect');
             if (courseSelect) courseSelect.value = currentCourseCode;
             if (semesterSelect) semesterSelect.value = currentSemester;
             if (searchInput) searchInput.value = currentSearchTerm;
+            if (timeFrameSelect) timeFrameSelect.value = currentResultTimeFrame;
             renderResultsTable();
         } else {
             toast('Delete failed: ' + (result.error || 'Unknown error'));
@@ -14560,6 +18578,7 @@ function createCourseTable($courseCode)
                 <td class="action-buttons" style="white-space: nowrap;">
                     <button class="action-btn" onclick="viewStudentCourses(${s.id})" title="View All Courses"><i class="fas fa-book"></i></button>
                     <button class="action-btn" onclick="editStudentById(${s.id})" title="Edit Student"><i class="fas fa-edit"></i></button>
+                    <button class="action-btn" onclick="showMigrateLevelModal(${s.id}, '${escapeHTML(s.full_name)}', '${escapeHTML(s.level || '')}')" title="Migrate Level"><i class="fas fa-level-up-alt"></i></button>
                     <button class="action-btn" onclick="showEnrollModal(${s.id}, '${escapeHTML(s.full_name)}')" title="Enroll in Additional Course"><i class="fas fa-plus-circle"></i></button>
                     <button class="action-btn" onclick="resetStudentPasswordById(${s.id})" title="Reset Password"><i class="fas fa-key"></i></button>
                     <button class="action-btn" onclick="deleteStudentById(${s.id})" title="Delete" style="color: #ef4444;"><i class="fas fa-trash"></i></button>
@@ -14720,6 +18739,78 @@ function createCourseTable($courseCode)
         filteredStudentDetails = [...allStudentsDetails];
         renderStudentDetailsTable();
         toast('Filters reset. Showing all students');
+    }
+
+    function showMigrateLevelModal(studentId, studentName, currentLevel = '') {
+        document.getElementById('migrateStudentId').value = studentId;
+        document.getElementById('migrateStudentName').textContent =
+            `${studentName || 'Student'}${currentLevel ? ' - current level ' + currentLevel : ''}`;
+        const levelSelect = document.getElementById('migrateStudentLevel');
+        if (levelSelect && currentLevel) levelSelect.value = currentLevel;
+        const modal = document.getElementById('migrateLevelModal');
+        if (modal) modal.style.display = 'flex';
+    }
+
+    function closeMigrateLevelModal() {
+        const modal = document.getElementById('migrateLevelModal');
+        if (modal) modal.style.display = 'none';
+    }
+
+    async function submitMigrateLevel() {
+        const studentId = document.getElementById('migrateStudentId')?.value;
+        const level = document.getElementById('migrateStudentLevel')?.value;
+        if (!studentId || !level) {
+            toast('Please select a student and level');
+            return;
+        }
+        if (!(await confirmPopup(`Move this student to Level ${level}?`, 'Migrate level', 'Migrate'))) return;
+        const result = await apiRequest('migrate_student_level', {
+            student_id: studentId,
+            level
+        });
+        if (result.success) {
+            toast(result.message || `Student moved to Level ${level}`);
+            closeMigrateLevelModal();
+            await loadStudents();
+            loadDashboardStats();
+        } else {
+            toast('❌ ' + (result.error || 'Failed to migrate student'));
+        }
+    }
+
+    async function bulkMigrateShownStudents() {
+        const visibleStudents = (Array.isArray(filteredStudents) && filteredStudents.length ? filteredStudents : allStudents)
+            .filter(student => student && student.id);
+        if (!visibleStudents.length) {
+            toast('No students are currently shown to migrate');
+            return;
+        }
+
+        const level = String(prompt('Move all currently shown students to which level? Enter 100, 200, 300, 400, or 500:', '200') || '').trim();
+        if (!['100', '200', '300', '400', '500'].includes(level)) {
+            toast('Please enter a valid level: 100, 200, 300, 400, or 500');
+            return;
+        }
+
+        const confirmed = await confirmPopup(
+            `Move ${visibleStudents.length} currently shown student(s) to Level ${level}?`,
+            'Bulk migrate students',
+            'Migrate All'
+        );
+        if (!confirmed) return;
+
+        const result = await apiRequest('bulk_migrate_student_level', {
+            level,
+            student_ids: JSON.stringify(visibleStudents.map(student => student.id))
+        });
+
+        if (result.success) {
+            toast(result.message || `Migrated ${visibleStudents.length} student(s) to Level ${level}`);
+            await loadStudents();
+            loadDashboardStats();
+        } else {
+            toast('Failed to migrate students: ' + (result.error || 'Unknown error'));
+        }
     }
 
     function showAddStudentModal() {
@@ -15193,7 +19284,7 @@ function createCourseTable($courseCode)
         originalSubmissionsData.forEach(sub => {
             const examDetail = examDetailsCache[sub.exam_id];
             const courseCode = examDetail ? examDetail.course_code : (sub.course_code || '');
-            const courseName = examDetail ? examDetail.title : (sub.exam_title || '');
+            const courseName = examDetail ? (examDetail.course_name || examDetail.title) : (sub.course_name || sub.exam_title || '');
             if (courseCode && courseName) {
                 courses.add(JSON.stringify({
                     code: courseCode,
@@ -15690,7 +19781,7 @@ function createCourseTable($courseCode)
             const totalScore = roundToWholeNumber(convertTo100Scale(examScore, classScore));
             const gradeInfo = getGradeInfo(totalScore);
             const examDetail = examDetailsCache[sub.exam_id];
-            const courseName = examDetail ? examDetail.title : (sub.exam_title || 'Unknown');
+            const courseName = examDetail ? (examDetail.course_name || examDetail.title) : (sub.course_name || sub.exam_title || 'Unknown');
             const date = new Date(sub.submitted_at || sub.submittedAt);
             const formattedDate = date.toLocaleString();
 
@@ -15902,9 +19993,10 @@ function createCourseTable($courseCode)
         const gradeInfo = getGradeInfo(totalScore);
 
         submission.status = 'GRADED';
+        studentClassScores[`${submission.exam_id}:${submission.student_identifier}`] = classScore;
         studentClassScores[submission.student_identifier] = classScore;
 
-        await apiRequest('update_submission_grade', {
+        const result = await apiRequest('update_submission_grade', {
             submission_id: submission.id,
             status: 'GRADED',
             total_score: totalScore,
@@ -15913,6 +20005,15 @@ function createCourseTable($courseCode)
             grade: gradeInfo.grade,
             grade_point: gradeInfo.gradePoint
         });
+
+        if (result && result.success && result.grade) {
+            submission.class_score = result.grade.class_score;
+            submission.exam_score = result.grade.exam_score;
+            submission.total_score = result.grade.total_score;
+            submission.grade = result.grade.grade;
+            submission.grade_point = result.grade.grade_point;
+            submission.status = result.grade.status || 'GRADED';
+        }
 
         return { examScore, totalScore, gradeInfo };
     }
@@ -15960,38 +20061,33 @@ function createCourseTable($courseCode)
                 if (result.data.length === 0) {
                     showEmptySubmissionsState();
                 } else {
-                    // Group the data first
-                    const groupedByCourse = {};
-                    originalSubmissionsData.forEach(sub => {
-                        const examDetail = examDetailsCache[sub.exam_id];
-                        const courseCode = examDetail ? examDetail.course_code : (sub.course_code ||
-                            'Unknown');
-                        const courseName = examDetail ? examDetail.title : (sub.exam_title ||
-                            'Unknown Course');
-                        const courseKey = `${courseCode}::${courseName}`;
-                        const level = examDetail ? examDetail.level : 'N/A';
-                        const semester = examDetail ? examDetail.semester : 'N/A';
+                    renderCourseCardsView(originalSubmissionsData);
+                    const requestedView = sessionStorage.getItem('currentSubmissionView');
+                    const requestedExamId = sessionStorage.getItem('currentSubmissionExamId');
+                    const requestedCourseKey = sessionStorage.getItem('currentCourseCode');
+                    const requestedInstanceKey = sessionStorage.getItem('currentExamInstanceKey');
 
-                        if (!groupedByCourse[courseKey]) {
-                            groupedByCourse[courseKey] = {
-                                courseKey: courseKey,
-                                courseCode: courseCode,
-                                courseName: courseName,
-                                level: level,
-                                semester: semester,
-                                submissions: [],
-                                examDetail: examDetail
-                            };
+                    if (requestedView === 'exam_instance') {
+                        const groups = window.courseGroupsData || {};
+                        let restored = false;
+                        if (requestedCourseKey && requestedInstanceKey && groups[requestedCourseKey]?.instances?.[requestedInstanceKey]) {
+                            showExamInstanceDetails(requestedCourseKey, requestedInstanceKey);
+                            restored = true;
+                        } else if (requestedExamId) {
+                            for (const course of Object.values(groups)) {
+                                const instance = Object.values(course.instances || {}).find(item => String(item.examId) === String(requestedExamId));
+                                if (instance) {
+                                    showExamInstanceDetails(course.courseKey, instance.instanceKey);
+                                    restored = true;
+                                    break;
+                                }
+                            }
                         }
-                        groupedByCourse[courseKey].submissions.push(sub);
-                    });
-                    window.courseGroupsData = groupedByCourse;
-
-                    if (currentExpandedCourse && window.courseGroupsData[currentExpandedCourse]) {
+                        if (!restored && currentExpandedCourse && window.courseGroupsData[currentExpandedCourse]) {
+                            showCourseDetails(currentExpandedCourse);
+                        }
+                    } else if (currentExpandedCourse && window.courseGroupsData[currentExpandedCourse]) {
                         showCourseDetails(currentExpandedCourse);
-                    } else {
-                        // Show course cards (FIRST VIEW)
-                        renderCourseCardsView(originalSubmissionsData);
                     }
                 }
             } else {
@@ -16009,6 +20105,7 @@ function createCourseTable($courseCode)
         originalSubmissionsData.forEach(sub => {
             const grading = getSubmissionGrading(sub);
             if (sub.student_identifier && grading.class_score !== undefined) {
+                studentClassScores[`${sub.exam_id}:${sub.student_identifier}`] = clampScore(grading.class_score, 0, 40);
                 studentClassScores[sub.student_identifier] = clampScore(grading.class_score, 0, 40);
             }
         });
@@ -17195,7 +21292,7 @@ function createCourseTable($courseCode)
         originalSubmissionsData.forEach(sub => {
             const examDetail = examDetailsCache[sub.exam_id];
             const courseKey = examDetail ? examDetail.course_code : sub.course_code;
-            const courseName = examDetail ? examDetail.title : sub.exam_title;
+            const courseName = examDetail ? (examDetail.course_name || examDetail.title) : (sub.course_name || sub.exam_title);
             if (courseKey && !courses[courseKey]) {
                 courses[courseKey] = {
                     code: courseKey,
@@ -17856,6 +21953,31 @@ function createCourseTable($courseCode)
     // 11. PROFILE FUNCTIONS
     // ============================================
 
+    function qodaLecturerProfileImageSource(serverValue = '') {
+        const cached = localStorage.getItem('qoda_lecturer_profile_pic');
+        if (serverValue && serverValue.startsWith('data:image/')) return serverValue;
+        if (cached) return cached;
+        return serverValue || '';
+    }
+
+    function applyLecturerProfileImage(src) {
+        if (!src) return;
+        const profilePicDisplay = document.getElementById('profilePicDisplay');
+        const profileIcon = document.querySelector('.profile-icon');
+        const smallAvatar = document.querySelector('.profile-avatar-small');
+        if (profilePicDisplay) {
+            profilePicDisplay.src = src;
+            profilePicDisplay.style.display = 'block';
+        }
+        if (profileIcon) profileIcon.innerHTML = `<img src="${src}" alt="Profile"><span class="tooltip-text">Profile</span>`;
+        if (smallAvatar) smallAvatar.innerHTML = `<img src="${src}" alt="Profile">`;
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        const cachedProfilePic = localStorage.getItem('qoda_lecturer_profile_pic');
+        if (cachedProfilePic) applyLecturerProfileImage(cachedProfilePic);
+    });
+
     async function loadProfile() {
         try {
             const result = await apiRequest('get_profile');
@@ -17878,23 +22000,11 @@ function createCourseTable($courseCode)
                 if (profileLevels) profileLevels.value = profile.levels_taught || '';
                 if (profileClasses) profileClasses.value = profile.classes || '';
                 if (profileCourses) profileCourses.value = profile.courses || '';
+                renderTeachingCourses(profile.teaching_courses || []);
 
-                const profilePicDisplay = document.getElementById('profilePicDisplay');
-                if (profilePicDisplay) {
-                    if (profile.profile_pic && profile.profile_pic !== '') {
-                        profilePicDisplay.src = profile.profile_pic;
-                        profilePicDisplay.style.display = 'block';
-                    } else {
-                        profilePicDisplay.style.display = 'none';
-                    }
-                }
-
-                const profileIcon = document.querySelector('.profile-icon');
-                const smallAvatar = document.querySelector('.profile-avatar-small');
-                if (profileIcon && profile.profile_pic && profile.profile_pic !== '') {
-                    profileIcon.innerHTML = `<img src="${profile.profile_pic}" alt="Profile">`;
-                    if (smallAvatar) smallAvatar.innerHTML = `<img src="${profile.profile_pic}" alt="Profile">`;
-                }
+                const profilePicSource = qodaLecturerProfileImageSource(profile.profile_pic || '');
+                if (profilePicSource) applyLecturerProfileImage(profilePicSource);
+                else document.getElementById('profilePicDisplay')?.style && (document.getElementById('profilePicDisplay').style.display = 'none');
             }
         } catch (error) {
             console.error('Error loading profile:', error);
@@ -17908,17 +22018,8 @@ function createCourseTable($courseCode)
         const reader = new FileReader();
         reader.onload = function(e) {
             const imgData = e.target.result;
-            const display = document.getElementById('profilePicDisplay');
-            if (display) {
-                display.src = imgData;
-                display.style.display = 'block';
-            }
-
-            const profileIcon = document.querySelector('.profile-icon');
-            if (profileIcon) profileIcon.innerHTML = `<img src="${imgData}" alt="Profile">`;
-
-            const smallAvatar = document.querySelector('.profile-avatar-small');
-            if (smallAvatar) smallAvatar.innerHTML = `<img src="${imgData}" alt="Profile">`;
+            localStorage.setItem('qoda_lecturer_profile_pic', imgData);
+            applyLecturerProfileImage(imgData);
         };
         reader.readAsDataURL(file);
 
@@ -17935,8 +22036,14 @@ function createCourseTable($courseCode)
                 body: formData
             });
             const result = await response.json();
-            if (result.success) toast('✅ Profile picture uploaded');
-            else toast('❌ Upload failed: ' + result.error);
+            if (result.success) {
+                const src = result.preview_url || result.url;
+                if (src) {
+                    localStorage.setItem('qoda_lecturer_profile_pic', src);
+                    applyLecturerProfileImage(src);
+                }
+                toast('✅ Profile picture uploaded');
+            } else toast('❌ Upload failed: ' + result.error);
         } catch (error) {
             console.error('Upload error:', error);
             toast('❌ Upload failed');
@@ -17950,7 +22057,6 @@ function createCourseTable($courseCode)
         const prof = {
             full_name: document.getElementById('profileName')?.value.trim() || '',
             email: document.getElementById('profileEmail')?.value.trim() || '',
-            staff_id: document.getElementById('profileStaffId')?.value.trim() || '',
             department: document.getElementById('profileDepartment')?.value.trim() || '',
             faculty: document.getElementById('profileFaculty')?.value.trim() || '',
             levels_taught: document.getElementById('profileLevels')?.value.trim() || '',
@@ -17982,6 +22088,66 @@ function createCourseTable($courseCode)
                 btn.innerHTML = originalText;
                 btn.disabled = false;
             }
+        }
+    }
+
+    function renderTeachingCourses(courses) {
+        const wrap = document.getElementById('teachingCoursesList');
+        if (!wrap) return;
+        if (!courses.length) {
+            wrap.innerHTML = '<span style="color: var(--muted); font-size: 13px;">No teaching courses added yet.</span>';
+            return;
+        }
+        wrap.innerHTML = courses.map(course => `
+            <span style="display:inline-flex; align-items:center; gap:6px; padding:8px 10px; border-radius:999px; background:rgba(59,130,246,.12); color:var(--text); border:1px solid var(--border); font-size:13px;">
+                <i class="fas fa-book"></i>
+                ${escapeHTML(course.course_code)} - ${escapeHTML(course.course_name)} (Level ${escapeHTML(course.level)})
+            </span>
+        `).join('');
+    }
+
+    async function saveTeachingCourse() {
+        const courseCode = document.getElementById('teachingCourseCode')?.value.trim();
+        const courseName = document.getElementById('teachingCourseName')?.value.trim();
+        const level = document.getElementById('teachingCourseLevel')?.value;
+        if (!courseCode || !courseName || !level) {
+            toast('❌ Course code, course name, and level are required');
+            return;
+        }
+        try {
+            const result = await apiRequest('save_lecturer_course', {
+                course_code: courseCode,
+                course_name: courseName,
+                level
+            });
+            if (result.success) {
+                document.getElementById('teachingCourseCode').value = '';
+                document.getElementById('teachingCourseName').value = '';
+                document.getElementById('teachingCourseLevel').value = '';
+                toast('✅ Teaching course saved');
+                loadProfile();
+            } else {
+                toast('❌ ' + (result.error || 'Could not save teaching course'));
+            }
+        } catch (error) {
+            toast('❌ Network error saving teaching course');
+        }
+    }
+
+    async function deleteLecturerAccount() {
+        const confirmed = await confirmPopup('Delete your lecturer account? This signs you out and disables this account.', 'Delete Account', 'Delete');
+        if (!confirmed) return;
+        const password = prompt('Enter your current password to confirm account deletion:');
+        if (!password) return;
+        try {
+            const result = await apiRequest('delete_lecturer_account', { password });
+            if (result.success) {
+                window.location.href = result.redirect || 'login.php';
+            } else {
+                toast('❌ ' + (result.error || 'Could not delete account'));
+            }
+        } catch (error) {
+            toast('❌ Network error deleting account');
         }
     }
 
@@ -18350,11 +22516,13 @@ function createCourseTable($courseCode)
         };
 
         localStorage.setItem("currentView", route);
+        localStorage.setItem("currentRouteParams", JSON.stringify(params));
         sessionStorage.setItem("currentView", route);
         sessionStorage.setItem("currentRouteParams", JSON.stringify(params));
 
         if (params.id) {
             sessionStorage.setItem("currentExamId", params.id);
+            localStorage.setItem(K_LAST_BUILDER_EXAM, String(params.id));
         }
 
         document.querySelectorAll(".nav-icon").forEach(icon => {
@@ -18387,7 +22555,10 @@ function createCourseTable($courseCode)
 
         const bluebarTitle = document.getElementById("bluebarTitle");
         if (bluebarTitle) {
-            bluebarTitle.innerHTML = `<span style="margin-left:0">${map[route] || "Dashboard"}</span>`;
+            const backButton = route !== 'dashboard'
+                ? `<button type="button" onclick="qodaDashboardBack()" title="Back" style="margin-right:10px;border:1px solid var(--border);background:var(--card);color:var(--text);border-radius:10px;padding:7px 11px;font-weight:800;cursor:pointer;"><i class="fas fa-arrow-left"></i> Back</button>`
+                : '';
+            bluebarTitle.innerHTML = `${backButton}<span style="margin-left:0">${map[route] || "Dashboard"}</span>`;
         }
 
         if (window.history && window.history.pushState) {
@@ -18419,6 +22590,14 @@ function createCourseTable($courseCode)
         if (route === "students") renderStudentsTable();
         if (route === "student-details") renderStudentDetailsTable();
         if (route === "profile") loadProfile();
+    }
+
+    function qodaDashboardBack() {
+        if (window.history.length > 1) {
+            window.history.back();
+            return;
+        }
+        go('dashboard');
     }
 
     function debugCurrentExam() {
@@ -18566,6 +22745,11 @@ function createCourseTable($courseCode)
         const submenuId = element.getAttribute('data-submenu');
         const submenu = submenusData[submenuId];
         if (!submenu) return;
+        if (submenu.items && submenu.items.length === 1) {
+            closeSubmenuPanel();
+            handleNavClick(element, submenu.items[0].page);
+            return;
+        }
 
         const panel = document.getElementById('submenuPanel');
         const content = document.getElementById('submenuContent');
@@ -18618,6 +22802,11 @@ function createCourseTable($courseCode)
         const submenuId = element.getAttribute('data-submenu');
         const submenu = submenusData[submenuId];
         if (!submenu) return;
+        if (submenu.items && submenu.items.length === 1) {
+            closeSubmenuPanel();
+            handleNavClick(element, submenu.items[0].page);
+            return;
+        }
 
         const panel = document.getElementById('submenuPanel');
         const overlay = document.getElementById('submenuOverlay');
@@ -18713,6 +22902,11 @@ function createCourseTable($courseCode)
         const submenuId = element.getAttribute('data-submenu');
         const submenu = submenusData[submenuId];
         if (!submenu) return;
+        if (submenu.items && submenu.items.length === 1) {
+            closeSubmenuPanel();
+            handleNavClick(element, submenu.items[0].page);
+            return;
+        }
 
         const panel = document.getElementById('submenuPanel');
         const content = document.getElementById('submenuContent');
@@ -18783,6 +22977,7 @@ function createCourseTable($courseCode)
 
         const icon = document.getElementById('themeIcon');
         if (icon) icon.className = isDark ? 'fas fa-sun' : 'fas fa-moon';
+        refreshQodaModelEditorThemes();
     }
 
     function updateChartsTheme() {
@@ -18855,8 +23050,10 @@ function createCourseTable($courseCode)
         'AUTO_GRADED',
         'MANUALLY_GRADED'
     ]);
-    const PROCTOR_LIVE_FRAME_MAX_AGE_MS = 45000;
+    const PROCTOR_LIVE_FRAME_MAX_AGE_MS = 90000;
+    const PROCTOR_POLL_INTERVAL_MS = 350;
     const proctorSubmittedRemovalTimers = {};
+    let proctoringLiveLoopActive = false;
 
     function proctorFrameAgeMs(timestamp) {
         if (!timestamp) return null;
@@ -18964,17 +23161,20 @@ function createCourseTable($courseCode)
                 activeProctoringStudents = studentsResult.data.map(student => {
                     const session = activeSessions.find(s => s.student_id == student.id);
                     const isSharing = !!(session && parseInt(session.screen_sharing_active || 0) === 1);
-                    const hasFreshFrame = !!(session && session.snapshot && isFreshProctorFrame(session.latest_snapshot_at));
+                    const hasFreshFrame = !!(session && session.snapshot);
                     return {
                         id: student.id,
                         student_id: student.student_id,
                         full_name: student.full_name,
+                        exam_title: examResult.data.title || examResult.data.course_name || examResult.data.course_code || 'Exam',
                         level: student.level,
                         programme: student.programme,
                         screenSharing: isSharing,
+                        socketSharing: isSharing && !!(session && session.socket_session_id),
+                        socketSessionId: session ? (session.socket_session_id || '') : '',
                         status: isSharing ? 'active' : 'offline',
                         violationCount: session ? parseInt(session.violations || 0) : 0,
-                        lastActivity: session ? (session.latest_snapshot_at || session.last_activity) : null,
+                        lastActivity: session ? (session.latest_socket_at || session.latest_snapshot_at || session.last_activity) : null,
                         snapshot: hasFreshFrame ? (session.snapshot || '') : '',
                         snapshotId: hasFreshFrame ? (session.snapshot_id || '') : '',
                         lastRenderedSnapshotId: '',
@@ -18986,8 +23186,16 @@ function createCourseTable($courseCode)
                     };
                 }).filter(student => !student.isSubmitted);
 
+                lastViolationTotalsByStudent = {};
+                activeProctoringStudents.forEach(student => {
+                    lastViolationTotalsByStudent[String(student.id)] = student.violationCount || 0;
+                });
+
                 updateProctoringStats(activeProctoringStudents);
+                renderLockedStudentsList(activeProctoringStudents);
                 renderProctoringGrid(activeProctoringStudents);
+                connectScreenMonitorSocket(examId);
+                startScreenPolling();
             } else {
                 renderEmptyProctoringGrid();
             }
@@ -19000,6 +23208,7 @@ function createCourseTable($courseCode)
     function renderProctoringGrid(students) {
         const grid = document.getElementById('proctoringGrid');
         if (!grid) return;
+        Object.keys(proctorGridWebrtcPeers).forEach(stopGridWebrtcStream);
 
         if (!students || students.length === 0) {
             grid.innerHTML = `
@@ -19027,15 +23236,15 @@ function createCourseTable($courseCode)
                 border: 2px solid ${sharingStatus ? '#10b981' : '#ef4444'};
                 transition: transform 0.2s, box-shadow 0.2s;
                 cursor: pointer;
-            " onclick="viewFullScreenProctor(${student.id})">
+            ">
                 <!-- Screen Preview -->
                 <div class="screen-preview-container" style="
                     position: relative;
                     background: #1e1e1e;
                     aspect-ratio: 16 / 9;
-                    min-height: 170px;
+                    min-height: 220px;
                     overflow: hidden;
-                ">
+                " onclick="openLiveScreenPreview(${student.id})" title="Click to view larger live screen">
                     <div id="screenPreview_${student.id}" style="
                         width: 100%;
                         height: 100%;
@@ -19044,8 +23253,9 @@ function createCourseTable($courseCode)
                         justify-content: center;
                         background: #1e1e1e;
                     ">
-                        <img id="screenImg_${student.id}" src="${hasFreshFrame ? `data:image/jpeg;base64,${student.snapshot}` : ''}" alt="Screen stream" style="width: 100%; height: 100%; object-fit: contain; ${hasFreshFrame ? '' : 'display:none;'}">
-                        <div id="screenPlaceholder_${student.id}" style="text-align: center; color: #9ca3af; ${hasFreshFrame ? 'display:none;' : ''}">
+                        <video id="screen-video-${student.id}" autoplay playsinline muted style="width: 100%; height: 100%; object-fit: contain; image-rendering: auto; background:#000; display:none;"></video>
+                        <img id="screenImg_${student.id}" alt="Live shared screen" style="display:none;width:100%;height:100%;object-fit:contain;background:#000;">
+                        <div id="screenPlaceholder_${student.id}" style="text-align: center; color: #9ca3af;">
                                 <div style="width:72px;height:72px;border-radius:50%;background:linear-gradient(135deg,#2563eb,#14b8a6);display:flex;align-items:center;justify-content:center;margin:0 auto 12px;color:white;font-size:28px;font-weight:800;">
                                     ${escapeHTML((student.full_name || '?').trim().charAt(0).toUpperCase())}
                                 </div>
@@ -19054,6 +23264,7 @@ function createCourseTable($courseCode)
                         </div>
                     </div>
                     <div id="liveBadge_${student.id}" class="live-badge" style="position: absolute; top: 10px; right: 10px; background: #ef4444; color: white; padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; ${sharingStatus ? '' : 'display:none;'}"><i class="fas fa-circle" style="font-size: 8px; margin-right: 4px;"></i> LIVE</div>
+                    <div id="webrtcStatus_${student.id}" style="position:absolute;left:10px;bottom:10px;background:rgba(15,23,42,.86);color:#bfdbfe;border:1px solid rgba(96,165,250,.55);padding:4px 8px;border-radius:6px;font-size:11px;font-weight:800;${sharingStatus ? '' : 'display:none;'}">CONNECTING LIVE VIDEO</div>
                     ${student.screenLocked ? '<div style="position:absolute;bottom:10px;right:10px;background:#111827;color:#fbbf24;border:1px solid #fbbf24;padding:5px 9px;border-radius:8px;font-size:11px;font-weight:800;"><i class="fas fa-lock"></i> LOCKED</div>' : ''}
                     ${student.violationCount > 0 ? `<div class="violation-badge" style="position: absolute; top: 10px; left: 10px; background: #ef4444; color: white; padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: 600;"><i class="fas fa-exclamation-triangle"></i> ${student.violationCount}</div>` : ''}
                 </div>
@@ -19064,6 +23275,7 @@ function createCourseTable($courseCode)
                         <div>
                             <strong style="font-size: 16px; color: var(--text);">${escapeHTML(student.full_name)}</strong>
                             <div style="font-size: 12px; color: var(--muted); margin-top: 2px;">ID: ${escapeHTML(student.student_id)}</div>
+                            <div style="font-size: 12px; color: var(--muted); margin-top: 2px;">Exam: ${escapeHTML(student.exam_title || 'Exam')}</div>
                         </div>
                         <span class="tag" id="screenStatusTag_${student.id}" style="background: ${statusColor}; color: white;">
                             <i class="fas ${sharingStatus ? 'fa-desktop' : 'fa-eye-slash'}"></i> ${statusText}
@@ -19077,9 +23289,6 @@ function createCourseTable($courseCode)
                 
                 <!-- Action Buttons -->
                 <div style="padding: 12px 15px; border-top: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 8px;">
-                    <button class="btn small" onclick="event.stopPropagation(); viewFullScreenProctor(${student.id})" style="flex: 1 1 120px; padding: 6px 12px;">
-                        <i class="fas fa-expand"></i> Full Screen
-                    </button>
                     <button class="btn warn small" onclick="event.stopPropagation(); sendWarningToStudentById(${student.id})" style="flex: 1 1 120px; padding: 6px 12px;">
                         <i class="fas fa-exclamation-triangle"></i> Warn
                     </button>
@@ -19089,8 +23298,11 @@ function createCourseTable($courseCode)
                     <button class="btn ok small" onclick="event.stopPropagation(); unlockStudentScreenById(${student.id})" style="flex: 1 1 120px; padding: 6px 12px;">
                         <i class="fas fa-unlock"></i> Unlock
                     </button>
-                    <button class="btn primary small" onclick="event.stopPropagation(); takeSnapshot(${student.id})" style="flex: 1 1 120px; padding: 6px 12px;">
-                        <i class="fas fa-camera"></i> Shot
+                    <button class="btn primary small" onclick="event.stopPropagation(); promptAddTimeToStudent(${student.id})" style="flex: 1 1 120px; padding: 6px 12px;">
+                        <i class="fas fa-clock"></i> Add Time
+                    </button>
+                    <button class="btn small" onclick="event.stopPropagation(); promptMessageStudent(${student.id})" style="flex: 1 1 120px; padding: 6px 12px;">
+                        <i class="fas fa-comment-alt"></i> Message
                     </button>
                     <button class="btn small" onclick="event.stopPropagation(); viewViolationEvidence(${student.id})" style="flex: 1 1 120px; padding: 6px 12px;">
                         <i class="fas fa-folder-open"></i> Evidence
@@ -19102,6 +23314,11 @@ function createCourseTable($courseCode)
 
         startScreenPolling();
         fetchScreenUpdates();
+        setTimeout(() => {
+            (students || []).forEach(student => {
+                if (student.screenSharing) ensureGridWebrtcStream(student);
+            });
+        }, 100);
     }
 
     function renderEmptyProctoringGrid() {
@@ -19123,21 +23340,22 @@ function createCourseTable($courseCode)
         }
 
         if (proctoringInterval) {
-            clearInterval(proctoringInterval);
+            clearTimeout(proctoringInterval);
         }
 
-        // Poll quickly so submitted students leave the live grid without waiting.
-        proctoringInterval = setInterval(() => {
-            fetchScreenUpdates();
-        }, 800);
+        // Poll quickly so live grid frames and submitted students update without waiting.
+        proctoringLiveLoopActive = false;
+        proctoringInterval = null;
 
         toast('✅ Proctoring started - Monitoring student screens');
-        fetchScreenUpdates();
+        connectScreenMonitorSocket(currentProctoringExam);
+        startScreenPolling(true);
     }
 
     function stopProctoring() {
+        proctoringLiveLoopActive = false;
         if (proctoringInterval) {
-            clearInterval(proctoringInterval);
+            clearTimeout(proctoringInterval);
             proctoringInterval = null;
         }
         toast('⏹️ Proctoring stopped');
@@ -19166,15 +23384,25 @@ function createCourseTable($courseCode)
 
                     const student = activeProctoringStudents.find(s => String(s.id) === String(update.student_id));
                     if (student) {
-                        const isSharing = parseInt(update.screen_sharing_active || 0) === 1;
-                        const hasFreshFrame = !!update.snapshot && isFreshProctorFrame(update.captured_at);
+                        const hasFreshFrame = !!update.snapshot;
+                        const socketLive = !!student.socketSharing || !!document.getElementById(`screen-video-${student.id}`)?.srcObject;
+                        const isSharing = socketLive || parseInt(update.screen_sharing_active || 0) === 1 || (!!update.snapshot && isFreshProctorFrame(update.captured_at));
                         student.screenSharing = isSharing;
+                        student.socketSharing = socketLive || (!!update.socket_session_id && parseInt(update.screen_sharing_active || 0) === 1);
+                        student.socketSessionId = update.socket_session_id || student.socketSessionId || '';
                         student.status = student.screenSharing ? 'active' : 'offline';
-                        student.lastActivity = update.captured_at || update.last_heartbeat_at || student.lastActivity;
+                        student.lastActivity = update.latest_socket_at || update.captured_at || update.last_heartbeat_at || student.lastActivity;
+                        const previousViolations = lastViolationTotalsByStudent[String(student.id)] ?? (student.violationCount || 0);
                         student.violationCount = parseInt(update.violations || student.violationCount || 0);
+                        if (student.violationCount > previousViolations) {
+                            toast(`⚠️ Violation recorded for ${student.full_name || student.student_id || 'student'}`);
+                        }
+                        lastViolationTotalsByStudent[String(student.id)] = student.violationCount;
                         student.snapshot = hasFreshFrame ? (update.snapshot || '') : '';
                         student.snapshotId = hasFreshFrame ? (update.snapshot_id || '') : '';
+                        student.snapshotHash = hasFreshFrame ? (update.snapshot_hash || '') : '';
                         student.latestSnapshotAt = update.captured_at || student.latestSnapshotAt || '';
+                        student.screenLocked = parseInt(update.screen_locked || 0) === 1;
                         updateProctorCardLiveState(student);
                     }
 
@@ -19204,6 +23432,7 @@ function createCourseTable($courseCode)
                 }
 
                 updateProctoringStats(activeProctoringStudents);
+                renderLockedStudentsList(activeProctoringStudents);
             }
         } catch (error) {
             console.error('Error fetching screen updates:', error);
@@ -19224,23 +23453,39 @@ function createCourseTable($courseCode)
         }
         if (statusTag) {
             statusTag.style.background = isSharing ? '#10b981' : '#ef4444';
-            statusTag.innerHTML = `<i class="fas ${isSharing ? 'fa-desktop' : 'fa-eye-slash'}"></i> ${isSharing ? 'Sharing Screen' : 'Not Sharing'}`;
+            statusTag.innerHTML = `<i class="fas ${isSharing ? 'fa-video' : 'fa-eye-slash'}"></i> ${isSharing ? 'Sharing Live' : 'Not Sharing'}`;
         }
         if (liveBadge) {
             liveBadge.style.display = isSharing ? 'block' : 'none';
         }
+        const video = document.getElementById(`screen-video-${student.id}`);
+        let hasLiveVideo = !!video?.srcObject;
         if (screenImg && student.snapshot && isSharing) {
-            if (String(student.lastRenderedSnapshotId || '') !== String(student.snapshotId || '')) {
+            const snapshotSignature = student.snapshotHash || `${student.snapshot.length}:${student.snapshot.slice(0, 32)}:${student.snapshot.slice(-32)}`;
+            const renderKey = `${student.snapshotId || ''}:${student.latestSnapshotAt || student.lastActivity || ''}:${snapshotSignature}`;
+            if (student.lastRenderedSnapshotId !== renderKey) {
                 screenImg.src = `data:image/jpeg;base64,${student.snapshot}`;
-                student.lastRenderedSnapshotId = student.snapshotId || Date.now();
+                student.lastRenderedSnapshotId = renderKey;
             }
             screenImg.style.display = 'block';
+            if (video) video.style.display = 'none';
+            hasLiveVideo = false;
+            if (currentFullScreenStudent && String(currentFullScreenStudent.id) === String(student.id)) {
+                updateFullScreenStreamFrame(student.snapshot, true);
+            }
         } else if (screenImg && !isSharing) {
             screenImg.removeAttribute('src');
             screenImg.style.display = 'none';
+            stopGridWebrtcStream(student.id);
+            if (currentFullScreenStudent && String(currentFullScreenStudent.id) === String(student.id)) {
+                updateFullScreenStreamFrame('', false);
+            }
+        }
+        if (isSharing) {
+            ensureGridWebrtcStream(student);
         }
         if (placeholder) {
-            placeholder.style.display = isSharing && student.snapshot ? 'none' : 'block';
+            placeholder.style.display = (isSharing && (student.snapshot || hasLiveVideo)) ? 'none' : 'block';
             const label = placeholder.querySelector('p');
             if (label) {
                 label.textContent = isSharing
@@ -19249,14 +23494,389 @@ function createCourseTable($courseCode)
             }
         }
         if (frameTime) {
-            const text = student.lastActivity ? new Date(student.lastActivity).toLocaleTimeString() : 'N/A';
-            frameTime.innerHTML = `<i class="fas fa-clock"></i> Last live frame: ${text}`;
+            frameTime.innerHTML = hasLiveVideo
+                ? `<i class="fas fa-video"></i> Live stream active: ${new Date().toLocaleTimeString()}`
+                : (student.snapshot && isSharing
+                    ? `<i class="fas fa-tv"></i> Live frame: ${student.latestSnapshotAt ? new Date(student.latestSnapshotAt).toLocaleTimeString() : new Date().toLocaleTimeString()}`
+                    : `<i class="fas fa-clock"></i> Live stream: ${isSharing ? 'waiting' : 'not active'}`);
         }
     }
 
+    function waitForGridIceGatheringComplete(peerConnection) {
+        if (peerConnection.iceGatheringState === 'complete') return Promise.resolve();
+        return new Promise(resolve => {
+            const timeout = setTimeout(resolve, 8000);
+            peerConnection.addEventListener('icegatheringstatechange', function onStateChange() {
+                if (peerConnection.iceGatheringState === 'complete') {
+                    clearTimeout(timeout);
+                    peerConnection.removeEventListener('icegatheringstatechange', onStateChange);
+                    resolve();
+                }
+            });
+        });
+    }
+
+    function connectScreenMonitorSocket(examId) {
+        if (!window.io || !examId) return null;
+        if (screenMonitorSocket && screenMonitorExamId === String(examId)) {
+            if (screenMonitorSocket.connected) {
+                screenMonitorSocket.emit('lecturer-join-monitoring', { exam_id: String(examId) });
+            }
+            return screenMonitorSocket;
+        }
+        if (screenMonitorSocket) {
+            screenMonitorSocket.disconnect();
+            screenMonitorSocket = null;
+        }
+        screenMonitorExamId = String(examId);
+        screenMonitorSocket = io({
+            path: '/socket.io',
+            transports: ['polling', 'websocket'],
+            upgrade: true,
+            reconnection: true,
+            reconnectionAttempts: 12,
+            reconnectionDelay: 800,
+            auth: { token: screenMonitorSocketToken }
+        });
+        screenMonitorSocket.on('connect', () => {
+            console.log('Lecturer screen socket connected', screenMonitorSocket.id);
+            screenMonitorSocket.emit('lecturer-join-monitoring', { exam_id: String(examId) });
+        });
+        screenMonitorSocket.on('screen-share-roster', rows => {
+            (rows || []).forEach(row => markStudentSocketSharing(row, true));
+        });
+        screenMonitorSocket.on('screen-share-started', row => markStudentSocketSharing(row, true));
+        screenMonitorSocket.on('screen-share-stopped', row => markStudentSocketSharing(row, false));
+        screenMonitorSocket.on('webrtc-offer', payload => answerLecturerScreenOffer(payload));
+        screenMonitorSocket.on('webrtc-ice-candidate', async payload => {
+            const entry = proctorGridWebrtcPeers[payload?.student_id];
+            if (!entry || !entry.pc || !payload?.candidate) return;
+            console.log('ICE candidate exchanged: lecturer received', payload);
+            try {
+                await entry.pc.addIceCandidate(payload.candidate);
+            } catch (error) {}
+        });
+        screenMonitorSocket.on('connect_error', error => {
+            console.error('Lecturer screen socket connect_error', error);
+            toast('Live screen socket failed: ' + (error.message || 'network error'));
+        });
+        screenMonitorSocket.on('screen-share-error', message => {
+            console.error('Lecturer screen-share-error', message);
+            document.querySelectorAll('[id^="webrtcStatus_"]').forEach(el => {
+                el.style.display = 'block';
+                el.textContent = 'LIVE SOCKET ERROR: ' + message;
+                el.style.color = '#fecaca';
+                el.style.borderColor = 'rgba(239,68,68,.75)';
+            });
+            toast('Live screen error: ' + message);
+        });
+        return screenMonitorSocket;
+    }
+
+    function markStudentSocketSharing(row, isSharing) {
+        const studentId = String(row?.student_id || '');
+        if (!studentId) return;
+        const student = activeProctoringStudents.find(s => String(s.id) === studentId);
+        if (student) {
+            student.screenSharing = !!isSharing;
+            student.socketSharing = !!isSharing;
+            student.status = isSharing ? 'active' : 'offline';
+            student.socketSessionId = row.session_id || student.socketSessionId || '';
+            student.lastActivity = row.last_updated || new Date().toISOString();
+            updateProctorCardLiveState(student);
+            updateProctoringStats(activeProctoringStudents);
+        }
+        if (!isSharing) stopGridWebrtcStream(studentId);
+    }
+
+    function ensureGridWebrtcStream(student) {
+        if (!student || !student.id || proctorGridWebrtcPeers[student.id]?.state === 'connected') return;
+        const socket = connectScreenMonitorSocket(currentProctoringExam);
+        const status = document.getElementById(`webrtcStatus_${student.id}`);
+        if (status) {
+            status.style.display = 'block';
+            status.textContent = socket?.connected ? 'WAITING FOR STUDENT LIVE OFFER' : 'WAITING FOR LIVE SOCKET';
+            status.style.color = '#bfdbfe';
+            status.style.borderColor = 'rgba(96,165,250,.55)';
+        }
+        answerLecturerHttpScreenOffer(student);
+    }
+
+    function attachLecturerLiveStream(studentId, stream, label = 'Live stream') {
+        const video = document.getElementById(`screen-video-${studentId}`);
+        if (!video) return;
+        video.srcObject = stream;
+        video.style.display = 'block';
+        const img = document.getElementById(`screenImg_${studentId}`);
+        const placeholder = document.getElementById(`screenPlaceholder_${studentId}`);
+        const frameTime = document.getElementById(`screenFrameTime_${studentId}`);
+        const statusTag = document.getElementById(`screenStatusTag_${studentId}`);
+        const status = document.getElementById(`webrtcStatus_${studentId}`);
+        const student = activeProctoringStudents.find(s => String(s.id) === String(studentId));
+        if (student) {
+            student.screenSharing = true;
+            student.lastActivity = new Date().toISOString();
+        }
+        if (img) img.style.display = 'none';
+        if (placeholder) placeholder.style.display = 'none';
+        if (frameTime) frameTime.innerHTML = `<i class="fas fa-video"></i> Live stream active: ${new Date().toLocaleTimeString()}`;
+        if (statusTag) {
+            statusTag.style.background = '#10b981';
+            statusTag.innerHTML = '<i class="fas fa-video"></i> Sharing Live';
+        }
+        if (status) {
+            status.textContent = `${label.toUpperCase()} CONNECTED`;
+            status.style.color = '#bbf7d0';
+            status.style.borderColor = 'rgba(34,197,94,.65)';
+        }
+    }
+
+    async function answerLecturerHttpScreenOffer(student) {
+        if (!student || !student.id || !currentProctoringExam || !window.RTCPeerConnection) return;
+        const studentId = String(student.id);
+        const existing = proctorGridWebrtcPeers[studentId];
+        if (existing && ['connected', 'connecting'].includes(existing.state)) return;
+        if ((proctorGridWebrtcRetryAt[studentId] || 0) > Date.now()) return;
+        proctorGridWebrtcRetryAt[studentId] = Date.now() + 2500;
+        const status = document.getElementById(`webrtcStatus_${studentId}`);
+        try {
+            const result = await apiRequest('webrtc_fetch_student_offer', {
+                exam_id: currentProctoringExam,
+                student_id: studentId
+            });
+            if (!result.success || !result.data || !result.data.offer) return;
+            const streamKey = result.data.stream_key;
+            if (proctorGridWebrtcPeers[studentId]?.streamKey === streamKey && proctorGridWebrtcPeers[studentId]?.state === 'connected') return;
+            if (proctorGridWebrtcPeers[studentId]?.pc) {
+                try { proctorGridWebrtcPeers[studentId].pc.close(); } catch (error) {}
+            }
+            if (status) {
+                status.style.display = 'block';
+                status.textContent = 'CONNECTING LIVE VIDEO';
+                status.style.color = '#bfdbfe';
+                status.style.borderColor = 'rgba(96,165,250,.55)';
+            }
+            const peerConnection = new RTCPeerConnection({
+                iceServers: QODA_WEBRTC_ICE_SERVERS,
+                bundlePolicy: 'max-bundle',
+                rtcpMuxPolicy: 'require'
+            });
+            proctorGridWebrtcPeers[studentId] = { pc: peerConnection, state: 'connecting', streamKey, mode: 'http' };
+            peerConnection.ontrack = event => {
+                console.log('Lecturer HTTP video ontrack fired', event);
+                const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+                proctorGridWebrtcPeers[studentId].state = 'connected';
+                attachLecturerLiveStream(studentId, stream, 'Live video');
+            };
+            peerConnection.onconnectionstatechange = () => {
+                const state = peerConnection.connectionState;
+                if (state === 'connected') {
+                    proctorGridWebrtcPeers[studentId].state = 'connected';
+                }
+                if (['failed', 'disconnected', 'closed'].includes(state)) {
+                    proctorGridWebrtcRetryAt[studentId] = Date.now() + 3000;
+                    if (proctorGridWebrtcPeers[studentId]?.pc === peerConnection) {
+                        stopGridWebrtcStream(studentId);
+                    }
+                }
+            };
+            await peerConnection.setRemoteDescription(JSON.parse(result.data.offer));
+            const answer = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answer);
+            await waitForGridIceGatheringComplete(peerConnection);
+            const answerResult = await apiRequest('webrtc_submit_monitor_answer', {
+                stream_key: streamKey,
+                answer: JSON.stringify(peerConnection.localDescription)
+            });
+            if (!answerResult.success) {
+                throw new Error(answerResult.error || 'Unable to send live answer');
+            }
+            console.log('Lecturer sent HTTP WebRTC answer', { studentId, streamKey });
+            if (status) status.textContent = 'LIVE ANSWER SENT';
+        } catch (error) {
+            console.error('Lecturer HTTP WebRTC answer failed:', error);
+            proctorGridWebrtcRetryAt[studentId] = Date.now() + 4000;
+            if (status) {
+                status.style.display = 'block';
+                status.textContent = 'LIVE VIDEO RETRYING';
+                status.style.color = '#fde68a';
+                status.style.borderColor = 'rgba(245,158,11,.65)';
+            }
+            if (proctorGridWebrtcPeers[studentId]?.state !== 'connected') {
+                stopGridWebrtcStream(studentId);
+            }
+        }
+    }
+
+    async function answerLecturerScreenOffer(payload) {
+        if (!payload?.student_id || !payload?.offer || !payload?.student_socket_id) return;
+        console.log('Lecturer received offer', payload);
+        const studentId = String(payload.student_id);
+        const student = activeProctoringStudents.find(s => String(s.id) === studentId);
+        if (student) {
+            student.screenSharing = true;
+            student.socketSessionId = payload.session_id || student.socketSessionId || '';
+            updateProctorCardLiveState(student);
+        }
+        const video = document.getElementById(`screen-video-${studentId}`);
+        if (!video || !window.RTCPeerConnection) return;
+        if (proctorGridWebrtcPeers[studentId]?.pc) {
+            try { proctorGridWebrtcPeers[studentId].pc.close(); } catch (error) {}
+        }
+        const status = document.getElementById(`webrtcStatus_${studentId}`);
+        if (status) {
+            status.style.display = 'block';
+            status.textContent = 'CONNECTING LIVE VIDEO';
+            status.style.color = '#bfdbfe';
+            status.style.borderColor = 'rgba(96,165,250,.55)';
+        }
+        const peerConnection = new RTCPeerConnection({
+            iceServers: QODA_WEBRTC_ICE_SERVERS,
+            bundlePolicy: 'max-bundle',
+            rtcpMuxPolicy: 'require'
+        });
+        proctorGridWebrtcPeers[studentId] = { pc: peerConnection, state: 'connecting', sessionId: payload.session_id || '', studentSocketId: payload.student_socket_id };
+
+        peerConnection.onicecandidate = event => {
+            if (event.candidate && screenMonitorSocket) {
+                console.log('ICE candidate exchanged: lecturer sent', event.candidate);
+                screenMonitorSocket.emit('webrtc-ice-candidate', {
+                    to: payload.student_socket_id,
+                    student_socket_id: payload.student_socket_id,
+                    exam_id: String(currentProctoringExam),
+                    student_id: studentId,
+                    session_id: String(payload.session_id || ''),
+                    candidate: event.candidate
+                });
+            }
+        };
+        peerConnection.ontrack = event => {
+            console.log('Lecturer video ontrack fired', event);
+            const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+            proctorGridWebrtcPeers[studentId].state = 'connected';
+            attachLecturerLiveStream(studentId, stream, 'Live video');
+        };
+        peerConnection.onconnectionstatechange = () => {
+            const state = peerConnection.connectionState;
+            if (state === 'connected') {
+                proctorGridWebrtcPeers[studentId].state = 'connected';
+            }
+            if (state === 'disconnected') {
+                const status = document.getElementById(`webrtcStatus_${studentId}`);
+                if (status) status.textContent = 'LIVE VIDEO BUFFERING';
+                setTimeout(() => {
+                    const entry = proctorGridWebrtcPeers[studentId];
+                    if (entry && entry.pc === peerConnection && peerConnection.connectionState === 'disconnected') {
+                        proctorGridWebrtcRetryAt[studentId] = Date.now() + 2000;
+                        stopGridWebrtcStream(studentId);
+                    }
+                }, 5000);
+            }
+            if (['failed', 'closed'].includes(state)) {
+                stopGridWebrtcStream(studentId);
+            }
+        };
+
+        try {
+            await peerConnection.setRemoteDescription(payload.offer);
+            const answer = await peerConnection.createAnswer();
+            console.log('Lecturer created answer', answer);
+            await peerConnection.setLocalDescription(answer);
+            screenMonitorSocket.emit('webrtc-answer', {
+                to: payload.student_socket_id,
+                student_socket_id: payload.student_socket_id,
+                exam_id: String(currentProctoringExam),
+                student_id: studentId,
+                session_id: String(payload.session_id || ''),
+                answer: peerConnection.localDescription
+            });
+            console.log('Lecturer sent answer', { studentId, studentSocketId: payload.student_socket_id });
+        } catch (error) {
+            console.error('Lecturer WebRTC answer failed:', error);
+            proctorGridWebrtcRetryAt[studentId] = Date.now() + 3000;
+            if (status) {
+                status.textContent = 'SNAPSHOT FALLBACK';
+                status.style.color = '#fde68a';
+                status.style.borderColor = 'rgba(245,158,11,.65)';
+            }
+            stopGridWebrtcStream(studentId);
+        }
+    }
+
+    function stopGridWebrtcStream(studentId) {
+        const entry = proctorGridWebrtcPeers[studentId];
+        if (!entry) return;
+        try {
+            if (entry.pc) entry.pc.close();
+        } catch (error) {}
+        const video = document.getElementById(`screen-video-${studentId}`);
+        if (video) {
+            video.srcObject = null;
+            video.style.display = 'none';
+        }
+        const status = document.getElementById(`webrtcStatus_${studentId}`);
+        if (status) {
+            status.textContent = 'RECONNECTING LIVE VIDEO';
+            status.style.color = '#fde68a';
+            status.style.borderColor = 'rgba(245,158,11,.65)';
+        }
+        delete proctorGridWebrtcPeers[studentId];
+    }
+
+    function openLiveScreenPreview(studentId) {
+        const student = activeProctoringStudents.find(s => String(s.id) === String(studentId));
+        if (!student) return;
+        const sourceVideo = document.getElementById(`screen-video-${studentId}`);
+        const modal = document.getElementById('fullScreenProctorModal');
+        const contentDiv = document.getElementById('fullScreenContent');
+        const nameEl = document.getElementById('fullScreenStudentName');
+        const idEl = document.getElementById('fullScreenStudentId');
+        if (!modal || !contentDiv) return;
+        currentFullScreenStudent = student;
+        if (nameEl) nameEl.innerHTML = `<i class="fas fa-tv"></i> ${escapeHTML(student.full_name || 'Student')} Live Screen`;
+        if (idEl) idEl.textContent = `ID: ${student.student_id || student.id} | ${student.screenSharing ? 'Sharing Screen' : 'Not Sharing'}`;
+        contentDiv.innerHTML = `
+            <div style="width:100%;height:100%;background:#000;display:flex;align-items:center;justify-content:center;position:relative;">
+                <img id="fullScreenImg" src="${student.snapshot ? `data:image/jpeg;base64,${student.snapshot}` : ''}" alt="Live shared screen" style="width:100%;height:100%;object-fit:contain;background:#000;${student.snapshot ? '' : 'display:none;'}">
+                <video id="largeLiveScreenVideo" autoplay playsinline muted style="width:100%;height:100%;object-fit:contain;background:#000;${student.snapshot ? 'display:none;' : ''}"></video>
+                <div id="fullScreenPlaceholder" style="position:absolute;inset:0;display:${student.snapshot ? 'none' : 'flex'};align-items:center;justify-content:center;text-align:center;color:#cbd5e1;font-weight:900;padding:24px;">
+                    <div>
+                        <i class="fas fa-desktop" style="font-size:44px;margin-bottom:12px;"></i>
+                        <p style="margin:0;">${student.screenSharing ? 'Screen shared, waiting for live frame' : 'Screen not shared'}</p>
+                        <small>${student.screenSharing ? 'A fresh frame should appear in a moment.' : 'The student must keep screen sharing active.'}</small>
+                    </div>
+                </div>
+                <div id="fullLiveIndicator" class="live-indicator-full" style="position:absolute;top:20px;right:20px;background:#ef4444;color:white;padding:8px 16px;border-radius:8px;font-weight:800;${student.snapshot ? '' : 'display:none;'}">
+                    <i class="fas fa-circle" style="font-size:10px;animation:blink 1s infinite;"></i> LIVE
+                </div>
+            </div>
+        `;
+        const largeVideo = document.getElementById('largeLiveScreenVideo');
+        const placeholder = document.getElementById('fullScreenPlaceholder');
+        if (largeVideo && sourceVideo && sourceVideo.srcObject && !student.snapshot) {
+            largeVideo.srcObject = sourceVideo.srcObject;
+            largeVideo.style.display = 'block';
+            if (placeholder) placeholder.style.display = 'none';
+        }
+        modal.style.display = 'flex';
+        startStudentStream(studentId);
+    }
+
     function startScreenPolling() {
-        if (proctoringInterval) return;
-        proctoringInterval = setInterval(fetchScreenUpdates, 800);
+        if (proctoringLiveLoopActive) return;
+        proctoringLiveLoopActive = true;
+
+        const runLiveGridLoop = async () => {
+            if (!proctoringLiveLoopActive || !currentProctoringExam) {
+                proctoringLiveLoopActive = false;
+                proctoringInterval = null;
+                return;
+            }
+            await fetchScreenUpdates();
+            proctoringInterval = setTimeout(runLiveGridLoop, PROCTOR_POLL_INTERVAL_MS);
+        };
+
+        runLiveGridLoop();
     }
 
     function updateProctoringStats(students) {
@@ -19276,6 +23896,21 @@ function createCourseTable($courseCode)
         if (violationCountEl) violationCountEl.textContent = violations;
     }
 
+    function renderLockedStudentsList(students) {
+        const panel = document.getElementById('lockedStudentsPanel');
+        const list = document.getElementById('lockedStudentsList');
+        if (!panel || !list) return;
+        const locked = (students || []).filter(student => student.screenLocked);
+        panel.style.display = locked.length ? 'block' : 'none';
+        list.innerHTML = locked.map(student => `
+            <button class="btn warn small" onclick="viewViolationEvidence(${student.id})" style="display:inline-flex;align-items:center;gap:8px;">
+                <i class="fas fa-user-lock"></i>
+                <span>${escapeHTML(student.full_name || 'Student')}</span>
+                <small style="opacity:.8;">${escapeHTML(student.student_id || '')}</small>
+            </button>
+        `).join('');
+    }
+
     async function viewViolationEvidence(studentId = null) {
         if (!currentProctoringExam) {
             toast('Please select an exam first');
@@ -19291,6 +23926,45 @@ function createCourseTable($courseCode)
             }
             const rows = result.data || [];
             const selectedStudent = studentId ? activeProctoringStudents.find(s => String(s.id) === String(studentId)) : null;
+            const grouped = rows.reduce((acc, row) => {
+                const key = row.student_id || row.student_identifier || 'unknown';
+                if (!acc[key]) {
+                    acc[key] = {
+                        studentId: row.student_id,
+                        identifier: row.student_identifier || '',
+                        name: row.full_name || 'Student',
+                        rows: []
+                    };
+                }
+                acc[key].rows.push(row);
+                return acc;
+            }, {});
+            const groups = Object.values(grouped);
+            const evidenceCards = groups.map(group => `
+                <details class="qcard" style="padding:14px;" ${studentId ? 'open' : ''}>
+                    <summary style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:12px;">
+                        <span>
+                            <strong style="color:var(--text);">${escapeHTML(group.name)}</strong>
+                            <small style="display:block;color:var(--muted);">${escapeHTML(group.identifier)} | ${group.rows.length} evidence item(s)</small>
+                        </span>
+                        <span class="tag" style="background:#ef4444;color:white;"><i class="fas fa-folder-open"></i> Open</span>
+                    </summary>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;margin-top:14px;">
+                        ${group.rows.map((row, index) => {
+                            const imageSrc = row.snapshot ? `data:image/jpeg;base64,${row.snapshot}` : (row.image_path ? `../${row.image_path}` : '');
+                            const downloadName = `${(group.identifier || 'student').replace(/[^A-Za-z0-9_-]/g, '_')}_${(row.event_type || 'evidence').replace(/[^A-Za-z0-9_-]/g, '_')}_${index + 1}.jpg`;
+                            return `
+                                <div style="border:1px solid var(--border);border-radius:10px;padding:10px;background:var(--panel-2,#0f172a);">
+                                    <div style="font-weight:800;color:var(--text);">${escapeHTML(row.event_type || 'Evidence')}</div>
+                                    <div class="small">${escapeHTML(row.created_at || '')}</div>
+                                    <p style="font-size:12px;color:var(--muted);line-height:1.45;">${escapeHTML(row.details || 'No details recorded.')}</p>
+                                    ${imageSrc ? `<img src="${imageSrc}" style="width:100%;border-radius:8px;border:1px solid var(--border);margin-bottom:8px;"><a class="btn small" download="${downloadName}" href="${imageSrc}" style="width:100%;justify-content:center;"><i class="fas fa-download"></i> Download Evidence</a>` : '<div class="empty-state" style="padding:18px;">No snapshot near this event</div>'}
+                                </div>
+                            `;
+                        }).join('')}
+                    </div>
+                </details>
+            `).join('');
             const modal = document.createElement('div');
             modal.className = 'modal';
             modal.style.display = 'flex';
@@ -19300,17 +23974,48 @@ function createCourseTable($courseCode)
                         <h3><i class="fas fa-folder-open"></i> ${selectedStudent ? `${escapeHTML(selectedStudent.full_name)} Evidence` : 'Violation Evidence'}</h3>
                         <button class="btn" onclick="this.closest('.modal').remove()"><i class="fas fa-times"></i> Close</button>
                     </div>
-                    ${rows.length ? `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px;">
+                    ${rows.length ? `<div style="display:grid;gap:14px;">${evidenceCards}</div>` : '<div class="empty-state"><i class="fas fa-check-circle"></i><p>No violations recorded for this exam.</p></div>'}
+                </div>
+            `;
+            document.body.appendChild(modal);
+        } catch (error) {
+            toast('Network error');
+        }
+    }
+
+    async function reviewProctoredCourses() {
+        try {
+            const result = await apiRequest('get_proctored_courses');
+            if (!result.success) {
+                toast('Failed to load proctored courses');
+                return;
+            }
+            const rows = result.data || [];
+            const modal = document.createElement('div');
+            modal.className = 'modal';
+            modal.style.display = 'flex';
+            modal.innerHTML = `
+                <div class="modal-content" style="width:min(1000px,96vw);max-height:90vh;overflow:auto;">
+                    <div class="modal-header">
+                        <h3><i class="fas fa-history"></i> Proctored Courses</h3>
+                        <button class="btn" onclick="this.closest('.modal').remove()"><i class="fas fa-times"></i> Close</button>
+                    </div>
+                    ${rows.length ? `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px;">
                         ${rows.map(row => `
-                            <div class="qcard" style="padding:12px;">
-                                <div style="font-weight:800;color:var(--text);">${escapeHTML(row.full_name || 'Student')}</div>
-                                <div class="small">${escapeHTML(row.student_identifier || '')} | ${escapeHTML(row.event_type || '')}</div>
-                                <div class="small">${escapeHTML(row.created_at || '')}</div>
-                                <p style="font-size:12px;color:var(--muted);">${escapeHTML(row.details || '')}</p>
-                                ${row.snapshot ? `<img src="data:image/jpeg;base64,${row.snapshot}" style="width:100%;border-radius:8px;border:1px solid var(--border);">` : '<div class="empty-state" style="padding:18px;">No snapshot near this event</div>'}
+                            <div class="qcard" style="padding:14px;">
+                                <div style="font-weight:900;color:var(--text);font-size:16px;">${escapeHTML(row.title || 'Exam')}</div>
+                                <div class="small">${escapeHTML(row.course_code || '')} | ${escapeHTML(row.semester || '')}</div>
+                                <div style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0;">
+                                    <span class="tag">${row.captured_students || 0} student(s)</span>
+                                    <span class="tag" style="background:#ef4444;color:white;">${row.evidence_count || 0} evidence</span>
+                                </div>
+                                <div class="small">Last proctored: ${escapeHTML(row.last_proctored_at || 'N/A')}</div>
+                                <button class="btn primary small" style="width:100%;margin-top:12px;" onclick="currentProctoringExam='${String(row.id).replace(/'/g, '')}'; viewViolationEvidence();">
+                                    <i class="fas fa-folder-open"></i> Review Evidence
+                                </button>
                             </div>
                         `).join('')}
-                    </div>` : '<div class="empty-state"><i class="fas fa-check-circle"></i><p>No violations recorded for this exam.</p></div>'}
+                    </div>` : '<div class="empty-state"><i class="fas fa-folder-open"></i><p>No proctored courses have evidence yet.</p></div>'}
                 </div>
             `;
             document.body.appendChild(modal);
@@ -19352,14 +24057,17 @@ function createCourseTable($courseCode)
         const modal = document.getElementById('fullScreenProctorModal');
         if (modal) {
             modal.style.display = 'flex';
+            if (modal.requestFullscreen && !document.fullscreenElement) {
+                modal.requestFullscreen().catch(() => {});
+            }
 
             // Load the full screen stream
             const contentDiv = document.getElementById('fullScreenContent');
             if (contentDiv) {
                 contentDiv.innerHTML = `
-                <div style="display: flex; justify-content: center; align-items: center; height: 100%; position: relative;">
-                    <div id="fullScreenStreamContainer" style="width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; background: #000;">
-                        <img id="fullScreenImg" src="${student.snapshot ? `data:image/jpeg;base64,${student.snapshot}` : ''}" alt="Screen stream" style="max-width: 100%; max-height: 100%; object-fit: contain; ${student.snapshot ? '' : 'display:none;'}">
+                <div style="display: flex; justify-content: stretch; align-items: stretch; width: 100%; height: 100%; position: relative; background:#000;">
+                    <div id="fullScreenStreamContainer" style="width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; background: #000; overflow:hidden;">
+                        <img id="fullScreenImg" src="${student.snapshot ? `data:image/jpeg;base64,${student.snapshot}` : ''}" alt="Screen stream" style="width: 100%; height: 100%; object-fit: contain; image-rendering: auto; background:#000; ${student.snapshot ? '' : 'display:none;'}">
                         <div id="fullScreenPlaceholder" style="text-align:center;color:#9ca3af;padding:30px;${student.snapshot ? 'display:none;' : ''}">
                             <i class="fas fa-desktop" style="font-size:44px;margin-bottom:12px;"></i>
                             <p style="margin:0;font-weight:700;">${student.screenSharing ? 'Screen shared, waiting for live frame' : 'Screen not shared'}</p>
@@ -19378,6 +24086,27 @@ function createCourseTable($courseCode)
         }
     }
 
+    function updateFullScreenStreamFrame(snapshot, isSharing = true) {
+        const fullScreenImg = document.getElementById('fullScreenImg');
+        const placeholder = document.getElementById('fullScreenPlaceholder');
+        const liveIndicator = document.getElementById('fullLiveIndicator');
+        const largeVideo = document.getElementById('largeLiveScreenVideo');
+        if (fullScreenImg && snapshot && isSharing) {
+            fullScreenImg.src = `data:image/jpeg;base64,${snapshot}`;
+            fullScreenImg.style.display = 'block';
+            if (largeVideo) largeVideo.style.display = 'none';
+        } else if (fullScreenImg && !isSharing) {
+            fullScreenImg.removeAttribute('src');
+            fullScreenImg.style.display = 'none';
+        }
+        if (placeholder) {
+            placeholder.style.display = snapshot && isSharing ? 'none' : 'block';
+        }
+        if (liveIndicator) {
+            liveIndicator.style.display = snapshot && isSharing ? 'block' : 'none';
+        }
+    }
+
     async function startStudentStream(studentId) {
         // Start polling for this specific student's screen
         if (window.studentStreamInterval) {
@@ -19391,22 +24120,10 @@ function createCourseTable($courseCode)
                     exam_id: currentProctoringExam
                 });
 
-                const isSharing = result.success && result.data && parseInt(result.data.screen_sharing_active || 0) === 1;
-                const hasFreshFrame = result.success && result.data && result.data.snapshot && isFreshProctorFrame(result.data.captured_at);
-                if (hasFreshFrame) {
-                    const fullScreenImg = document.getElementById('fullScreenImg');
-                    const placeholder = document.getElementById('fullScreenPlaceholder');
-                    const liveIndicator = document.getElementById('fullLiveIndicator');
-                    if (fullScreenImg) {
-                        fullScreenImg.src = `data:image/jpeg;base64,${result.data.snapshot}`;
-                        fullScreenImg.style.display = 'block';
-                    }
-                    if (placeholder) {
-                        placeholder.style.display = 'none';
-                    }
-                    if (liveIndicator) {
-                        liveIndicator.style.display = 'block';
-                    }
+                const isSharing = result.success && result.data && (parseInt(result.data.screen_sharing_active || 0) === 1 || (!!result.data.snapshot && isFreshProctorFrame(result.data.captured_at)));
+                const hasFrame = result.success && result.data && result.data.snapshot;
+                if (hasFrame) {
+                    updateFullScreenStreamFrame(result.data.snapshot, isSharing);
 
                     // Update violation count if needed
                     if (result.data.violations && currentFullScreenStudent) {
@@ -19429,22 +24146,14 @@ function createCourseTable($courseCode)
                         }
                     }
                 } else {
-                    const fullScreenImg = document.getElementById('fullScreenImg');
                     const placeholder = document.getElementById('fullScreenPlaceholder');
-                    const liveIndicator = document.getElementById('fullLiveIndicator');
-                    if (fullScreenImg) {
-                        fullScreenImg.removeAttribute('src');
-                        fullScreenImg.style.display = 'none';
-                    }
+                    updateFullScreenStreamFrame('', false);
                     if (placeholder) {
                         placeholder.style.display = 'block';
                         const label = placeholder.querySelector('p');
                         const small = placeholder.querySelector('small');
                         if (label) label.textContent = isSharing ? 'Screen shared, waiting for live frame' : 'Screen not shared';
                         if (small) small.textContent = isSharing ? 'A fresh frame should appear in a moment.' : 'The student must keep screen sharing active.';
-                    }
-                    if (liveIndicator) {
-                        liveIndicator.style.display = 'none';
                     }
                 }
             } catch (error) {
@@ -19453,7 +24162,7 @@ function createCourseTable($courseCode)
         };
 
         refreshStudentStream();
-        window.studentStreamInterval = setInterval(refreshStudentStream, 800);
+        window.studentStreamInterval = setInterval(refreshStudentStream, PROCTOR_POLL_INTERVAL_MS);
     }
 
     function closeFullScreenProctorModal() {
@@ -19465,6 +24174,9 @@ function createCourseTable($courseCode)
             clearInterval(window.studentStreamInterval);
             window.studentStreamInterval = null;
         }
+        if (document.fullscreenElement && document.fullscreenElement.id === 'fullScreenProctorModal') {
+            document.exitFullscreen().catch(() => {});
+        }
 
         currentFullScreenStudent = null;
     }
@@ -19472,6 +24184,91 @@ function createCourseTable($courseCode)
     function sendWarningToStudent() {
         if (currentFullScreenStudent) {
             sendWarningToStudentById(currentFullScreenStudent.id);
+        }
+    }
+
+    async function controlProctoringExam(control, extra = {}) {
+        if (!currentProctoringExam) {
+            toast('Select an exam to proctor first.');
+            return;
+        }
+        const result = await apiRequest('manage_exam_time', {
+            exam_id: currentProctoringExam,
+            control,
+            ...extra
+        });
+        toast(result.success ? (result.message || 'Exam control updated.') : (result.error || 'Could not update exam control.'));
+        if (result.success) {
+            refreshProctoring();
+        }
+    }
+
+    function promptAddProctoringTimeAll() {
+        if (!currentProctoringExam) {
+            toast('Select an exam first.');
+            return;
+        }
+        const minutes = parseInt(prompt('Add how many minutes to ALL students?', '10') || '0', 10);
+        if (minutes > 0) {
+            controlProctoringExam('add_time', { minutes });
+        } else if (minutes !== 0) {
+            toast('Enter valid minutes.');
+        }
+    }
+
+    function promptProctoringMessageAll() {
+        if (!currentProctoringExam) {
+            toast('Select an exam first.');
+            return;
+        }
+        const message = prompt('Message to send to all students in this exam:');
+        if (message && message.trim()) {
+            controlProctoringExam('announcement', { message: message.trim() });
+        }
+    }
+
+    async function promptAddTimeToStudent(studentId) {
+        if (!currentProctoringExam) {
+            toast('Select an exam first.');
+            return;
+        }
+        const student = activeProctoringStudents.find(s => String(s.id) === String(studentId));
+        const minutes = parseInt(prompt(`Add how many minutes to ${student?.full_name || 'this student'}?`, '5') || '0', 10);
+        if (!Number.isFinite(minutes) || minutes <= 0) {
+            toast('Enter valid minutes.');
+            return;
+        }
+        const reason = prompt('Reason for individual extra time:', 'Lecturer granted individual extra time') || 'Lecturer granted individual extra time';
+        try {
+            const result = await apiRequest('add_student_exam_time', {
+                exam_id: currentProctoringExam,
+                student_id: studentId,
+                minutes,
+                reason
+            });
+            toast(result.success ? (result.message || 'Extra time added.') : (result.error || 'Could not add extra time.'));
+        } catch (error) {
+            toast('Network error');
+        }
+    }
+
+    async function promptMessageStudent(studentId) {
+        if (!currentProctoringExam) {
+            toast('Select an exam first.');
+            return;
+        }
+        const student = activeProctoringStudents.find(s => String(s.id) === String(studentId));
+        const message = prompt(`Message to ${student?.full_name || 'this student'}:`);
+        if (!message || !message.trim()) return;
+        try {
+            const result = await apiRequest('send_message_to_student', {
+                exam_id: currentProctoringExam,
+                student_id: studentId,
+                message: message.trim()
+            });
+            toast(result.success ? 'Message sent to student.' : (result.error || 'Could not send message.'));
+        } catch (error) {
+            toast('Network error');
         }
     }
 
@@ -20094,6 +24891,7 @@ function createCourseTable($courseCode)
                 <td class="action-buttons" style="white-space: nowrap;">
                     <button class="action-btn" onclick="viewStudentCourses(${s.id})" title="View Courses"><i class="fas fa-book"></i></button>
                     <button class="action-btn" onclick="editStudentById(${s.id})" title="Edit Student"><i class="fas fa-edit"></i></button>
+                    <button class="action-btn" onclick="showMigrateLevelModal(${s.id}, '${escapeHTML(s.full_name)}', '${escapeHTML(s.level || '')}')" title="Migrate Level"><i class="fas fa-level-up-alt"></i></button>
                     <button class="action-btn" onclick="showEnrollModal(${s.id}, '${escapeHTML(s.full_name)}')" title="Enroll in Course"><i class="fas fa-plus-circle"></i></button>
                     <button class="action-btn" onclick="resetStudentPasswordById(${s.id})" title="Reset Password"><i class="fas fa-key"></i></button>
                     <button class="action-btn" onclick="deleteStudentById(${s.id})" title="Delete" style="color: #ef4444;"><i class="fas fa-trash"></i></button>
@@ -20165,6 +24963,7 @@ function createCourseTable($courseCode)
         if (idx >= 0) {
             exams[idx][field] = value;
             setExams(exams);
+            backupExamDraft(exams[idx]);
             console.log(`Updated ${field} = ${value}`);
             if (['questionsToAnswer', 'marks', 'questions'].includes(field)) {
                 refreshQuestionAnswerRuleHint();
@@ -20300,9 +25099,9 @@ function createCourseTable($courseCode)
             initResultsPage();
         }
 
-        const savedView = sessionStorage.getItem('currentView');
-        const savedExamId = sessionStorage.getItem('currentExamId');
-        const savedParams = JSON.parse(sessionStorage.getItem('currentRouteParams') || '{}');
+        const savedView = sessionStorage.getItem('currentView') || localStorage.getItem('currentView');
+        const savedExamId = sessionStorage.getItem('currentExamId') || localStorage.getItem(K_LAST_BUILDER_EXAM);
+        const savedParams = JSON.parse(sessionStorage.getItem('currentRouteParams') || localStorage.getItem('currentRouteParams') || '{}');
 
         console.log("Restoring view:", savedView, "Exam ID:", savedExamId);
 
@@ -20320,21 +25119,37 @@ function createCourseTable($courseCode)
 
         setInterval(loadDashboardStats, 30000);
         setInterval(() => {
+            if (document.getElementById('view-exams')?.classList.contains('active')) {
+                loadExamsList();
+            }
+            if (document.getElementById('view-students')?.classList.contains('active') ||
+                document.getElementById('view-student-details')?.classList.contains('active')) {
+                loadStudents();
+            }
             if (document.getElementById('view-submissions')?.classList.contains('active')) {
                 loadSubmissions();
             }
             if (document.getElementById('view-results')?.classList.contains('active')) {
-                renderResults();
+                if (typeof initResultsPage === 'function') initResultsPage();
+                else renderResults();
+            }
+            if (document.getElementById('view-proctoring')?.classList.contains('active') && currentProctoringExam) {
+                fetchScreenUpdates();
             }
         }, 10000);
 
         window.addEventListener('beforeunload', function() {
             if (currentExamId) {
+                saveAllFormDataToExam();
+                backupExamDraft();
                 saveExamToDatabase();
                 sessionStorage.setItem('currentExamId', currentExamId);
+                localStorage.setItem(K_LAST_BUILDER_EXAM, String(currentExamId));
             }
             sessionStorage.setItem('currentView', routeState.route);
             sessionStorage.setItem('currentRouteParams', JSON.stringify(routeState.params));
+            localStorage.setItem('currentView', routeState.route);
+            localStorage.setItem('currentRouteParams', JSON.stringify(routeState.params));
         });
 
         document.addEventListener('click', function(e) {
@@ -20355,6 +25170,7 @@ function createCourseTable($courseCode)
             if (currentExamId && document.getElementById('view-builder')?.classList.contains(
                     'active')) {
                 saveAllFormDataToExam();
+                backupExamDraft();
                 console.log("Auto-saved form data before page unload");
             }
         });
@@ -20491,8 +25307,12 @@ function createCourseTable($courseCode)
             durationField.addEventListener('change', function() {
                 updateExamField('durationMins', parseInt(this.value) || 180);
                 syncEndTimeFromDuration();
+                syncCutoffFromGrace();
             });
-            durationField.addEventListener('input', syncEndTimeFromDuration);
+            durationField.addEventListener('input', function() {
+                syncEndTimeFromDuration();
+                syncCutoffFromGrace();
+            });
         }
 
         // Instructions field
@@ -20573,7 +25393,9 @@ function createCourseTable($courseCode)
         if (startField) {
             startField.addEventListener('change', function() {
                 updateExamField('startAtISO', this.value);
+                syncSchedulePartsFromStart();
                 syncDurationFromStartEnd();
+                syncCutoffFromGrace();
             });
         }
 
@@ -20582,6 +25404,7 @@ function createCourseTable($courseCode)
             endField.addEventListener('change', function() {
                 updateExamField('endAtISO', this.value);
                 syncDurationFromStartEnd();
+                syncCutoffFromGrace();
             });
         }
 
@@ -20651,7 +25474,16 @@ function createCourseTable($courseCode)
 
     function parseHash() {
         const h = (window.location.hash || "").replace("#", "");
-        if (!h) return go("dashboard");
+        if (!h) {
+            const savedRoute = sessionStorage.getItem("currentView") || localStorage.getItem("currentView") || "dashboard";
+            let savedParams = {};
+            try {
+                savedParams = JSON.parse(sessionStorage.getItem("currentRouteParams") || localStorage.getItem("currentRouteParams") || "{}") || {};
+            } catch (error) {
+                savedParams = {};
+            }
+            return go(savedRoute, savedParams);
+        }
         const [r, q] = h.split("?");
         const params = Object.fromEntries(new URLSearchParams(q || ""));
         go(r || "dashboard", params);
@@ -20922,6 +25754,9 @@ function createCourseTable($courseCode)
             durationMins: parseInt(document.getElementById('bDuration')?.value) || 180,
             instructions: document.getElementById('bInstructions')?.value || '',
             startAtISO: document.getElementById('bStartAt')?.value || '',
+            endAtISO: document.getElementById('bEndAt')?.value || '',
+            gracePeriodMinutes: parseInt(document.getElementById('bGracePeriod')?.value) || 0,
+            cutoffAtISO: document.getElementById('bCutoffAt')?.value || '',
             questionsToAnswer: parseInt(document.getElementById('bQuestionsToAnswer')?.value) || 0,
             exam_password: document.getElementById('examPassword')?.value || '',
             school_name: document.getElementById('schoolName')?.value || '',
@@ -20974,6 +25809,19 @@ function createCourseTable($courseCode)
             {
                 id: 'bStartAt',
                 property: 'startAtISO'
+            },
+            {
+                id: 'bEndAt',
+                property: 'endAtISO'
+            },
+            {
+                id: 'bGracePeriod',
+                property: 'gracePeriodMinutes',
+                parser: (v) => parseInt(v) || 0
+            },
+            {
+                id: 'bCutoffAt',
+                property: 'cutoffAtISO'
             },
             {
                 id: 'bQuestionsToAnswer',
@@ -21082,6 +25930,9 @@ function createCourseTable($courseCode)
         exams[idx].durationMins = formData.durationMins;
         exams[idx].instructions = formData.instructions;
         exams[idx].startAtISO = formData.startAtISO;
+        exams[idx].endAtISO = formData.endAtISO;
+        exams[idx].gracePeriodMinutes = formData.gracePeriodMinutes;
+        exams[idx].cutoffAtISO = formData.cutoffAtISO;
         exams[idx].questionsToAnswer = formData.questionsToAnswer;
         exams[idx].exam_password = formData.exam_password;
         exams[idx].school_name = formData.school_name;
@@ -21097,12 +25948,1814 @@ function createCourseTable($courseCode)
         exams[idx].show_correct_answers = formData.show_correct_answers;
         exams[idx].allow_review = formData.allow_review;
 
-        if (formData.questions.length > 0) exams[idx].questions = formData.questions;
+        exams[idx].questions = formData.questions;
 
         setExams(exams);
+        backupExamDraft(exams[idx]);
         console.log("✅ All form data saved to exam object");
         return true;
     }
+    // ============================================
+    // MODERN CODING QUESTION AUTHORING WORKFLOW
+    // ============================================
+    function richToPlain(html) {
+        const div = document.createElement('div');
+        div.innerHTML = html || '';
+        return (div.textContent || div.innerText || '').trim();
+    }
+
+    function richValueToHtml(value) {
+        const text = String(value || '');
+        if (!text) return '';
+        if (/<[a-z][\s\S]*>/i.test(text)) return text;
+        return escapeHTML(text).replace(/\n/g, '<br>');
+    }
+
+    const qodaModelEditors = new Map();
+    let qodaMonacoLoading = null;
+
+    function qodaEditorTheme() {
+        return 'vs-dark';
+    }
+
+    function loadQodaMonaco() {
+        if (window.monaco?.editor) return Promise.resolve(window.monaco);
+        if (qodaMonacoLoading) return qodaMonacoLoading;
+        qodaMonacoLoading = new Promise((resolve, reject) => {
+            const ensureLoader = () => {
+                if (typeof window.require === 'function') {
+                    waitForLoader();
+                    return;
+                }
+                let script = document.querySelector('script[data-qoda-monaco-loader]');
+                if (!script) {
+                    script = document.createElement('script');
+                    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs/loader.js';
+                    script.async = true;
+                    script.dataset.qodaMonacoLoader = '1';
+                    document.head.appendChild(script);
+                }
+                script.addEventListener('load', waitForLoader, { once: true });
+                script.addEventListener('error', () => reject(new Error('Monaco loader failed to load')), { once: true });
+                setTimeout(() => {
+                    if (typeof window.require === 'function') waitForLoader();
+                }, 1200);
+            };
+            const waitForLoader = () => {
+                if (window.monaco?.editor) {
+                    resolve(window.monaco);
+                    return;
+                }
+                if (typeof window.require !== 'function') {
+                    reject(new Error('Monaco loader is unavailable'));
+                    return;
+                }
+                window.require.config({
+                    paths: {
+                        vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs'
+                    }
+                });
+                window.require(['vs/editor/editor.main'], () => resolve(window.monaco), reject);
+            };
+            ensureLoader();
+        }).catch(error => {
+            console.warn('Model solution editor fallback:', error);
+            qodaMonacoLoading = null;
+            throw error;
+        });
+        return qodaMonacoLoading;
+    }
+
+    async function initQodaModelSolutionEditors() {
+        const containers = Array.from(document.querySelectorAll('.qoda-monaco-editor[data-question-id]'));
+        const liveIds = new Set(containers.map(container => container.id));
+        qodaModelEditors.forEach((editor, id) => {
+            if (!liveIds.has(id)) {
+                editor.dispose();
+                qodaModelEditors.delete(id);
+            }
+        });
+        if (!containers.length) return;
+
+        try {
+            const monacoApi = await loadQodaMonaco();
+            containers.forEach(container => {
+                const qId = container.dataset.questionId;
+                const lang = container.dataset.language || 'plaintext';
+                const field = container.dataset.field || 'modelSolution';
+                const fallback = document.getElementById(`${field}_${qId}`);
+                const shell = container.closest('.qoda-code-shell');
+                let existing = qodaModelEditors.get(container.id);
+                if (existing && existing.getDomNode()?.parentElement !== container) {
+                    existing.dispose();
+                    qodaModelEditors.delete(container.id);
+                    existing = null;
+                }
+                if (existing) {
+                    const model = existing.getModel();
+                    if (model) monacoApi.editor.setModelLanguage(model, lang);
+                    existing.updateOptions({ theme: qodaEditorTheme() });
+                    shell?.classList.add('monaco-ready');
+                    requestAnimationFrame(() => existing.layout());
+                    return;
+                }
+                const editor = monacoApi.editor.create(container, {
+                    value: fallback?.value || '',
+                    language: lang,
+                    theme: qodaEditorTheme(),
+                    automaticLayout: true,
+                    minimap: { enabled: false },
+                    lineNumbers: 'on',
+                    lineNumbersMinChars: 3,
+                    glyphMargin: false,
+                    folding: false,
+                    renderLineHighlight: 'line',
+                    tabSize: 4,
+                    insertSpaces: true,
+                    wordWrap: 'on',
+                    scrollBeyondLastLine: false,
+                    fontSize: 14,
+                    lineHeight: 22
+                });
+                shell?.classList.add('monaco-ready');
+                editor.onDidChangeModelContent(() => {
+                    const value = editor.getValue();
+                    if (fallback) fallback.value = value;
+                    updateQuestion(qId, field, value);
+                });
+                qodaModelEditors.set(container.id, editor);
+                requestAnimationFrame(() => editor.layout());
+                setTimeout(() => editor.layout(), 150);
+            });
+        } catch (error) {
+            document.querySelectorAll('.qoda-code-shell.monaco-ready').forEach(shell => shell.classList.remove('monaco-ready'));
+        }
+    }
+
+    function refreshQodaModelEditorThemes() {
+        if (!window.monaco?.editor) return;
+        monaco.editor.setTheme(qodaEditorTheme());
+        qodaModelEditors.forEach(editor => {
+            editor.updateOptions({ theme: qodaEditorTheme() });
+            editor.layout();
+        });
+    }
+
+    function handleQodaCodeTextareaKeydown(event, qId, field) {
+        const textarea = event.target;
+        if (!textarea || !(textarea instanceof HTMLTextAreaElement)) return;
+        const start = textarea.selectionStart;
+        const end = textarea.selectionEnd;
+        const value = textarea.value;
+
+        if (event.key === 'Tab') {
+            event.preventDefault();
+            textarea.value = `${value.slice(0, start)}    ${value.slice(end)}`;
+            textarea.selectionStart = textarea.selectionEnd = start + 4;
+            updateQuestion(qId, field, textarea.value);
+            return;
+        }
+
+        if (event.key === 'Enter') {
+            const lineStart = value.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
+            const currentLine = value.slice(lineStart, start);
+            const indent = (currentLine.match(/^\s*/) || [''])[0];
+            const extra = /[:{[(]\s*$/.test(currentLine) ? '    ' : '';
+            if (indent || extra) {
+                event.preventDefault();
+                const insert = `\n${indent}${extra}`;
+                textarea.value = `${value.slice(0, start)}${insert}${value.slice(end)}`;
+                textarea.selectionStart = textarea.selectionEnd = start + insert.length;
+                updateQuestion(qId, field, textarea.value);
+            }
+        }
+    }
+
+    function normalizeCodingQuestion(q) {
+        q.type = 'code';
+        q.text = q.text || richToPlain(q.problemStatement || '');
+        q.problemStatement = q.problemStatement || q.text || '';
+        q.inputFormat = '';
+        q.outputFormat = '';
+        q.constraints = q.constraints || '';
+        q.notes = q.notes || '';
+        q.sampleCases = Array.isArray(q.sampleCases) ? q.sampleCases : [];
+        q.testCases = Array.isArray(q.testCases) ? q.testCases : [];
+        q.language = q.language || 'Python';
+        q.languageMode = q.languageMode || 'single';
+        q.starterCode = q.starterCode || '';
+        q.modelSolution = q.modelSolution || '';
+        q.difficulty = q.difficulty || 'Easy';
+        q.comparisonMode = q.comparisonMode || 'exact';
+        q.markingRubric = [];
+        q.executionSettings = Object.assign({
+            timeLimit: 2,
+            memoryLimit: 128,
+            cpuLimit: 2,
+            comparisonMode: 'exact',
+            ignoreWhitespace: true,
+            ignoreTrailingSpaces: true,
+            ignoreBlankLines: false,
+            caseSensitive: true,
+            customValidator: ''
+        }, q.executionSettings || {});
+        q.securitySettings = Object.assign({
+            allowRunCode: true,
+            allowCompile: true,
+            allowCustomInput: true,
+            showPassedTestCases: true,
+            showHiddenTestCases: false,
+            detectCopyPaste: true,
+            detectTabSwitching: true,
+            detectMultipleScreens: true,
+            autoSave: true,
+            autoSubmit: true
+        }, q.securitySettings || {});
+        q.questionBankTags = q.questionBankTags || '';
+        q.topic = q.topic || '';
+        q.subtopic = q.subtopic || '';
+        q.tags = q.tags || '';
+        q.marks = parseFloat(q.marks || 5);
+        q.compulsory = !!q.compulsory;
+        return q;
+    }
+
+    function createCodeQuestionObject() {
+        return normalizeCodingQuestion({
+            id: uid('Q'),
+            title: '',
+            type: 'code',
+            text: '',
+            marks: 5,
+            compulsory: false,
+            language: 'Python',
+            difficulty: 'Easy',
+            gradingMode: 'auto',
+            sampleCases: [],
+            testCases: [],
+            markingRubric: [{
+                    criterion: 'Input Handling',
+                    marks: 1,
+                    description: 'Reads the required input correctly.'
+                },
+                {
+                    criterion: 'Logic',
+                    marks: 2,
+                    description: 'Solves the problem using correct logic.'
+                },
+                {
+                    criterion: 'Output',
+                    marks: 1,
+                    description: 'Displays output in the required format.'
+                },
+                {
+                    criterion: 'Code Quality',
+                    marks: 1,
+                    description: 'Uses clear, maintainable code.'
+                }
+            ]
+        });
+    }
+
+    function getQuestionById(qId) {
+        const exams = getExams();
+        const examIndex = exams.findIndex(e => parseInt(e.id) === parseInt(currentExamId));
+        if (examIndex < 0) return null;
+        const qIndex = (exams[examIndex].questions || []).findIndex(q => q.id === qId);
+        if (qIndex < 0) return null;
+        return {
+            exams,
+            examIndex,
+            qIndex,
+            question: normalizeCodingQuestion(exams[examIndex].questions[qIndex])
+        };
+    }
+
+    function persistQuestionMutation(ctx, rerender = false) {
+        ctx.exams[ctx.examIndex].questions[ctx.qIndex] = ctx.question;
+        setExams(ctx.exams);
+        backupExamDraft(ctx.exams[ctx.examIndex]);
+        refreshQuestionAnswerRuleHint();
+        saveExamToDatabase();
+        if (rerender) renderQuestions();
+        updateBuilderValidationSummary();
+    }
+
+    function updateQuestion(qId, field, value) {
+        const ctx = getQuestionById(qId);
+        if (!ctx) return;
+        ctx.question[field] = value;
+        if (field === 'marks') {
+            ctx.question.marks = parseFloat(value) || 0;
+            if (Array.isArray(ctx.question.markingRubric) && ctx.question.markingRubric.length) {
+                ctx.question.markingRubric = distributeMarks(ctx.question.marks, ctx.question.markingRubric.map(row => [
+                    row.criterion || 'Criterion',
+                    row.description || 'Award marks for this requirement.'
+                ]));
+            }
+        }
+        if (field === 'problemStatement') ctx.question.text = richToPlain(value);
+        persistQuestionMutation(ctx, field === 'marks' || field === 'compulsory' || field === 'difficulty');
+    }
+
+    function updateQuestionTextField(qId, field, value) {
+        const ctx = getQuestionById(qId);
+        if (!ctx) return;
+        ctx.question[field] = value;
+        if (field === 'problemStatement') ctx.question.text = richToPlain(value);
+        persistQuestionMutation(ctx, false);
+        const preview = document.getElementById(`qPreview_${qId}`);
+        if (preview) preview.innerHTML = renderQuestionPreview(ctx.question);
+    }
+
+    function updateNestedQuestion(qId, group, field, value) {
+        const ctx = getQuestionById(qId);
+        if (!ctx) return;
+        ctx.question[group] = ctx.question[group] || {};
+        ctx.question[group][field] = value;
+        persistQuestionMutation(ctx, false);
+    }
+
+    function formatRichField(qId, field, command) {
+        const editor = document.getElementById(`rich_${field}_${qId}`);
+        if (!editor) return;
+        editor.focus();
+        if (command === 'code') {
+            document.execCommand('insertHTML', false, '<pre><code>// code block</code></pre>');
+        } else if (command === 'table') {
+            document.execCommand('insertHTML', false,
+                '<table data-qoda-numbered="1"><tr><th>#</th><th>Input</th><th>Output</th></tr><tr><td>1</td><td></td><td></td></tr><tr><td>2</td><td></td><td></td></tr></table>');
+        } else if (command === 'image') {
+            insertRichImageFromDrive(qId, field);
+            return;
+        } else if (command === 'math') {
+            document.execCommand('insertHTML', false, '<span class="math-inline">\\( formula \\)</span>');
+        } else {
+            document.execCommand(command, false, null);
+        }
+        updateQuestionTextField(qId, field, editor.innerHTML);
+    }
+
+    function activeRichTable(editor) {
+        const selection = window.getSelection();
+        let node = selection?.anchorNode || null;
+        while (node && node !== editor) {
+            if (node.nodeType === 1 && node.tagName === 'TABLE') return node;
+            node = node.parentNode;
+        }
+        return editor.querySelector('table:last-of-type');
+    }
+
+    function renumberRichTable(table) {
+        if (!table || table.dataset.qodaNumbered !== '1') return;
+        Array.from(table.rows).forEach((row, index) => {
+            const first = row.cells[0] || row.insertCell(0);
+            first.textContent = index === 0 ? '#' : String(index);
+        });
+    }
+
+    function editRichTable(qId, field, action) {
+        const editor = document.getElementById(`rich_${field}_${qId}`);
+        if (!editor) return;
+        editor.focus();
+        let table = activeRichTable(editor);
+        if (!table) {
+            formatRichField(qId, field, 'table');
+            table = activeRichTable(editor);
+        }
+        if (!table) return;
+        if (action === 'row') {
+            const source = table.rows[table.rows.length - 1] || table.insertRow();
+            const row = table.insertRow(-1);
+            const cells = Math.max(source.cells.length, 2);
+            for (let i = 0; i < cells; i++) row.insertCell(-1).innerHTML = i === 0 && table.dataset.qodaNumbered === '1' ? '' : '&nbsp;';
+        }
+        if (action === 'column') {
+            Array.from(table.rows).forEach((row, index) => {
+                const cell = index === 0 ? document.createElement('th') : document.createElement('td');
+                cell.innerHTML = index === 0 ? 'Column' : '&nbsp;';
+                row.appendChild(cell);
+            });
+        }
+        if (action === 'number') table.dataset.qodaNumbered = '1';
+        renumberRichTable(table);
+        updateQuestionTextField(qId, field, editor.innerHTML);
+    }
+
+    function insertRichImageFromDrive(qId, field) {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'image/*';
+        input.onchange = () => {
+            const file = input.files?.[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                const img = new Image();
+                img.onload = () => {
+                    const maxWidth = 1100;
+                    const scale = Math.min(1, maxWidth / img.width);
+                    const canvas = document.createElement('canvas');
+                    canvas.width = Math.max(1, Math.round(img.width * scale));
+                    canvas.height = Math.max(1, Math.round(img.height * scale));
+                    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+                    const dataUrl = canvas.toDataURL('image/jpeg', 0.78);
+                    const editor = document.getElementById(`rich_${field}_${qId}`);
+                    if (!editor) return;
+                    editor.focus();
+                    document.execCommand('insertHTML', false, `<img src="${dataUrl}" alt="Question image">`);
+                    updateQuestionTextField(qId, field, editor.innerHTML);
+                };
+                img.src = String(reader.result || '');
+            };
+            reader.readAsDataURL(file);
+        };
+        input.click();
+    }
+
+    function renderRichEditor(q, field, label, placeholder) {
+        return `
+            <div class="qoda-field">
+                <label>${label}</label>
+                <div class="qoda-rich-wrap">
+                    <div class="qoda-rich-toolbar" aria-label="${escapeHTML(label)} tools">
+                        <button type="button" title="Bold" onclick="formatRichField('${q.id}','${field}','bold')"><b>B</b></button>
+                        <button type="button" title="Italic" onclick="formatRichField('${q.id}','${field}','italic')"><i>I</i></button>
+                        <button type="button" title="Bulleted list" onclick="formatRichField('${q.id}','${field}','insertUnorderedList')"><i class="fas fa-list-ul"></i></button>
+                        <button type="button" title="Numbered list" onclick="formatRichField('${q.id}','${field}','insertOrderedList')"><i class="fas fa-list-ol"></i></button>
+                        <button type="button" title="Code block" onclick="formatRichField('${q.id}','${field}','code')"><i class="fas fa-code"></i></button>
+                        <button type="button" title="Table" onclick="formatRichField('${q.id}','${field}','table')"><i class="fas fa-table"></i></button>
+                        <button type="button" title="Add table row" onclick="editRichTable('${q.id}','${field}','row')"><i class="fas fa-grip-lines"></i></button>
+                        <button type="button" title="Add table column" onclick="editRichTable('${q.id}','${field}','column')"><i class="fas fa-columns"></i></button>
+                        <button type="button" title="Number table rows" onclick="editRichTable('${q.id}','${field}','number')"><i class="fas fa-list-ol"></i></button>
+                        <button type="button" title="Image" onclick="formatRichField('${q.id}','${field}','image')"><i class="fas fa-image"></i></button>
+                        <button type="button" title="Formula" onclick="formatRichField('${q.id}','${field}','math')"><i class="fas fa-square-root-variable"></i></button>
+                    </div>
+                    <div id="rich_${field}_${q.id}" class="qoda-rich-editor" contenteditable="true"
+                        data-placeholder="${escapeHTML(placeholder)}"
+                        oninput="updateQuestionTextField('${q.id}','${field}',this.innerHTML)">${richValueToHtml(q[field])}</div>
+                </div>
+            </div>`;
+    }
+
+    function getQuestionValidation(q) {
+        normalizeCodingQuestion(q);
+        const checks = [{
+                label: 'Question entered',
+                ok: !!richToPlain(q.problemStatement || q.text)
+            },
+            {
+                label: 'Marks assigned',
+                ok: (parseFloat(q.marks) || 0) > 0
+            },
+            {
+                label: 'Language selected',
+                ok: q.languageMode === 'multi' || !!q.language
+            },
+            {
+                label: 'Test cases created',
+                ok: (q.testCases || []).length > 0
+            },
+            {
+                label: 'Model solution provided',
+                ok: !!String(q.modelSolution || '').trim()
+            }
+        ];
+        checks.push({
+            label: 'Question ready for publication',
+            ok: checks.every(c => c.ok)
+        });
+        return checks;
+    }
+
+    function renderValidationChecklist(q) {
+        return `<ul class="qoda-validation-list">${getQuestionValidation(q).map(item => `
+            <li class="${item.ok ? 'ready' : 'missing'}">
+                <i class="fas ${item.ok ? 'fa-check-circle' : 'fa-circle-exclamation'}"></i>
+                <span>${escapeHTML(item.label)}</span>
+            </li>`).join('')}</ul>`;
+    }
+
+    function renderValidationStatusPanel(q) {
+        const checks = getQuestionValidation(q);
+        const ready = checks.filter(item => item.ok).length;
+        const warningLabels = ['test case', 'model solution'];
+        const items = checks.map(item => {
+            const lower = item.label.toLowerCase();
+            const status = item.ok ? 'ready' : (warningLabels.some(label => lower.includes(label)) ? 'warning' : 'missing');
+            const icon = item.ok ? 'fa-check-circle' : (status === 'warning' ? 'fa-triangle-exclamation' : 'fa-circle-exclamation');
+            return `
+                <div class="qoda-validation-item ${status}">
+                    <i class="fas ${icon}"></i>
+                    <span>${escapeHTML(item.label)}</span>
+                </div>`;
+        }).join('');
+        return `
+            <div class="qoda-validation-title">
+                <span><i class="fas fa-clipboard-check"></i> Validation Status</span>
+                <span class="qoda-validation-progress">Progress: ${ready} / ${checks.length} Requirements Complete</span>
+            </div>
+            <div class="qoda-validation-grid">${items}</div>
+        `;
+    }
+
+    function formatValidationProgress(ready, total) {
+        return `${ready} of ${total} validation checks complete`;
+    }
+
+    function renderQuestionPreview(q) {
+        normalizeCodingQuestion(q);
+        const samples = (q.sampleCases || []).map((s, i) => `
+            <div class="qoda-case-card">
+                <strong>Sample ${i + 1}</strong>
+                <div><small>Input</small><pre>${escapeHTML(s.input || '')}</pre></div>
+                <div><small>Output</small><pre>${escapeHTML(s.output || s.expectedOutput || '')}</pre></div>
+                ${s.explanation ? `<div><small>Explanation</small><div>${escapeHTML(s.explanation)}</div></div>` : ''}
+            </div>`).join('');
+        return `
+            <div class="qoda-preview-content">
+                <div>
+                    <div class="qoda-q-badges">
+                        <span class="qoda-badge primary">${escapeHTML(q.languageMode === 'multi' ? 'Multi-language' : q.language)}</span>
+                        <span class="qoda-badge warning">${parseFloat(q.marks || 0)} marks</span>
+                    </div>
+                </div>
+                <section><h4>Problem Statement</h4><div>${richValueToHtml(q.problemStatement || q.text)}</div></section>
+                <section><h4>Validation</h4>${renderValidationChecklist(q)}</section>
+            </div>`;
+    }
+
+    function renderSampleCasesList(q) {
+        if (!q.sampleCases.length) {
+            return `<div class="empty-state" style="padding:18px;">No sample cases yet. Add examples students can see.</div>`;
+        }
+        return q.sampleCases.map((sample, index) => `
+            <div class="qoda-case-card">
+                <div class="qoda-case-head">
+                    <strong>Sample Case #${index + 1}</strong>
+                    <div class="qoda-case-actions">
+                        <button class="btn small" onclick="duplicateSampleCase('${q.id}',${index})"><i class="fas fa-copy"></i> Duplicate</button>
+                        <button class="btn danger small" onclick="removeSampleCase('${q.id}',${index})"><i class="fas fa-trash"></i> Delete</button>
+                    </div>
+                </div>
+                <div class="qoda-field-grid">
+                    <div class="qoda-field"><label>Sample Input</label><textarea onchange="updateSampleCase('${q.id}',${index},'input',this.value)">${escapeHTML(sample.input || '')}</textarea></div>
+                    <div class="qoda-field"><label>Sample Output</label><textarea onchange="updateSampleCase('${q.id}',${index},'output',this.value)">${escapeHTML(sample.output || sample.expectedOutput || '')}</textarea></div>
+                </div>
+                <div class="qoda-field"><label>Explanation</label><textarea onchange="updateSampleCase('${q.id}',${index},'explanation',this.value)">${escapeHTML(sample.explanation || '')}</textarea></div>
+            </div>`).join('');
+    }
+
+    function renderModernTestCasesList(q) {
+        if (!q.testCases.length) {
+            return `<div class="empty-state" style="padding:18px;">No grading test cases yet. Add visible and hidden tests for auto-grading.</div>`;
+        }
+        return q.testCases.map((tc, index) => `
+            <div class="qoda-case-card">
+                <div class="qoda-case-head">
+                    <div class="qoda-q-badges">
+                        <strong>Test Case #${index + 1}</strong>
+                        <span class="qoda-badge ${tc.hidden ? 'warning' : 'success'}">${tc.hidden ? 'Hidden Test Case' : 'Visible Test Case'}</span>
+                    </div>
+                    <div class="qoda-case-actions">
+                        <button class="btn small" onclick="duplicateTestCase('${q.id}',${index})"><i class="fas fa-copy"></i> Duplicate</button>
+                        <button class="btn danger small" onclick="removeTestCase('${q.id}',${index})"><i class="fas fa-trash"></i> Delete</button>
+                    </div>
+                </div>
+                    <div class="qoda-field-grid">
+                    <div class="qoda-field"><label>Input</label><textarea placeholder="Example: 23 3, or press Enter for line-by-line input" onchange="updateTestCase('${q.id}',${index},'input',this.value)">${escapeHTML(tc.input || '')}</textarea></div>
+                    <div class="qoda-field"><label>Expected Output</label><textarea placeholder="Example: 26, or multiple output lines separated by Enter" onchange="updateTestCase('${q.id}',${index},'expected',this.value)">${escapeHTML(tc.expected || tc.expectedOutput || '')}</textarea></div>
+                    <div class="qoda-field">
+                        <label>Comparison Mode</label>
+                        <select onchange="updateTestCase('${q.id}',${index},'comparisonMode',this.value)">
+                            ${['exact','contains','ignore_whitespace','ignore_trailing','ignore_blank_lines','case_insensitive','regex','numeric_tolerance','custom_validator'].map(mode =>
+                                `<option value="${mode}" ${(tc.comparisonMode || 'exact') === mode ? 'selected' : ''}>${mode.replaceAll('_',' ')}</option>`).join('')}
+                        </select>
+                    </div>
+                    <div class="qoda-field">
+                        <label>Visibility</label>
+                        <label class="qoda-toggle-row">
+                            <input type="checkbox" ${tc.hidden ? 'checked' : ''} onchange="updateTestCase('${q.id}',${index},'hidden',this.checked)">
+                            ${tc.hidden ? 'Hidden Test Case' : 'Visible Test Case'}
+                        </label>
+                    </div>
+                </div>
+            </div>`).join('');
+    }
+
+    function renderRubricRows(q) {
+        if (!q.markingRubric.length) {
+            return `<div class="empty-state" style="padding:18px;">No rubric criteria yet.</div>`;
+        }
+        return q.markingRubric.map((row, index) => `
+            <div class="qoda-rubric-row">
+                <div class="qoda-field-grid">
+                    <div class="qoda-field"><label>Criteria</label><input value="${escapeHTML(row.criterion || '')}" onchange="updateRubricCriterion('${q.id}',${index},'criterion',this.value)"></div>
+                    <div class="qoda-field"><label>Marks</label><input type="number" min="0" step="0.5" value="${parseFloat(row.marks || 0)}" onchange="updateRubricCriterion('${q.id}',${index},'marks',parseFloat(this.value)||0)"></div>
+                    <div class="qoda-field"><label>Description</label><input value="${escapeHTML(row.description || '')}" onchange="updateRubricCriterion('${q.id}',${index},'description',this.value)"></div>
+                </div>
+                <div><button class="btn danger small" onclick="removeRubricCriterion('${q.id}',${index})"><i class="fas fa-trash"></i> Remove Criterion</button></div>
+            </div>`).join('');
+    }
+
+    const qodaTemplateCategories = ['Coding Templates', 'Web Development Templates', 'Database Templates'];
+    let qodaTemplateTargetQuestionId = null;
+
+    const qodaQuestionTemplates = [{
+            category: 'Coding Templates',
+            title: 'Input / Output Problems',
+            topic: 'Input and Output',
+            subtopic: 'Standard input',
+            difficulty: 'Easy',
+            language: 'Python',
+            semester: 'First Semester',
+            tags: ['stdin', 'stdout', 'basics'],
+            problemStatement: 'Write a program that reads the required values from standard input and displays the correct result.',
+            inputFormat: 'Each input value is provided on a separate line.',
+            outputFormat: 'Print the final answer on a single line.',
+            sampleCases: [{ input: '12\n45\n23', output: '45', explanation: '45 is the largest value.' }],
+            testCases: [{ input: '12\n45\n23', expected: '45', hidden: false }, { input: '7\n3\n9', expected: '9', hidden: true }],
+            modelSolution: 'values = [int(input()) for _ in range(3)]\nprint(max(values))',
+            markingRubric: [
+                { criterion: 'Input Handling', marks: 1, description: 'Reads all required inputs correctly.' },
+                { criterion: 'Logic', marks: 2, description: 'Uses the correct calculation or comparison.' },
+                { criterion: 'Output', marks: 1, description: 'Prints the result in the expected format.' },
+                { criterion: 'Code Quality', marks: 1, description: 'Code is readable and organized.' }
+            ],
+            executionSettings: { timeLimit: 2, memoryLimit: 128, cpuLimit: 2 },
+            recommendedMarks: 5
+        },
+        {
+            category: 'Coding Templates',
+            title: 'Loops and Iteration',
+            topic: 'Loops',
+            subtopic: 'For and while loops',
+            difficulty: 'Easy',
+            language: 'Java',
+            semester: 'First Semester',
+            tags: ['loops', 'iteration'],
+            problemStatement: 'Write a program that reads an integer n and prints the numbers from 1 to n, each on a new line.',
+            inputFormat: 'A single integer n.',
+            outputFormat: 'Numbers from 1 to n, each on a new line.',
+            sampleCases: [{ input: '5', output: '1\n2\n3\n4\n5', explanation: 'The loop prints five values.' }],
+            testCases: [{ input: '3', expected: '1\n2\n3', hidden: false }, { input: '1', expected: '1', hidden: true }],
+            modelSolution: 'import java.util.Scanner;\n\npublic class Main {\n    public static void main(String[] args) {\n        Scanner input = new Scanner(System.in);\n        int n = input.nextInt();\n        for (int i = 1; i <= n; i++) {\n            System.out.println(i);\n        }\n    }\n}',
+            markingRubric: [
+                { criterion: 'Input Handling', marks: 1, description: 'Reads n correctly.' },
+                { criterion: 'Loop Logic', marks: 2, description: 'Uses a valid loop with correct bounds.' },
+                { criterion: 'Output', marks: 1, description: 'Prints each value correctly.' },
+                { criterion: 'Code Quality', marks: 1, description: 'Uses clear names and structure.' }
+            ],
+            executionSettings: { timeLimit: 2, memoryLimit: 128, cpuLimit: 2 },
+            recommendedMarks: 5
+        },
+        {
+            category: 'Coding Templates',
+            title: 'Conditional Statements',
+            topic: 'Decision Making',
+            subtopic: 'If / else',
+            difficulty: 'Easy',
+            language: 'C',
+            semester: 'First Semester',
+            tags: ['if', 'else', 'conditions'],
+            problemStatement: 'Write a program that reads one integer and determines whether it is even or odd.',
+            inputFormat: 'One integer.',
+            outputFormat: 'Print Even if the number is even, otherwise print Odd.',
+            sampleCases: [{ input: '8', output: 'Even', explanation: '8 is divisible by 2.' }],
+            testCases: [{ input: '8', expected: 'Even', hidden: false }, { input: '7', expected: 'Odd', hidden: true }],
+            modelSolution: '#include <stdio.h>\n\nint main() {\n    int number;\n    scanf("%d", &number);\n    if (number % 2 == 0) {\n        printf("Even");\n    } else {\n        printf("Odd");\n    }\n    return 0;\n}',
+            markingRubric: [
+                { criterion: 'Input Handling', marks: 1, description: 'Reads the integer correctly.' },
+                { criterion: 'Condition', marks: 2, description: 'Uses modulus or valid even/odd logic.' },
+                { criterion: 'Output', marks: 1, description: 'Displays the correct label.' },
+                { criterion: 'Code Quality', marks: 1, description: 'Compiles and is readable.' }
+            ],
+            executionSettings: { timeLimit: 2, memoryLimit: 128, cpuLimit: 2 },
+            recommendedMarks: 5
+        },
+        {
+            category: 'Coding Templates',
+            title: 'Functions and Methods',
+            topic: 'Functions',
+            subtopic: 'Reusable logic',
+            difficulty: 'Medium',
+            language: 'JavaScript',
+            semester: 'First Semester',
+            tags: ['functions', 'methods'],
+            problemStatement: 'Write a function that accepts two numbers and returns their sum. Read two numbers and print the returned value.',
+            inputFormat: 'Two numbers on separate lines.',
+            outputFormat: 'The sum of both numbers.',
+            sampleCases: [{ input: '4\n6', output: '10', explanation: '4 + 6 = 10.' }],
+            testCases: [{ input: '4\n6', expected: '10', hidden: false }, { input: '12\n5', expected: '17', hidden: true }],
+            modelSolution: 'const fs = require("fs");\nconst [a, b] = fs.readFileSync(0, "utf8").trim().split(/\\s+/).map(Number);\nfunction add(x, y) {\n  return x + y;\n}\nconsole.log(add(a, b));',
+            markingRubric: [
+                { criterion: 'Function', marks: 2, description: 'Creates and uses a function/method.' },
+                { criterion: 'Input Handling', marks: 1, description: 'Reads both values correctly.' },
+                { criterion: 'Output', marks: 1, description: 'Prints the correct sum.' },
+                { criterion: 'Code Quality', marks: 1, description: 'Clear reusable code.' }
+            ],
+            executionSettings: { timeLimit: 2, memoryLimit: 128, cpuLimit: 2 },
+            recommendedMarks: 5
+        },
+        {
+            category: 'Coding Templates',
+            title: 'Arrays and Lists',
+            topic: 'Arrays',
+            subtopic: 'Aggregation',
+            difficulty: 'Medium',
+            language: 'Python',
+            semester: 'Second Semester',
+            tags: ['arrays', 'lists', 'sum'],
+            problemStatement: 'Read n followed by n integers and print the sum of all values.',
+            inputFormat: 'The first line contains n. The next line contains n integers.',
+            outputFormat: 'Print the sum.',
+            sampleCases: [{ input: '5\n1 2 3 4 5', output: '15', explanation: 'The sum is 15.' }],
+            testCases: [{ input: '5\n1 2 3 4 5', expected: '15', hidden: false }, { input: '3\n10 -2 7', expected: '15', hidden: true }],
+            modelSolution: 'n = int(input())\nvalues = list(map(int, input().split()))\nprint(sum(values[:n]))',
+            markingRubric: [
+                { criterion: 'Input Handling', marks: 1, description: 'Reads n and the array values.' },
+                { criterion: 'Array Logic', marks: 2, description: 'Processes the collection correctly.' },
+                { criterion: 'Output', marks: 1, description: 'Prints the correct sum.' },
+                { criterion: 'Code Quality', marks: 1, description: 'Readable and efficient for the task.' }
+            ],
+            executionSettings: { timeLimit: 2, memoryLimit: 128, cpuLimit: 2 },
+            recommendedMarks: 5
+        },
+        {
+            category: 'Coding Templates',
+            title: 'Strings',
+            topic: 'String Processing',
+            subtopic: 'Reversal',
+            difficulty: 'Easy',
+            language: 'PHP',
+            semester: 'Second Semester',
+            tags: ['strings', 'reverse'],
+            problemStatement: 'Read a string and print the string in reverse order.',
+            inputFormat: 'One line containing a string.',
+            outputFormat: 'The reversed string.',
+            sampleCases: [{ input: 'qoda', output: 'adoq', explanation: 'The characters are reversed.' }],
+            testCases: [{ input: 'qoda', expected: 'adoq', hidden: false }, { input: 'exam', expected: 'maxe', hidden: true }],
+            modelSolution: '<' + '?php\n$input = trim(stream_get_contents(STDIN));\necho strrev($input);\n?' + '>',
+            markingRubric: [
+                { criterion: 'Input Handling', marks: 1, description: 'Reads the string.' },
+                { criterion: 'String Logic', marks: 2, description: 'Reverses the string correctly.' },
+                { criterion: 'Output', marks: 1, description: 'Displays only the reversed value.' },
+                { criterion: 'Code Quality', marks: 1, description: 'Clean PHP syntax.' }
+            ],
+            executionSettings: { timeLimit: 2, memoryLimit: 128, cpuLimit: 2 },
+            recommendedMarks: 5
+        },
+        {
+            category: 'Web Development Templates',
+            title: 'HTML Page Design',
+            topic: 'HTML',
+            subtopic: 'Semantic page structure',
+            difficulty: 'Easy',
+            language: 'HTML/CSS/JS',
+            semester: 'First Semester',
+            tags: ['html', 'semantic', 'layout'],
+            problemStatement: 'Create a semantic HTML page for a student profile with a heading, image placeholder, course list, and contact section.',
+            inputFormat: 'No standard input is required.',
+            outputFormat: 'A valid HTML page displayed in the browser preview.',
+            sampleCases: [{ input: '', output: 'Student profile page renders correctly.', explanation: 'Students should use semantic tags.' }],
+            testCases: [{ input: '', expected: '<h1', hidden: false }, { input: '', expected: '<section', hidden: true }],
+            modelSolution: '<!doctype html>\n<html>\n<head><title>Student Profile</title></head>\n<body>\n  <main>\n    <h1>Student Profile</h1>\n    <section><h2>Courses</h2><ul><li>Programming</li></ul></section>\n    <section><h2>Contact</h2><p>Email: student@example.com</p></section>\n  </main>\n</body>\n</html>',
+            markingRubric: [
+                { criterion: 'Structure', marks: 2, description: 'Uses semantic HTML correctly.' },
+                { criterion: 'Required Content', marks: 2, description: 'Includes all requested sections.' },
+                { criterion: 'Validity', marks: 1, description: 'HTML is valid and renders.' }
+            ],
+            executionSettings: { timeLimit: 1, memoryLimit: 64, cpuLimit: 1 },
+            recommendedMarks: 5
+        },
+        {
+            category: 'Web Development Templates',
+            title: 'JavaScript DOM Manipulation',
+            topic: 'JavaScript',
+            subtopic: 'DOM events',
+            difficulty: 'Medium',
+            language: 'HTML/CSS/JS',
+            semester: 'Second Semester',
+            tags: ['dom', 'events', 'javascript'],
+            problemStatement: 'Build a page with an input, a button, and an output area. When the button is clicked, display the typed message.',
+            inputFormat: 'Browser input field.',
+            outputFormat: 'The message appears on the page after clicking the button.',
+            sampleCases: [{ input: 'Hello', output: 'Hello', explanation: 'The page displays the typed text.' }],
+            testCases: [{ input: '', expected: 'addEventListener', hidden: false }, { input: '', expected: 'textContent', hidden: true }],
+            modelSolution: '<input id="message"><button id="show">Show</button><p id="output"></p><script>document.getElementById("show").addEventListener("click",()=>{document.getElementById("output").textContent=document.getElementById("message").value;});<\/script>',
+            markingRubric: [
+                { criterion: 'HTML Controls', marks: 1, description: 'Creates the input, button, and output area.' },
+                { criterion: 'DOM Logic', marks: 3, description: 'Uses JavaScript event handling correctly.' },
+                { criterion: 'User Experience', marks: 1, description: 'Displays the result clearly.' }
+            ],
+            executionSettings: { timeLimit: 1, memoryLimit: 64, cpuLimit: 1 },
+            recommendedMarks: 5
+        },
+        {
+            category: 'Database Templates',
+            title: 'SQL Queries',
+            topic: 'SQL',
+            subtopic: 'Selection and filtering',
+            difficulty: 'Easy',
+            language: 'SQL',
+            semester: 'First Semester',
+            tags: ['select', 'where', 'sql'],
+            problemStatement: 'Write an SQL query to select all active students from a students table.',
+            inputFormat: 'Table: students(id, full_name, status).',
+            outputFormat: 'Rows where status is Active.',
+            sampleCases: [{ input: 'students table', output: 'Only active students', explanation: 'Filter using WHERE.' }],
+            testCases: [{ input: '', expected: 'SELECT', hidden: false }, { input: '', expected: 'WHERE', hidden: true }],
+            modelSolution: "SELECT id, full_name, status\nFROM students\nWHERE status = 'Active';",
+            markingRubric: [
+                { criterion: 'SELECT Clause', marks: 1, description: 'Selects appropriate columns.' },
+                { criterion: 'FROM Clause', marks: 1, description: 'Uses the correct table.' },
+                { criterion: 'WHERE Clause', marks: 2, description: 'Filters active students correctly.' },
+                { criterion: 'Syntax', marks: 1, description: 'Valid SQL syntax.' }
+            ],
+            executionSettings: { timeLimit: 2, memoryLimit: 64, cpuLimit: 1 },
+            recommendedMarks: 5
+        },
+        {
+            category: 'Database Templates',
+            title: 'Joins',
+            topic: 'SQL',
+            subtopic: 'Inner joins',
+            difficulty: 'Medium',
+            language: 'SQL',
+            semester: 'Second Semester',
+            tags: ['join', 'foreign key'],
+            problemStatement: 'Write an SQL query to list each student with the course names they are enrolled in.',
+            inputFormat: 'Tables: students(id, full_name), course_enrollments(student_id, course_name).',
+            outputFormat: 'Student full name and course name.',
+            sampleCases: [{ input: 'students + course_enrollments', output: 'student-course pairs', explanation: 'Join using student id.' }],
+            testCases: [{ input: '', expected: 'JOIN', hidden: false }, { input: '', expected: 'student_id', hidden: true }],
+            modelSolution: 'SELECT s.full_name, ce.course_name\nFROM students s\nJOIN course_enrollments ce ON ce.student_id = s.id;',
+            markingRubric: [
+                { criterion: 'Join', marks: 2, description: 'Uses a valid join condition.' },
+                { criterion: 'Columns', marks: 1, description: 'Returns the requested fields.' },
+                { criterion: 'Aliases', marks: 1, description: 'Uses clear table references.' },
+                { criterion: 'Syntax', marks: 1, description: 'Valid SQL syntax.' }
+            ],
+            executionSettings: { timeLimit: 2, memoryLimit: 64, cpuLimit: 1 },
+            recommendedMarks: 5
+        }
+    ];
+
+    [
+        ['Coding Templates', 'File Handling', 'Files', 'Read/write files', 'Medium', 'Python', ['files', 'read', 'write']],
+        ['Coding Templates', 'Object-Oriented Programming', 'OOP', 'Classes and objects', 'Medium', 'Java', ['class', 'object', 'method']],
+        ['Coding Templates', 'Database Programming', 'Database Programming', 'CRUD logic', 'Hard', 'PHP', ['database', 'crud', 'server-side']],
+        ['Coding Templates', 'Data Structures and Algorithms', 'Algorithms', 'Sorting/searching', 'Hard', 'C++', ['algorithm', 'array', 'sort']],
+        ['Web Development Templates', 'CSS Styling', 'CSS', 'Visual styling', 'Easy', 'HTML/CSS/JS', ['css', 'layout', 'colors']],
+        ['Web Development Templates', 'Responsive Design', 'Responsive Web', 'Media queries', 'Medium', 'HTML/CSS/JS', ['responsive', 'media-query', 'mobile']],
+        ['Web Development Templates', 'Form Validation', 'Forms', 'Client validation', 'Medium', 'HTML/CSS/JS', ['forms', 'validation']],
+        ['Web Development Templates', 'PHP Web Application', 'PHP', 'Server-side form handling', 'Medium', 'PHP', ['php', 'form', 'server']],
+        ['Web Development Templates', 'Full-Stack Development Tasks', 'Full Stack', 'Frontend plus backend', 'Hard', 'PHP', ['full-stack', 'database', 'forms']],
+        ['Database Templates', 'Aggregation Functions', 'SQL', 'GROUP BY and aggregate functions', 'Medium', 'SQL', ['count', 'sum', 'group-by']],
+        ['Database Templates', 'Stored Procedures', 'SQL', 'Stored procedure logic', 'Hard', 'SQL', ['procedure', 'parameters']],
+        ['Database Templates', 'Database Design', 'SQL', 'Tables, keys, and relationships', 'Hard', 'SQL', ['schema', 'primary-key', 'foreign-key']]
+    ].forEach(([category, title, topic, subtopic, difficulty, language, tags]) => {
+        qodaQuestionTemplates.push({
+            category,
+            title,
+            topic,
+            subtopic,
+            difficulty,
+            language,
+            semester: 'First Semester',
+            tags,
+            problemStatement: `Create a ${title.toLowerCase()} solution that demonstrates ${subtopic.toLowerCase()} for the given assessment scenario.`,
+            inputFormat: language === 'HTML/CSS/JS' ? 'Browser-based input or page interaction where required.' : 'Use standard input or the provided database structure where required.',
+            outputFormat: language === 'HTML/CSS/JS' ? 'A working browser preview that satisfies the task.' : 'Display the required result clearly.',
+            sampleCases: [{ input: '', output: 'Expected behavior is demonstrated.', explanation: 'Customize this example for the course.' }],
+            testCases: [{ input: '', expected: title.split(' ')[0], hidden: false }],
+            modelSolution: language === 'SQL' ? '-- Write the model SQL solution here\nSELECT 1;' : language === 'HTML/CSS/JS' ? '<!doctype html>\n<html><body><h1>Model Solution</h1></body></html>' : '// Write the model solution here',
+            markingRubric: [
+                { criterion: 'Requirements', marks: 2, description: 'Meets the stated problem requirements.' },
+                { criterion: 'Correctness', marks: 2, description: 'Produces the expected behavior or output.' },
+                { criterion: 'Code Quality', marks: 1, description: 'Solution is readable and maintainable.' }
+            ],
+            executionSettings: { timeLimit: 2, memoryLimit: 128, cpuLimit: 2 },
+            recommendedMarks: 5
+        });
+    });
+
+    const qodaTemplateEnhancements = {
+        'File Handling': {
+            problemStatement: 'Write a program that reads all lines from a file named input.txt and prints the number of non-empty lines.',
+            inputFormat: 'A text file named input.txt is provided with zero or more lines.',
+            outputFormat: 'Print one integer: the count of non-empty lines.',
+            sampleCases: [{ input: 'apple\\n\\nbanana', output: '2', explanation: 'Two lines contain visible text.' }],
+            testCases: [{ input: 'alpha\\n\\nbeta\\n', expected: '2', hidden: false }, { input: '\\none\\ntwo\\nthree', expected: '3', hidden: true }],
+            modelSolution: 'with open("input.txt", "r", encoding="utf-8") as f:\\n    lines = f.readlines()\\nprint(sum(1 for line in lines if line.strip()))'
+        },
+        'Object-Oriented Programming': {
+            problemStatement: 'Create a Student class with name and score fields, then print the name of the student with the highest score.',
+            inputFormat: 'The first line contains n. Each of the next n lines contains a student name and score.',
+            outputFormat: 'Print the name of the highest-scoring student.',
+            sampleCases: [{ input: '3\\nAma 78\\nKojo 92\\nEfua 88', output: 'Kojo', explanation: 'Kojo has the highest score.' }],
+            testCases: [{ input: '2\\nA 10\\nB 20', expected: 'B', hidden: false }, { input: '3\\nSam 40\\nAnn 41\\nJoe 39', expected: 'Ann', hidden: true }],
+            modelSolution: 'import java.util.*;\\n\\nclass Student {\\n    String name;\\n    int score;\\n    Student(String name, int score) { this.name = name; this.score = score; }\\n}\\n\\npublic class Main {\\n    public static void main(String[] args) {\\n        Scanner sc = new Scanner(System.in);\\n        int n = sc.nextInt();\\n        Student best = null;\\n        for (int i = 0; i < n; i++) {\\n            Student s = new Student(sc.next(), sc.nextInt());\\n            if (best == null || s.score > best.score) best = s;\\n        }\\n        System.out.println(best.name);\\n    }\\n}'
+        },
+        'Database Programming': {
+            problemStatement: 'Build a PHP script that inserts a new course record using prepared statements and displays a success message.',
+            inputFormat: 'POST fields: course_code and course_name.',
+            outputFormat: 'Display Saved when the insert succeeds.',
+            testCases: [{ input: '', expected: 'prepare', hidden: false }, { input: '', expected: 'execute', hidden: true }],
+            modelSolution: '<' + '?php\\n$pdo = new PDO($dsn, $user, $pass);\\n$stmt = $pdo->prepare("INSERT INTO courses (course_code, course_name) VALUES (?, ?)");\\n$stmt->execute([$_POST["course_code"], $_POST["course_name"]]);\\necho "Saved";\\n?' + '>'
+        },
+        'Data Structures and Algorithms': {
+            problemStatement: 'Read n integers, sort them in ascending order, and print the sorted list on one line.',
+            inputFormat: 'The first line contains n. The second line contains n integers.',
+            outputFormat: 'Print the sorted integers separated by spaces.',
+            sampleCases: [{ input: '5\\n4 1 3 2 5', output: '1 2 3 4 5', explanation: 'The values are sorted ascending.' }],
+            testCases: [{ input: '4\\n9 1 7 3', expected: '1 3 7 9', hidden: false }, { input: '3\\n-1 2 0', expected: '-1 0 2', hidden: true }],
+            modelSolution: '#include <bits/stdc++.h>\\nusing namespace std;\\nint main(){ int n; cin >> n; vector<int> a(n); for(int &x:a) cin >> x; sort(a.begin(), a.end()); for(int i=0;i<n;i++){ if(i) cout << " "; cout << a[i]; } }'
+        },
+        'CSS Styling': {
+            problemStatement: 'Style a profile card with a centered layout, rounded avatar, readable typography, and a hover effect.',
+            inputFormat: 'A basic HTML profile-card structure is provided.',
+            outputFormat: 'The profile card is visually styled and responsive.',
+            testCases: [{ input: '', expected: 'border-radius', hidden: false }, { input: '', expected: ':hover', hidden: true }],
+            modelSolution: '.profile-card { max-width: 360px; margin: 32px auto; padding: 24px; border-radius: 12px; box-shadow: 0 12px 30px rgba(0,0,0,.12); text-align: center; font-family: Arial, sans-serif; }\\n.profile-card img { width: 96px; height: 96px; border-radius: 50%; object-fit: cover; }\\n.profile-card:hover { transform: translateY(-4px); }'
+        },
+        'Responsive Design': {
+            problemStatement: 'Create a responsive two-column dashboard that becomes a single column on mobile screens.',
+            inputFormat: 'Browser viewport width determines the layout.',
+            outputFormat: 'Desktop shows two columns; mobile shows one stacked column.',
+            testCases: [{ input: '', expected: '@media', hidden: false }, { input: '', expected: 'grid-template-columns', hidden: true }],
+            modelSolution: '.dashboard { display: grid; grid-template-columns: 260px 1fr; gap: 20px; }\\n@media (max-width: 768px) { .dashboard { grid-template-columns: 1fr; } }'
+        },
+        'Form Validation': {
+            problemStatement: 'Build a registration form that validates name and email before submission and displays useful messages.',
+            inputFormat: 'Browser form fields: name and email.',
+            outputFormat: 'Invalid entries show validation messages; valid entries submit successfully.',
+            testCases: [{ input: '', expected: 'preventDefault', hidden: false }, { input: '', expected: 'email', hidden: true }],
+            modelSolution: 'document.querySelector("form").addEventListener("submit", event => {\\n  const email = document.querySelector("#email").value.trim();\\n  if (!email.includes("@")) {\\n    event.preventDefault();\\n    document.querySelector("#message").textContent = "Enter a valid email";\\n  }\\n});'
+        },
+        'PHP Web Application': {
+            problemStatement: 'Create a PHP page that accepts a student name from a form, sanitizes it, and displays a welcome message.',
+            inputFormat: 'POST field: student_name.',
+            outputFormat: 'Display Welcome, followed by the sanitized student name.',
+            testCases: [{ input: '', expected: 'htmlspecialchars', hidden: false }, { input: '', expected: '$_POST', hidden: true }],
+            modelSolution: '<' + '?php\\n$name = trim($_POST["student_name"] ?? "");\\necho "Welcome, " . htmlspecialchars($name, ENT_QUOTES, "UTF-8");\\n?' + '>'
+        },
+        'Full-Stack Development Tasks': {
+            problemStatement: 'Create a small course feedback feature with an HTML form, PHP handler, and database insert using prepared statements.',
+            inputFormat: 'Form fields: course_code, rating, comment.',
+            outputFormat: 'The feedback is saved and a confirmation is shown.',
+            testCases: [{ input: '', expected: '<form', hidden: false }, { input: '', expected: 'prepare', hidden: true }],
+            modelSolution: '<form method="post"><input name="course_code"><input name="rating" type="number"><textarea name="comment"></textarea><button>Save</button></form>\\n<' + '?php\\nif ($_SERVER["REQUEST_METHOD"] === "POST") {\\n  $stmt = $pdo->prepare("INSERT INTO feedback(course_code, rating, comment) VALUES (?, ?, ?)");\\n  $stmt->execute([$_POST["course_code"], $_POST["rating"], $_POST["comment"]]);\\n  echo "Feedback saved";\\n}\\n?' + '>'
+        },
+        'Aggregation Functions': {
+            problemStatement: 'Write an SQL query that shows the number of students enrolled in each course.',
+            inputFormat: 'Table: course_enrollments(course_code, student_id).',
+            outputFormat: 'Course code and enrollment count.',
+            testCases: [{ input: '', expected: 'COUNT', hidden: false }, { input: '', expected: 'GROUP BY', hidden: true }],
+            modelSolution: 'SELECT course_code, COUNT(student_id) AS enrolled_students\\nFROM course_enrollments\\nGROUP BY course_code;'
+        },
+        'Stored Procedures': {
+            problemStatement: 'Write a stored procedure that returns all students enrolled in a given course code.',
+            inputFormat: 'Procedure parameter: p_course_code.',
+            outputFormat: 'Rows for matching enrolled students.',
+            testCases: [{ input: '', expected: 'CREATE PROCEDURE', hidden: false }, { input: '', expected: 'p_course_code', hidden: true }],
+            modelSolution: 'CREATE PROCEDURE GetCourseStudents(IN p_course_code VARCHAR(50))\\nBEGIN\\n  SELECT student_id, course_code\\n  FROM course_enrollments\\n  WHERE course_code = p_course_code;\\nEND;'
+        },
+        'Database Design': {
+            problemStatement: 'Design tables for courses, students, and enrollments with primary keys and foreign keys.',
+            inputFormat: 'Entities: students, courses, course_enrollments.',
+            outputFormat: 'SQL CREATE TABLE statements with relationships.',
+            testCases: [{ input: '', expected: 'PRIMARY KEY', hidden: false }, { input: '', expected: 'FOREIGN KEY', hidden: true }],
+            modelSolution: 'CREATE TABLE students (id INT PRIMARY KEY, full_name VARCHAR(150) NOT NULL);\\nCREATE TABLE courses (id INT PRIMARY KEY, course_code VARCHAR(50) UNIQUE NOT NULL);\\nCREATE TABLE course_enrollments (student_id INT, course_id INT, PRIMARY KEY(student_id, course_id), FOREIGN KEY(student_id) REFERENCES students(id), FOREIGN KEY(course_id) REFERENCES courses(id));'
+        }
+    };
+
+    qodaQuestionTemplates.forEach(template => {
+        const enhanced = qodaTemplateEnhancements[template.title];
+        if (enhanced) Object.assign(template, enhanced);
+        template.course = template.course || template.topic || template.category;
+        template.starterCode = template.starterCode || '';
+        template.notes = '';
+        template.constraints = '';
+    });
+
+    function templateMatchesFilters(template) {
+        const search = (document.getElementById('templateSearch')?.value || '').toLowerCase();
+        const course = (document.getElementById('templateCourse')?.value || '').toLowerCase();
+        const topicFilter = (document.getElementById('templateTopic')?.value || '').toLowerCase();
+        const semester = document.getElementById('templateSemester')?.value || '';
+        const tags = (document.getElementById('templateTags')?.value || '').toLowerCase();
+        const category = document.getElementById('templateCategory')?.value || '';
+        const language = document.getElementById('templateLanguage')?.value || '';
+        const difficulty = document.getElementById('templateDifficulty')?.value || '';
+        const haystack = [template.title, template.category, template.topic, template.subtopic, template.problemStatement, template.language, template.difficulty, template.course || '', ...(template.tags || [])].join(' ').toLowerCase();
+        return (!search || haystack.includes(search)) &&
+            (!course || haystack.includes(course)) &&
+            (!topicFilter || haystack.includes(topicFilter)) &&
+            (!semester || template.semester === semester) &&
+            (!tags || (template.tags || []).join(' ').toLowerCase().includes(tags)) &&
+            (!category || template.category === category) &&
+            (!language || template.language === language) &&
+            (!difficulty || template.difficulty === difficulty);
+    }
+
+    function ensureTemplateLibraryModal() {
+        let modal = document.getElementById('qodaTemplateLibraryModal');
+        if (modal) return modal;
+        modal = document.createElement('div');
+        modal.id = 'qodaTemplateLibraryModal';
+        modal.className = 'modal';
+        modal.style.display = 'none';
+        modal.innerHTML = `
+            <div class="modal-content" style="width:1180px;max-width:96%;max-height:90vh;overflow:auto;">
+                <div class="modal-header" style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:16px;">
+                    <div>
+                        <h3 style="margin:0;"><i class="fas fa-layer-group"></i> Import Question Template</h3>
+                        <small style="color:var(--muted);">Choose a ready-made university assessment pattern and customize it.</small>
+                    </div>
+                    <button class="btn" onclick="closeTemplateLibraryModal()"><i class="fas fa-times"></i> Close</button>
+                </div>
+                <div class="qoda-template-layout">
+                    <aside class="qoda-template-filter">
+                        <div class="qoda-field"><label>Search</label><input id="templateSearch" placeholder="Topic, tags, language..." oninput="renderQuestionTemplates()"></div>
+                        <div class="qoda-field"><label>Course</label><input id="templateCourse" placeholder="Course name or code..." oninput="renderQuestionTemplates()"></div>
+                        <div class="qoda-field"><label>Topic</label><input id="templateTopic" placeholder="SQL, arrays, forms..." oninput="renderQuestionTemplates()"></div>
+                        <div class="qoda-field"><label>Category</label><select id="templateCategory" onchange="renderQuestionTemplates()"></select></div>
+                        <div class="qoda-field"><label>Language</label><select id="templateLanguage" onchange="renderQuestionTemplates()"></select></div>
+                        <div class="qoda-field"><label>Semester</label><select id="templateSemester" onchange="renderQuestionTemplates()">
+                            <option value="">Any Semester</option><option>First Semester</option><option>Second Semester</option><option>Summer School</option>
+                        </select></div>
+                        <div class="qoda-field"><label>Difficulty</label><select id="templateDifficulty" onchange="renderQuestionTemplates()">
+                            <option value="">Any Difficulty</option><option>Easy</option><option>Medium</option><option>Hard</option>
+                        </select></div>
+                        <div class="qoda-field"><label>Tags</label><input id="templateTags" placeholder="loops, arrays..." oninput="renderQuestionTemplates()"></div>
+                        <div class="qoda-field"><label>Import Option</label><select id="templateImportMode">
+                            <option value="full">Import Full Question</option>
+                            <option value="question">Import Question Only</option>
+                            <option value="tests">Import Test Cases Only</option>
+                            <option value="solution">Import Model Solution Only</option>
+                        </select></div>
+                    </aside>
+                    <section>
+                        <div id="qodaTemplateResults" class="qoda-template-grid"></div>
+                    </section>
+                </div>
+            </div>`;
+        document.body.appendChild(modal);
+        const categorySelect = modal.querySelector('#templateCategory');
+        const languageSelect = modal.querySelector('#templateLanguage');
+        categorySelect.innerHTML = '<option value="">All Categories</option>' + qodaTemplateCategories.map(c => `<option>${escapeHTML(c)}</option>`).join('');
+        const languages = [...new Set(qodaQuestionTemplates.map(t => t.language))].sort();
+        languageSelect.innerHTML = '<option value="">All Languages</option>' + languages.map(l => `<option>${escapeHTML(l)}</option>`).join('');
+        return modal;
+    }
+
+    function openTemplateLibrary(qId) {
+        qodaTemplateTargetQuestionId = qId;
+        const modal = ensureTemplateLibraryModal();
+        modal.style.display = 'flex';
+        renderQuestionTemplates();
+    }
+
+    function closeTemplateLibraryModal() {
+        const modal = document.getElementById('qodaTemplateLibraryModal');
+        if (modal) modal.style.display = 'none';
+    }
+
+    function renderQuestionTemplates() {
+        const results = document.getElementById('qodaTemplateResults');
+        if (!results) return;
+        const matches = qodaQuestionTemplates.filter(templateMatchesFilters);
+        if (!matches.length) {
+            results.innerHTML = '<div class="empty-state" style="grid-column:1/-1;">No templates match your filters.</div>';
+            return;
+        }
+        results.innerHTML = matches.map((template, index) => `
+            <article class="qoda-template-card" onclick="applyQuestionTemplate(${qodaQuestionTemplates.indexOf(template)})">
+                <div class="qoda-template-tags">
+                    <span class="qoda-template-tag">${escapeHTML(template.category.replace(' Templates',''))}</span>
+                    <span class="qoda-template-tag">${escapeHTML(template.language)}</span>
+                    <span class="qoda-template-tag">${escapeHTML(template.difficulty)}</span>
+                </div>
+                <h4 style="margin:0;">${escapeHTML(template.title)}</h4>
+                <p style="margin:0;color:var(--muted);">${escapeHTML(template.topic)}${template.subtopic ? ' / ' + escapeHTML(template.subtopic) : ''}</p>
+                <small style="color:var(--muted);">${escapeHTML((template.tags || []).join(', '))}</small>
+            </article>`).join('');
+    }
+
+    function applyQuestionTemplate(templateIndex) {
+        const template = qodaQuestionTemplates[templateIndex];
+        const ctx = getQuestionById(qodaTemplateTargetQuestionId);
+        const mode = document.getElementById('templateImportMode')?.value || 'full';
+        if (!template || !ctx) return;
+
+        const copy = value => JSON.parse(JSON.stringify(value));
+        if (mode === 'full' || mode === 'question') {
+            ctx.question.title = template.title;
+            ctx.question.problemStatement = template.problemStatement;
+            ctx.question.text = richToPlain(template.problemStatement);
+            ctx.question.inputFormat = '';
+            ctx.question.outputFormat = '';
+            ctx.question.constraints = '';
+            ctx.question.notes = '';
+            ctx.question.language = template.language;
+            ctx.question.difficulty = template.difficulty;
+            ctx.question.topic = template.topic;
+            ctx.question.subtopic = template.subtopic;
+            ctx.question.tags = (template.tags || []).join(', ');
+            ctx.question.questionBankTags = ctx.question.tags;
+            ctx.question.marks = template.recommendedMarks || ctx.question.marks || 5;
+            ctx.question.sampleCases = copy(template.sampleCases || []);
+            ctx.question.starterCode = template.starterCode || ctx.question.starterCode || '';
+            ctx.question.executionSettings = Object.assign({}, ctx.question.executionSettings || {}, template.executionSettings || {});
+        }
+        if (mode === 'full' || mode === 'tests') {
+            ctx.question.testCases = copy(template.testCases || []);
+        }
+        if (mode === 'full' || mode === 'solution') {
+            ctx.question.modelSolution = template.modelSolution || '';
+            ctx.question.modelValidationStatus = '';
+            ctx.question.modelValidationMessage = 'Model solution has not been validated yet.';
+        }
+        if (mode === 'full') {
+            ctx.question.markingRubric = [];
+        }
+
+        persistQuestionMutation(ctx, true);
+        closeTemplateLibraryModal();
+        toast(`Template imported: ${template.title}`);
+    }
+
+    function renderCodingQuestionCard(q, idx, totalQuestions) {
+        normalizeCodingQuestion(q);
+        const validation = getQuestionValidation(q);
+        const readyCount = validation.filter(v => v.ok).length;
+        return `
+        <article class="qoda-author-card">
+            <header class="qoda-q-header">
+                <div class="qoda-q-meta">
+                    <div class="qoda-q-badges">
+                        <span class="qoda-badge primary">Q${idx + 1}</span>
+                        <span class="qoda-badge success">Coding</span>
+                        <span class="qoda-badge">${escapeHTML(q.languageMode === 'multi' ? 'Multi-language' : q.language)}</span>
+                        <span class="qoda-badge warning">${parseFloat(q.marks || 0)} marks</span>
+                        ${q.compulsory ? '<span class="qoda-badge success">Compulsory</span>' : '<span class="qoda-badge">Optional</span>'}
+                    </div>
+                </div>
+                <div class="qoda-icon-actions">
+                    <button class="btn small" onclick="toggleCompulsory('${q.id}')"><i class="fas fa-star"></i> ${q.compulsory ? 'Make Optional' : 'Compulsory'}</button>
+                    <button class="btn small" onclick="moveQ('${q.id}', -1)" ${idx === 0 ? 'disabled' : ''} title="Move Up"><i class="fas fa-arrow-up"></i></button>
+                    <button class="btn small" onclick="moveQ('${q.id}', 1)" ${idx === totalQuestions - 1 ? 'disabled' : ''} title="Move Down"><i class="fas fa-arrow-down"></i></button>
+                    <button class="btn small" onclick="duplicateQuestion('${q.id}')"><i class="fas fa-copy"></i> Duplicate</button>
+                    <button class="btn danger small" onclick="removeQuestion('${q.id}')"><i class="fas fa-trash"></i> Delete</button>
+                </div>
+            </header>
+            <div class="qoda-validation-panel" id="validation_${q.id}">
+                ${renderValidationStatusPanel(q)}
+            </div>
+
+            <div class="qoda-author-body">
+                <div class="qoda-author-main">
+                    <details class="qoda-author-section" open>
+                        <summary><span><i class="fas fa-pen-nib"></i> Problem Description</span><span class="qoda-badge">${richToPlain(q.problemStatement || q.text) ? 'Ready' : 'Required'}</span></summary>
+                        <div class="qoda-section-body">
+                            ${renderRichEditor(q, 'problemStatement', 'Problem Statement', 'Describe the task students must solve.')}
+                            <div class="qoda-field-grid">
+                                <div class="qoda-field"><label>Marks</label><input type="number" min="0" step="0.5" value="${parseFloat(q.marks || 0)}" onchange="updateQuestion('${q.id}','marks',parseFloat(this.value)||0)"></div>
+                            </div>
+                        </div>
+                    </details>
+
+                    <details class="qoda-author-section" open>
+                        <summary><span><i class="fas fa-vial"></i> Auto-Grading Test Cases</span><span class="qoda-badge">${q.testCases.length} grading tests</span></summary>
+                        <div class="qoda-section-body">
+                            <div class="qoda-toolbar-actions">
+                                <button class="btn primary small" onclick="generateAssessmentFromQuestion('${q.id}')"><i class="fas fa-wand-magic-sparkles"></i> Generate From Question</button>
+                                <button class="btn primary small" onclick="addTestCase('${q.id}')"><i class="fas fa-plus"></i> Add Test Case</button>
+                                <button class="btn small" onclick="batchImportTestCases('${q.id}')"><i class="fas fa-file-import"></i> Batch Import</button>
+                                <button class="btn small" onclick="bulkUploadTestCases('${q.id}')"><i class="fas fa-upload"></i> Bulk Upload</button>
+                                <button class="btn small" onclick="copyTestCasesFromPrevious('${q.id}')"><i class="fas fa-clone"></i> Copy Previous</button>
+                            </div>
+                            <div id="gradingCases_${q.id}">${renderModernTestCasesList(q)}</div>
+                        </div>
+                    </details>
+
+                    <details class="qoda-author-section">
+                        <summary><span><i class="fas fa-code"></i> Programming Language Settings</span><span class="qoda-badge">${escapeHTML(q.languageMode === 'multi' ? 'Multi-language' : q.language)}</span></summary>
+                        <div class="qoda-section-body">
+                            <div class="qoda-field-grid">
+                                <div class="qoda-field"><label>Language</label><select onchange="updateCodeLanguage('${q.id}',this.value)">
+                                    ${codingLanguagesList.map(lang => `<option value="${escapeHTML(lang)}" ${q.language === lang ? 'selected' : ''}>${escapeHTML(lang)}</option>`).join('')}
+                                </select></div>
+                            </div>
+                            <label class="qoda-toggle-row"><input type="checkbox" ${q.languageMode === 'multi' ? 'checked' : ''} onchange="updateQuestion('${q.id}','languageMode',this.checked?'multi':'single')"> Multi-language mode</label>
+                        </div>
+                    </details>
+
+                    <details class="qoda-author-section">
+                        <summary><span><i class="fas fa-file-code"></i> Starter Code</span><span class="qoda-badge">Student template</span></summary>
+                        <div class="qoda-section-body">
+                            <div class="qoda-field">
+                                <label>Editable starter code template</label>
+                                <div class="qoda-code-shell">
+                                    <div class="qoda-code-head">
+                                        <span class="qoda-code-tab"><i class="fas fa-code"></i> ${escapeHTML(qodaCodeFileName(q, 'starterCode'))}<span class="qoda-code-close">x</span></span>
+                                        <span class="qoda-code-status">VS Code editor</span>
+                                    </div>
+                                    <textarea id="starterCode_${q.id}" class="qoda-code-editor" spellcheck="false" onkeydown="handleQodaCodeTextareaKeydown(event,'${q.id}','starterCode')" oninput="updateQuestion('${q.id}','starterCode',this.value)" placeholder="Optional code students receive when the exam opens.">${escapeHTML(q.starterCode || '')}</textarea>
+                                    <div id="starterMonaco_${q.id}" class="qoda-monaco-editor" data-question-id="${q.id}" data-field="starterCode" data-language="${monacoLanguageFromQuestion(q.languageMode === 'multi' ? q.language : q.language)}"></div>
+                                </div>
+                            </div>
+                        </div>
+                    </details>
+
+                    <details class="qoda-author-section">
+                        <summary><span><i class="fas fa-lock"></i> Model Solution</span><span class="qoda-badge ${q.modelValidationStatus === 'passed' ? 'success' : q.modelValidationStatus === 'failed' ? 'warning' : ''}">${q.modelValidationStatus || 'Hidden'}</span></summary>
+                        <div class="qoda-section-body">
+                            <div class="qoda-field">
+                                <label>Hidden model solution</label>
+                                <div class="qoda-code-shell">
+                                    <div class="qoda-code-head">
+                                        <span class="qoda-code-tab"><i class="fas fa-code"></i> ${escapeHTML(qodaCodeFileName(q, 'modelSolution'))}<span class="qoda-code-close">x</span></span>
+                                        <span class="qoda-code-status">VS Code editor</span>
+                                    </div>
+                                    <textarea id="modelSolution_${q.id}" class="qoda-code-editor" spellcheck="false" onkeydown="handleQodaCodeTextareaKeydown(event,'${q.id}','modelSolution')" oninput="updateQuestion('${q.id}','modelSolution',this.value)" placeholder="Students never see this. Use it to validate the question before publishing.">${escapeHTML(q.modelSolution || '')}</textarea>
+                                    <div id="modelMonaco_${q.id}" class="qoda-monaco-editor" data-question-id="${q.id}" data-field="modelSolution" data-language="${monacoLanguageFromQuestion(q.languageMode === 'multi' ? q.language : q.language)}"></div>
+                                </div>
+                            </div>
+                            <div class="qoda-toolbar-actions">
+                                <button class="btn small" onclick="runModelSolution('${q.id}')"><i class="fas fa-play"></i> Run Model Solution</button>
+                                <button class="btn primary small" onclick="validateModelSolutionAgainstTests('${q.id}')"><i class="fas fa-check-double"></i> Validate Against Test Cases</button>
+                            </div>
+                            <div id="modelValidation_${q.id}" class="qoda-autosave">${escapeHTML(q.modelValidationMessage || 'Model solution has not been validated yet.')}</div>
+                        </div>
+                    </details>
+
+                    <details class="qoda-author-section">
+                        <summary><span><i class="fas fa-database"></i> Question Bank</span><span class="qoda-badge">Reuse and tags</span></summary>
+                        <div class="qoda-section-body">
+                            <div class="qoda-field-grid">
+                                <div class="qoda-field"><label>Topic</label><input value="${escapeHTML(q.topic || '')}" onchange="updateQuestion('${q.id}','topic',this.value)"></div>
+                                <div class="qoda-field"><label>Subtopic</label><input value="${escapeHTML(q.subtopic || '')}" onchange="updateQuestion('${q.id}','subtopic',this.value)"></div>
+                                <div class="qoda-field"><label>Tags</label><input value="${escapeHTML(q.tags || q.questionBankTags || '')}" placeholder="arrays, loops, functions" onchange="updateQuestion('${q.id}','tags',this.value);updateQuestion('${q.id}','questionBankTags',this.value)"></div>
+                            </div>
+                            <div class="qoda-toolbar-actions">
+                                <button class="btn primary small" onclick="saveQuestionToBank('${q.id}')"><i class="fas fa-save"></i> Save To Question Bank</button>
+                                <button class="btn small" onclick="openQuestionBankModal()"><i class="fas fa-search"></i> Search Existing Questions</button>
+                                <button class="btn small" onclick="openQuestionBankModal()"><i class="fas fa-copy"></i> Clone Existing Question</button>
+                                <button class="btn small" onclick="openTemplateLibrary('${q.id}')"><i class="fas fa-layer-group"></i> Import Existing Question</button>
+                            </div>
+                        </div>
+                    </details>
+
+                </div>
+
+                <aside class="qoda-preview-panel">
+                    <div class="qoda-preview-head">
+                        <span><i class="fas fa-eye"></i> Live Student Preview</span>
+                        <span class="qoda-badge">${readyCount}/${validation.length}</span>
+                    </div>
+                    <div id="qPreview_${q.id}">${renderQuestionPreview(q)}</div>
+                </aside>
+            </div>
+
+            <div class="qoda-publish-toolbar">
+                <div class="qoda-autosave">Auto-save every 30 seconds. Missing fields are marked in the checklist.</div>
+                <div class="qoda-toolbar-actions">
+                    <button class="btn" onclick="saveDraftExam()"><i class="fas fa-save"></i> Save Draft</button>
+                    <button class="btn" onclick="previewCodeQuestion('${q.id}')"><i class="fas fa-eye"></i> Preview</button>
+                    <button class="btn primary" onclick="validateQuestion('${q.id}')"><i class="fas fa-check-circle"></i> Validate Question</button>
+                    <button class="btn success" onclick="publishExam()"><i class="fas fa-paper-plane"></i> Publish</button>
+                </div>
+            </div>
+        </article>`;
+    }
+
+    function addSampleCase(qId) {
+        const ctx = getQuestionById(qId);
+        if (!ctx) return;
+        ctx.question.sampleCases.push({
+            input: '',
+            output: '',
+            explanation: ''
+        });
+        persistQuestionMutation(ctx, true);
+    }
+
+    function updateSampleCase(qId, index, field, value) {
+        const ctx = getQuestionById(qId);
+        if (!ctx || !ctx.question.sampleCases[index]) return;
+        ctx.question.sampleCases[index][field] = value;
+        persistQuestionMutation(ctx, false);
+    }
+
+    function removeSampleCase(qId, index) {
+        const ctx = getQuestionById(qId);
+        if (!ctx) return;
+        ctx.question.sampleCases.splice(index, 1);
+        persistQuestionMutation(ctx, true);
+    }
+
+    function duplicateSampleCase(qId, index) {
+        const ctx = getQuestionById(qId);
+        if (!ctx || !ctx.question.sampleCases[index]) return;
+        ctx.question.sampleCases.splice(index + 1, 0, JSON.parse(JSON.stringify(ctx.question.sampleCases[index])));
+        persistQuestionMutation(ctx, true);
+    }
+
+    function distributeMarks(total, labels) {
+        const cleanTotal = Math.max(1, parseFloat(total) || 1);
+        const base = Math.floor((cleanTotal / labels.length) * 100) / 100;
+        let remaining = cleanTotal;
+        return labels.map((label, index) => {
+            const marks = index === labels.length - 1 ? remaining : base;
+            remaining = Math.max(0, remaining - marks);
+            return { criterion: label[0], marks: Math.round(marks * 100) / 100, description: label[1] };
+        });
+    }
+
+    function generatedTestsForQuestion(q) {
+        const text = richToPlain(q.problemStatement || q.text || '').toLowerCase();
+        const language = String(q.language || '').toLowerCase();
+        const isWeb = language.includes('html') || language.includes('css') || language.includes('javascript') || language.includes('js');
+        const isSql = language.includes('sql');
+        if (isWeb) {
+            return [
+                { input: '', expected: text.includes('form') ? '<form' : text.includes('responsive') ? '@media' : '<', hidden: false, comparisonMode: 'contains' },
+                { input: '', expected: text.includes('button') ? 'button' : text.includes('style') ? 'style' : 'class', hidden: true, comparisonMode: 'contains' }
+            ];
+        }
+        if (isSql) {
+            return [
+                { input: '', expected: text.includes('join') ? 'JOIN' : 'SELECT', hidden: false, comparisonMode: 'contains' },
+                { input: '', expected: text.includes('count') || text.includes('aggregate') ? 'GROUP BY' : 'WHERE', hidden: true, comparisonMode: 'contains' }
+            ];
+        }
+        if (text.includes('sum') || text.includes('add')) {
+            return [{ input: '23 3', expected: '26', hidden: false }, { input: '10 15', expected: '25', hidden: true }];
+        }
+        if (text.includes('even') || text.includes('odd')) {
+            return [{ input: '8', expected: 'Even', hidden: false }, { input: '7', expected: 'Odd', hidden: true }];
+        }
+        if (text.includes('largest') || text.includes('maximum') || text.includes('max')) {
+            return [{ input: '12 45 23', expected: '45', hidden: false }, { input: '7 3 9', expected: '9', hidden: true }];
+        }
+        if (text.includes('reverse')) {
+            return [{ input: 'qoda', expected: 'adoq', hidden: false }, { input: 'exam', expected: 'maxe', hidden: true }];
+        }
+        if (text.includes('sort')) {
+            return [{ input: '4\n9 1 7 3', expected: '1 3 7 9', hidden: false }, { input: '3\n-1 2 0', expected: '-1 0 2', hidden: true }];
+        }
+        return [{ input: '2 3', expected: '5', hidden: false }, { input: '5 6', expected: '11', hidden: true }];
+    }
+
+    function generateAssessmentFromQuestion(qId) {
+        const ctx = getQuestionById(qId);
+        if (!ctx) return;
+        const marks = parseFloat(ctx.question.marks || 0) || 5;
+        ctx.question.testCases = generatedTestsForQuestion(ctx.question).map((tc, index) => ({
+            marks: Math.round((marks / 2) * 100) / 100,
+            comparisonMode: tc.comparisonMode || 'ignore_trailing',
+            ...tc,
+            expectedOutput: tc.expected
+        }));
+        ctx.question.markingRubric = [];
+        persistQuestionMutation(ctx, true);
+        toast('Generated test cases from the question.');
+    }
+
+    function addTestCase(qId) {
+        const ctx = getQuestionById(qId);
+        if (!ctx) return;
+        ctx.question.testCases.push({
+            input: '',
+            expected: '',
+            comparisonMode: ctx.question.executionSettings?.comparisonMode || 'exact',
+            hidden: false
+        });
+        persistQuestionMutation(ctx, true);
+    }
+
+    function updateTestCase(qId, index, field, value) {
+        const ctx = getQuestionById(qId);
+        if (!ctx || !ctx.question.testCases[index]) return;
+        ctx.question.testCases[index][field] = value;
+        if (field === 'expected') ctx.question.testCases[index].expectedOutput = value;
+        persistQuestionMutation(ctx, false);
+    }
+
+    function removeTestCase(qId, index) {
+        const ctx = getQuestionById(qId);
+        if (!ctx) return;
+        ctx.question.testCases.splice(index, 1);
+        persistQuestionMutation(ctx, true);
+    }
+
+    function duplicateTestCase(qId, index) {
+        const ctx = getQuestionById(qId);
+        if (!ctx || !ctx.question.testCases[index]) return;
+        ctx.question.testCases.splice(index + 1, 0, JSON.parse(JSON.stringify(ctx.question.testCases[index])));
+        persistQuestionMutation(ctx, true);
+    }
+
+    function batchImportTestCases(qId) {
+        const raw = prompt('Paste test cases as JSON array: [{"input":"1\\n2","expected":"3","hidden":true}]');
+        if (!raw) return;
+        try {
+            const imported = JSON.parse(raw);
+            if (!Array.isArray(imported)) throw new Error('Expected a JSON array');
+            const ctx = getQuestionById(qId);
+            if (!ctx) return;
+            imported.forEach(tc => ctx.question.testCases.push({
+                input: String(tc.input || ''),
+                expected: String(tc.expected || tc.expectedOutput || ''),
+                comparisonMode: tc.comparisonMode || 'exact',
+                hidden: !!tc.hidden
+            }));
+            persistQuestionMutation(ctx, true);
+        } catch (error) {
+            toast('Invalid test case import: ' + error.message);
+        }
+    }
+
+    function bulkUploadTestCases(qId) {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.json,application/json,text/plain';
+        input.onchange = () => {
+            const file = input.files?.[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = () => {
+                try {
+                    const imported = JSON.parse(String(reader.result || '[]'));
+                    if (!Array.isArray(imported)) throw new Error('Expected a JSON array');
+                    const ctx = getQuestionById(qId);
+                    if (!ctx) return;
+                    imported.forEach(tc => ctx.question.testCases.push({
+                        input: String(tc.input || ''),
+                        expected: String(tc.expected || tc.expectedOutput || ''),
+                        comparisonMode: tc.comparisonMode || 'exact',
+                        hidden: !!tc.hidden
+                    }));
+                    persistQuestionMutation(ctx, true);
+                    toast(`Uploaded ${imported.length} test case(s).`);
+                } catch (error) {
+                    toast('Bulk upload failed: ' + error.message);
+                }
+            };
+            reader.readAsText(file);
+        };
+        input.click();
+    }
+
+    function copyTestCasesFromPrevious(qId) {
+        const exam = findExam(currentExamId);
+        if (!exam) return;
+        const currentIndex = (exam.questions || []).findIndex(q => q.id === qId);
+        const previous = (exam.questions || []).slice(0, currentIndex).reverse().find(q => Array.isArray(q.testCases) && q.testCases.length);
+        if (!previous) {
+            toast('No previous question has test cases to copy.');
+            return;
+        }
+        const ctx = getQuestionById(qId);
+        if (!ctx) return;
+        ctx.question.testCases = JSON.parse(JSON.stringify(previous.testCases || []));
+        persistQuestionMutation(ctx, true);
+    }
+
+    function addRubricCriterion(qId) {
+        const ctx = getQuestionById(qId);
+        if (!ctx) return;
+        ctx.question.markingRubric.push({
+            criterion: '',
+            marks: 1,
+            description: ''
+        });
+        persistQuestionMutation(ctx, true);
+    }
+
+    function updateRubricCriterion(qId, index, field, value) {
+        const ctx = getQuestionById(qId);
+        if (!ctx || !ctx.question.markingRubric[index]) return;
+        ctx.question.markingRubric[index][field] = value;
+        persistQuestionMutation(ctx, false);
+    }
+
+    function removeRubricCriterion(qId, index) {
+        const ctx = getQuestionById(qId);
+        if (!ctx) return;
+        ctx.question.markingRubric.splice(index, 1);
+        persistQuestionMutation(ctx, true);
+    }
+
+    async function runQuestionModelCode(question, withTests = false) {
+        const payload = {
+            code: question.modelSolution || '',
+            language: question.language || 'Python',
+            input: '',
+            use_inferred_input: !withTests,
+            question_text: richToPlain(question.problemStatement || question.text || ''),
+            test_cases: withTests ? (question.testCases || []).map(tc => ({
+                input: tc.input || '',
+                expected: tc.expected || tc.expectedOutput || '',
+                tolerance: tc.tolerance || null,
+                comparisonMode: tc.comparisonMode || 'exact'
+            })) : []
+        };
+        const response = await fetch('api/run_code.php', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        });
+        return await response.json();
+    }
+
+    async function runModelSolution(qId) {
+        const ctx = getQuestionById(qId);
+        if (!ctx) return;
+        if (!String(ctx.question.modelSolution || '').trim()) {
+            toast('Add a model solution before running.');
+            return;
+        }
+        const target = document.getElementById(`modelValidation_${qId}`);
+        if (target) target.textContent = 'Running model solution...';
+        try {
+            const result = await runQuestionModelCode(ctx.question, false);
+            const output = result.success ? (result.output || 'Model solution ran successfully.') : (result.error || 'Model solution failed.');
+            ctx.question.modelValidationMessage = output.slice(0, 500);
+            ctx.question.modelValidationStatus = result.success ? 'ran' : 'failed';
+            persistQuestionMutation(ctx, true);
+            toast(result.success ? 'Model solution ran successfully.' : 'Model solution failed.');
+        } catch (error) {
+            ctx.question.modelValidationStatus = 'failed';
+            ctx.question.modelValidationMessage = error.message;
+            persistQuestionMutation(ctx, true);
+            toast('Model solution failed: ' + error.message);
+        }
+    }
+
+    async function validateModelSolutionAgainstTests(qId) {
+        const ctx = getQuestionById(qId);
+        if (!ctx) return;
+        const hasSolution = !!String(ctx.question.modelSolution || '').trim();
+        const hasTests = (ctx.question.testCases || []).length > 0;
+        if (!hasSolution || !hasTests) {
+            ctx.question.modelValidationStatus = 'failed';
+            ctx.question.modelValidationMessage = 'Failed: add both a model solution and at least one grading test case.';
+            persistQuestionMutation(ctx, true);
+            toast(ctx.question.modelValidationMessage);
+            return;
+        }
+        const target = document.getElementById(`modelValidation_${qId}`);
+        if (target) target.textContent = 'Validating model solution against test cases...';
+        try {
+            const result = await runQuestionModelCode(ctx.question, true);
+            const caseResults = Array.isArray(result.results) ? result.results : [];
+            const passed = caseResults.length > 0 && caseResults.every(tc => tc.passed);
+            ctx.question.modelValidationStatus = passed ? 'passed' : 'failed';
+            ctx.question.modelValidationMessage = passed ?
+                `Passed ${caseResults.length}/${caseResults.length} test case(s).` :
+                `Failed ${caseResults.filter(tc => tc.passed).length}/${caseResults.length || ctx.question.testCases.length} test case(s).`;
+            persistQuestionMutation(ctx, true);
+            toast(ctx.question.modelValidationMessage);
+        } catch (error) {
+            ctx.question.modelValidationStatus = 'failed';
+            ctx.question.modelValidationMessage = error.message;
+            persistQuestionMutation(ctx, true);
+            toast('Validation failed: ' + error.message);
+        }
+    }
+
+    function validateQuestion(qId) {
+        const ctx = getQuestionById(qId);
+        if (!ctx) return false;
+        const missing = getQuestionValidation(ctx.question).filter(item => !item.ok).map(item => item.label);
+        if (missing.length) {
+            confirmPopup('Missing items:\n' + missing.join('\n'), 'Question validation', 'OK');
+            return false;
+        }
+        toast('Question is ready for publication.');
+        return true;
+    }
+
+    async function saveQuestionToBank(qId) {
+        const ctx = getQuestionById(qId);
+        const exam = findExam(currentExamId);
+        if (!ctx || !exam) return;
+        const response = await apiRequest('save_question_to_bank', {
+            course_code: exam.courseCode || document.getElementById('bCode')?.value || '',
+            course_name: exam.title || document.getElementById('bTitle')?.value || '',
+            semester: exam.semester || document.getElementById('semester')?.value || '',
+            academic_year: exam.academic_year || document.getElementById('academic_year')?.value || '',
+            topic: ctx.question.topic || '',
+            difficulty: ctx.question.difficulty || '',
+            language: ctx.question.language || '',
+            title: ctx.question.title || `Question ${ctx.qIndex + 1}`,
+            prompt: richToPlain(ctx.question.problemStatement || ctx.question.text),
+            question_json: JSON.stringify(ctx.question),
+            test_cases: JSON.stringify(ctx.question.testCases || []),
+            marks: ctx.question.marks || 0,
+            source_exam_id: currentExamId
+        });
+        toast(response.success ? 'Question saved to question bank.' : (response.error || 'Could not save question to bank.'));
+    }
+
+    function updateBuilderValidationSummary() {
+        const exam = findExam(currentExamId);
+        if (!exam || !Array.isArray(exam.questions)) return;
+        exam.questions.forEach(q => {
+            const target = document.getElementById(`validation_${q.id}`);
+            if (!target) return;
+            target.innerHTML = renderValidationStatusPanel(q);
+        });
+    }
+
+    function ensureActiveSessionsModal() {
+        let modal = document.getElementById('activeStudentSessionsModal');
+        if (modal) return modal;
+        modal = document.createElement('div');
+        modal.id = 'activeStudentSessionsModal';
+        modal.className = 'modal';
+        modal.style.display = 'none';
+        modal.innerHTML = `
+            <div class="modal-content" style="width:1050px;max-width:96%;max-height:90vh;overflow:auto;">
+                <div class="modal-header" style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:16px;">
+                    <div>
+                        <h3 style="margin:0;"><i class="fas fa-desktop"></i> Active Student Sessions</h3>
+                        <small style="color:var(--muted);">One active login is allowed per student. Force logout is for device crashes or emergency recovery.</small>
+                    </div>
+                    <button class="btn" onclick="closeActiveStudentSessionsModal()"><i class="fas fa-times"></i> Close</button>
+                </div>
+                <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+                    <button class="btn primary" onclick="loadActiveStudentSessions()"><i class="fas fa-sync"></i> Refresh</button>
+                    <button class="btn" onclick="loadStudentSessionHistory(0)"><i class="fas fa-history"></i> View Recent History</button>
+                </div>
+                <div id="activeStudentSessionsList" style="display:grid;gap:12px;"></div>
+                <div id="studentSessionHistoryList" style="margin-top:16px;display:grid;gap:10px;"></div>
+            </div>`;
+        document.body.appendChild(modal);
+        return modal;
+    }
+
+    async function showActiveStudentSessionsModal() {
+        const modal = ensureActiveSessionsModal();
+        modal.style.display = 'flex';
+        await loadActiveStudentSessions();
+    }
+
+    function closeActiveStudentSessionsModal() {
+        const modal = document.getElementById('activeStudentSessionsModal');
+        if (modal) modal.style.display = 'none';
+    }
+
+    async function loadActiveStudentSessions() {
+        const list = document.getElementById('activeStudentSessionsList');
+        if (list) list.innerHTML = '<div class="empty-state">Loading active sessions...</div>';
+        const result = await apiRequest('get_active_student_sessions');
+        if (!list) return;
+        if (!result.success) {
+            list.innerHTML = `<div class="empty-state">Could not load active sessions: ${escapeHTML(result.error || 'Unknown error')}</div>`;
+            return;
+        }
+        const rows = result.data || [];
+        if (!rows.length) {
+            list.innerHTML = '<div class="empty-state">No active student sessions right now.</div>';
+            return;
+        }
+        list.innerHTML = rows.map(row => `
+            <div class="qoda-case-card">
+                <div class="qoda-case-head">
+                    <div>
+                        <strong>${escapeHTML(row.full_name || row.student_identifier || 'Student')}</strong>
+                        <div style="color:var(--muted);font-size:12px;">${escapeHTML(row.student_identifier || '')} | Level ${escapeHTML(row.level || '-')} | ${escapeHTML(row.programme || '-')}</div>
+                    </div>
+                    <div class="qoda-case-actions">
+                        <button class="btn small" onclick="loadStudentSessionHistory(${parseInt(row.student_id, 10) || 0})"><i class="fas fa-history"></i> History</button>
+                        <button class="btn danger small" onclick="forceLogoutStudentSession(${parseInt(row.student_id, 10) || 0}, ${parseInt(row.id, 10) || 0})"><i class="fas fa-right-from-bracket"></i> Force Logout</button>
+                    </div>
+                </div>
+                <div class="qoda-field-grid">
+                    <div><small>Device</small><div>${escapeHTML(row.operating_system || 'Unknown OS')}</div></div>
+                    <div><small>IP Address</small><div>${escapeHTML(row.ip_address || '-')}</div></div>
+                    <div><small>Login Time</small><div>${escapeHTML(row.login_at || '-')}</div></div>
+                    <div><small>Last Seen</small><div>${escapeHTML(row.last_seen || '-')}</div></div>
+                </div>
+            </div>`).join('');
+    }
+
+    async function forceLogoutStudentSession(studentId, sessionRecordId) {
+        const ok = await confirmPopup('Force logout this student session? The student can log in again on one device and continue from autosaved answers.', 'Force Logout', 'Force Logout');
+        if (!ok) return;
+        const result = await apiRequest('force_logout_student_session', {
+            student_id: studentId,
+            session_record_id: sessionRecordId
+        });
+        toast(result.success ? 'Student session released.' : (result.error || 'Could not release session.'));
+        await loadActiveStudentSessions();
+    }
+
+    async function loadStudentSessionHistory(studentId = 0) {
+        const target = document.getElementById('studentSessionHistoryList');
+        if (!target) return;
+        target.innerHTML = '<div class="empty-state">Loading session history...</div>';
+        const result = await apiRequest('get_student_session_history', {
+            student_id: studentId
+        });
+        if (!result.success) {
+            target.innerHTML = `<div class="empty-state">Could not load history: ${escapeHTML(result.error || 'Unknown error')}</div>`;
+            return;
+        }
+        const rows = result.data || [];
+        if (!rows.length) {
+            target.innerHTML = '<div class="empty-state">No session history found.</div>';
+            return;
+        }
+        target.innerHTML = `
+            <h4 style="margin:0;">Session and Device History</h4>
+            <div style="overflow-x:auto;">
+                <table class="table">
+                    <thead><tr><th>Time</th><th>Event</th><th>OS</th><th>IP</th><th>Exam</th><th>Details</th></tr></thead>
+                    <tbody>${rows.map(row => `
+                        <tr>
+                            <td>${escapeHTML(row.created_at || '')}</td>
+                            <td>${escapeHTML(row.event_type || '')}</td>
+                            <td>${escapeHTML(row.operating_system || '')}</td>
+                            <td>${escapeHTML(row.ip_address || '')}</td>
+                            <td>${escapeHTML(row.exam_id || '')}</td>
+                            <td>${escapeHTML(row.details || '')}</td>
+                        </tr>`).join('')}</tbody>
+                </table>
+            </div>`;
+    }
+
+    const qodaLegacyPublishExam = publishExam;
+    publishExam = async function() {
+        const exam = findExam(currentExamId);
+        if (exam && Array.isArray(exam.questions)) {
+            const problems = [];
+            exam.questions.forEach((q, index) => {
+                const missing = getQuestionValidation(q).filter(item => !item.ok && item.label !== 'Question ready for publication');
+                if (missing.length) {
+                    problems.push(`Q${index + 1}: ${missing.map(m => m.label).join(', ')}`);
+                }
+            });
+            if (problems.length) {
+                await confirmPopup('Fix these before publishing:\n' + problems.join('\n'), 'Publishing validation', 'OK');
+                return;
+            }
+        }
+        return qodaLegacyPublishExam();
+    };
+
+    const qodaLegacyRemoveQuestion = removeQuestion;
+    removeQuestion = async function(qId) {
+        const ok = await confirmPopup('Delete this question from the exam?', 'Delete question', 'Delete');
+        if (ok) qodaLegacyRemoveQuestion(qId);
+    };
+
+    function enhanceSidebarTooltips() {
+        const descriptions = {
+            Profile: 'Lecturer profile and teaching courses',
+            Dashboard: 'Home, statistics, and activity',
+            'Exam Management': 'Create exams, submissions, and results',
+            'Student Management': 'Students, enrollment, and levels',
+            Monitoring: 'Proctoring and screen evidence',
+            Account: 'Profile and account tools',
+            'Switch Theme': 'Toggle light or dark mode',
+            Logout: 'Sign out safely'
+        };
+        document.querySelectorAll('.tooltip-text').forEach(tip => {
+            const label = tip.textContent.trim();
+            if (!label || tip.dataset.enhanced === '1') return;
+            tip.innerHTML = `<strong>${escapeHTML(label)}</strong><small>${escapeHTML(descriptions[label] || 'Open this dashboard section')}</small>`;
+            tip.dataset.enhanced = '1';
+        });
+    }
+
+    document.addEventListener('pointerdown', function(e) {
+        const panel = document.getElementById('submenuPanel');
+        if (!panel || !panel.classList.contains('open')) return;
+        if (e.target.closest('#submenuPanel, .nav-icon.has-submenu, .submenu-item')) return;
+        closeSubmenuPanel();
+    }, true);
+
+    if (window.qodaBuilderAutoSaveTimer) clearInterval(window.qodaBuilderAutoSaveTimer);
+    window.qodaBuilderAutoSaveTimer = setInterval(() => {
+        if (currentExamId && document.getElementById('view-builder')?.classList.contains('active')) {
+            saveAllFormDataToExam();
+            saveExamToDatabase();
+            document.querySelectorAll('.qoda-autosave').forEach(el => {
+                if (el.id && el.id.startsWith('autosave_')) return;
+                el.textContent = `Auto-saved at ${new Date().toLocaleTimeString()}`;
+            });
+        }
+    }, 30000);
+
+    document.addEventListener('DOMContentLoaded', enhanceSidebarTooltips);
+
     // Helper function to round to nearest whole number
     function roundToWholeNumber(value) {
         return Math.round(parseFloat(value) || 0);

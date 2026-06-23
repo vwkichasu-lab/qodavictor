@@ -9,7 +9,13 @@ class JwtHandler
 
     public function __construct()
     {
-        $this->secret = 'qoda-secret-key-change-in-production-2024';
+        $this->secret = getenv('JWT_SECRET') ?: getenv('QODA_APP_SECRET') ?: '';
+        if ($this->secret === '') {
+            if (getenv('RAILWAY_ENVIRONMENT') || getenv('RAILWAY_ENVIRONMENT_ID')) {
+                throw new RuntimeException('JWT_SECRET is not configured.');
+            }
+            $this->secret = hash('sha256', __DIR__ . '|qoda-local-development-secret');
+        }
     }
 
     public function encode($payload)

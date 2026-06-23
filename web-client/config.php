@@ -16,7 +16,9 @@ try {
     $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
     $pdo->exec("SET SESSION sql_mode = CONCAT_WS(',', @@SESSION.sql_mode, 'ANSI_QUOTES')");
 } catch (PDOException $e) {
-    die("Database connection failed: " . $e->getMessage());
+    error_log('Database connection failed: ' . $e->getMessage());
+    http_response_code(503);
+    die('Database connection is temporarily unavailable. Please try again later.');
 }
 
 // ========== SESSION START ==========

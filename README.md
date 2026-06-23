@@ -111,6 +111,18 @@ railway up --service qoda
 
 Required production environment values should be configured in Railway variables, not committed to GitHub.
 
+### ChatGPT-Assisted Grading
+
+QODA can use a ChatGPT rubric grader after compiler/test execution. Add these Railway variables to enable it:
+
+```text
+OPENAI_API_KEY=your_api_key_here
+QODA_AI_GRADING_ENABLED=auto
+QODA_AI_GRADING_MODEL=gpt-4.1-mini
+```
+
+If `OPENAI_API_KEY` is missing or the ChatGPT service is unavailable, QODA automatically falls back to the local compiler/test-case grader.
+
 ## Database
 
 The main schema reference is:
@@ -135,8 +147,17 @@ php scripts/migrate.php
 
 - Keep `.env`, Railway tokens, database passwords, and API keys out of Git.
 - Use Railway variables or a managed secret store for production credentials.
+- Configure `JWT_SECRET`, `QODA_APP_SECRET`, and `QODA_SOCKET_SECRET` before public production use.
 - Do not commit uploads, runtime execution output, or local database dumps.
 - Review the repository before pushing public changes that may contain credentials.
+
+## Improvement Roadmap
+
+The stabilization and production-readiness roadmap is documented in:
+
+```text
+docs/production-improvement-roadmap.md
+```
 
 ## License
 

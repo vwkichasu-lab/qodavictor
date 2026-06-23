@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1050" viewBox="0 0 1600 1050" role="img" aria-labelledby="title desc">
+  <title id="title">QODA PU Use Case Diagram</title>
+  <desc id="desc">Use case diagram for QODA PU with Student and Lecturer actors, use cases inside the system boundary, and external service actors for realtime, code execution, and database.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .boundary { fill: #ffffff; stroke: #0f172a; stroke-width: 3; rx: 24; }
+      .title { font: 800 34px Arial, Helvetica, sans-serif; fill: #0f172a; }
+      .subtitle { font: 700 20px Arial, Helvetica, sans-serif; fill: #334155; }
+      .actor-label { font: 800 22px Arial, Helvetica, sans-serif; fill: #0f172a; text-anchor: middle; }
+      .service-label { font: 800 18px Arial, Helvetica, sans-serif; fill: #0f172a; text-anchor: middle; }
+      .usecase { fill: #ecfeff; stroke: #0891b2; stroke-width: 2.5; }
+      .usecase-alt { fill: #eff6ff; stroke: #2563eb; stroke-width: 2.5; }
+      .usecase-warn { fill: #fff7ed; stroke: #f97316; stroke-width: 2.5; }
+      .usecase-text { font: 700 16px Arial, Helvetica, sans-serif; fill: #0f172a; text-anchor: middle; dominant-baseline: middle; }
+      .line { stroke: #475569; stroke-width: 2.2; fill: none; }
+      .actor-line { stroke: #0f172a; stroke-width: 4; stroke-linecap: round; fill: none; }
+      .service-box { fill: #f1f5f9; stroke: #475569; stroke-width: 2.5; rx: 14; }
+      .database { fill: #f1f5f9; stroke: #475569; stroke-width: 2.5; }
+      .note { font: 600 15px Arial, Helvetica, sans-serif; fill: #475569; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1600" height="1050"/>
+
+  <text x="800" y="56" class="title" text-anchor="middle">QODA PU Secure Coding Examination System</text>
+  <text x="800" y="88" class="subtitle" text-anchor="middle">Use Case Diagram</text>
+
+  <rect x="250" y="125" width="1030" height="835" class="boundary"/>
+  <text x="765" y="165" class="subtitle" text-anchor="middle">QODA System Boundary</text>
+
+  <!-- Student actor -->
+  <circle cx="115" cy="200" r="28" fill="#ffffff" stroke="#0f172a" stroke-width="4"/>
+  <line x1="115" y1="228" x2="115" y2="310" class="actor-line"/>
+  <line x1="62" y1="260" x2="168" y2="260" class="actor-line"/>
+  <line x1="115" y1="310" x2="70" y2="385" class="actor-line"/>
+  <line x1="115" y1="310" x2="160" y2="385" class="actor-line"/>
+  <text x="115" y="425" class="actor-label">Student</text>
+
+  <!-- Lecturer actor -->
+  <circle cx="115" cy="610" r="28" fill="#ffffff" stroke="#0f172a" stroke-width="4"/>
+  <line x1="115" y1="638" x2="115" y2="720" class="actor-line"/>
+  <line x1="62" y1="670" x2="168" y2="670" class="actor-line"/>
+  <line x1="115" y1="720" x2="70" y2="795" class="actor-line"/>
+  <line x1="115" y1="720" x2="160" y2="795" class="actor-line"/>
+  <text x="115" y="835" class="actor-label">Lecturer</text>
+
+  <!-- External service actors -->
+  <rect x="1340" y="170" width="190" height="92" class="service-box"/>
+  <text x="1435" y="205" class="service-label">Realtime /</text>
+  <text x="1435" y="230" class="service-label">Socket.IO Service</text>
+  <circle cx="1374" cy="214" r="7" fill="#0891b2"/>
+  <circle cx="1496" cy="214" r="7" fill="#0891b2"/>
+  <line x1="1381" y1="214" x2="1489" y2="214" stroke="#0891b2" stroke-width="3"/>
+
+  <rect x="1340" y="450" width="190" height="92" class="service-box"/>
+  <text x="1435" y="485" class="service-label">Code Execution</text>
+  <text x="1435" y="510" class="service-label">Service</text>
+  <circle cx="1435" cy="520" r="12" fill="none" stroke="#2563eb" stroke-width="3"/>
+  <path d="M1435 501 v-14 M1435 539 v14 M1416 520 h-14 M1454 520 h14" stroke="#2563eb" stroke-width="3" stroke-linecap="round"/>
+
+  <path d="M1345 710 C1345 688 1525 688 1525 710 L1525 805 C1525 827 1345 827 1345 805 Z" class="database"/>
+  <ellipse cx="1435" cy="710" rx="90" ry="22" fill="#e2e8f0" stroke="#475569" stroke-width="2.5"/>
+  <text x="1435" y="762" class="service-label">Database</text>
+
+  <!-- Common use cases -->
+  <ellipse cx="395" cy="225" rx="115" ry="42" class="usecase-alt"/>
+  <text x="395" y="225" class="usecase-text">Login</text>
+  <ellipse cx="395" cy="325" rx="115" ry="42" class="usecase-alt"/>
+  <text x="395" y="325" class="usecase-text">View Dashboard</text>
+
+  <!-- Student use cases -->
+  <ellipse cx="610" cy="205" rx="135" ry="42" class="usecase"/>
+  <text x="610" y="205" class="usecase-text">View Available Exams</text>
+  <ellipse cx="610" cy="300" rx="115" ry="42" class="usecase"/>
+  <text x="610" y="300" class="usecase-text">Start Exam</text>
+  <ellipse cx="610" cy="395" rx="125" ry="42" class="usecase"/>
+  <text x="610" y="395" class="usecase-text">Share Screen</text>
+  <ellipse cx="610" cy="490" rx="145" ry="42" class="usecase"/>
+  <text x="610" y="490" class="usecase-text">Answer Coding Questions</text>
+  <ellipse cx="610" cy="585" rx="105" ry="42" class="usecase"/>
+  <text x="610" y="585" class="usecase-text">Run Code</text>
+  <ellipse cx="610" cy="680" rx="120" ry="42" class="usecase"/>
+  <text x="610" y="680" class="usecase-text">Autosave Answers</text>
+  <ellipse cx="610" cy="775" rx="115" ry="42" class="usecase"/>
+  <text x="610" y="775" class="usecase-text">Submit Exam</text>
+  <ellipse cx="610" cy="870" rx="105" ry="42" class="usecase"/>
+  <text x="610" y="870" class="usecase-text">View Results</text>
+
+  <!-- Lecturer use cases -->
+  <ellipse cx="955" cy="210" rx="125" ry="42" class="usecase-alt"/>
+  <text x="955" y="210" class="usecase-text">Register Account</text>
+  <ellipse cx="955" cy="305" rx="125" ry="42" class="usecase-alt"/>
+  <text x="955" y="305" class="usecase-text">Create / Edit Exam</text>
+  <ellipse cx="955" cy="400" rx="145" ry="42" class="usecase-alt"/>
+  <text x="955" y="400" class="usecase-text">Add Questions and Tests</text>
+  <ellipse cx="955" cy="495" rx="110" ry="42" class="usecase-alt"/>
+  <text x="955" y="495" class="usecase-text">Publish Exam</text>
+  <ellipse cx="955" cy="590" rx="135" ry="42" class="usecase-warn"/>
+  <text x="955" y="590" class="usecase-text">Monitor Live Exam</text>
+  <ellipse cx="955" cy="685" rx="135" ry="42" class="usecase-warn"/>
+  <text x="955" y="685" class="usecase-text">Control Timer / Time</text>
+  <ellipse cx="955" cy="780" rx="150" ry="42" class="usecase-warn"/>
+  <text x="955" y="780" class="usecase-text">Warn / Lock / Message</text>
+  <ellipse cx="955" cy="875" rx="125" ry="42" class="usecase-alt"/>
+  <text x="955" y="875" class="usecase-text">Grade and Publish</text>
+
+  <!-- Student connections -->
+  <path class="line" d="M170 215 L280 225"/>
+  <path class="line" d="M170 250 L280 315"/>
+  <path class="line" d="M170 285 L475 205"/>
+  <path class="line" d="M170 310 L495 300"/>
+  <path class="line" d="M170 335 L490 395"/>
+  <path class="line" d="M170 360 L475 490"/>
+  <path class="line" d="M170 380 L510 585"/>
+  <path class="line" d="M170 395 L500 775"/>
+  <path class="line" d="M170 410 L515 870"/>
+
+  <!-- Lecturer connections -->
+  <path class="line" d="M170 615 L280 245"/>
+  <path class="line" d="M170 640 L280 335"/>
+  <path class="line" d="M170 665 L830 210"/>
+  <path class="line" d="M170 690 L830 305"/>
+  <path class="line" d="M170 715 L810 400"/>
+  <path class="line" d="M170 740 L845 495"/>
+  <path class="line" d="M170 765 L820 590"/>
+  <path class="line" d="M170 790 L820 685"/>
+  <path class="line" d="M170 815 L805 780"/>
+  <path class="line" d="M170 835 L830 875"/>
+
+  <!-- Service connections -->
+  <path class="line" d="M735 395 L1340 215"/>
+  <path class="line" d="M1090 590 L1340 215"/>
+  <path class="line" d="M1090 685 L1340 215"/>
+  <path class="line" d="M1105 780 L1340 215"/>
+
+  <path class="line" d="M715 585 L1340 496"/>
+  <path class="line" d="M1090 400 L1340 496"/>
+
+  <path class="line" d="M730 680 L1345 760"/>
+  <path class="line" d="M725 775 L1345 780"/>
+  <path class="line" d="M1065 305 L1345 720"/>
+  <path class="line" d="M1065 495 L1345 735"/>
+  <path class="line" d="M1080 875 L1345 805"/>
+
+  <text x="315" y="935" class="note">Note: Administrator is intentionally excluded. This diagram focuses on Student and Lecturer interactions.</text>
+</svg>

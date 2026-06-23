@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once '../backend-php/config/database.php';
+require_once '../backend-php/lib/grade_storage.php';
 
 // Check login
 if (!isset($_SESSION['user_id'])) {
@@ -21,6 +22,27 @@ function ensureColumn(PDO $pdo, string $table, string $column, string $definitio
     }
 }
 
+function tryEnsureColumn(PDO $pdo, string $table, string $column, string $definition): void
+{
+    try {
+        ensureColumn($pdo, $table, $column, $definition);
+    } catch (Throwable $error) {
+        error_log("IDE schema column check skipped for {$table}.{$column}: " . $error->getMessage());
+    }
+}
+
+function qodaGradeInfo(float $score): array
+{
+    if ($score >= 80) return ['grade' => 'A', 'point' => 4.0];
+    if ($score >= 75) return ['grade' => 'B+', 'point' => 3.5];
+    if ($score >= 70) return ['grade' => 'B', 'point' => 3.0];
+    if ($score >= 65) return ['grade' => 'C+', 'point' => 2.5];
+    if ($score >= 60) return ['grade' => 'C', 'point' => 2.0];
+    if ($score >= 55) return ['grade' => 'D+', 'point' => 1.5];
+    if ($score >= 50) return ['grade' => 'D', 'point' => 1.0];
+    return ['grade' => 'E', 'point' => 0.0];
+}
+
 try {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS exam_question_grading (
@@ -38,14 +60,20 @@ try {
             INDEX idx_submission (submission_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ");
-    ensureColumn($pdo, 'exam_submissions', 'graded_at', 'DATETIME NULL');
-    ensureColumn($pdo, 'exam_submissions', 'graded_by', 'INT NULL');
-    ensureColumn($pdo, 'exam_submissions', 'manual_feedback', 'TEXT NULL');
-    ensureColumn($pdo, 'exam_submissions', 'manual_score', 'DECIMAL(10,2) DEFAULT 0');
-    ensureColumn($pdo, 'exam_submissions', 'auto_score', 'DECIMAL(10,2) DEFAULT 0');
-    ensureColumn($pdo, 'exam_question_grading', 'manual_score', 'DECIMAL(10,2) NULL');
-    ensureColumn($pdo, 'exam_question_grading', 'manual_feedback', 'TEXT NULL');
-    ensureColumn($pdo, 'exam_question_grading', 'score_source', "VARCHAR(20) DEFAULT 'ai'");
+    tryEnsureColumn($pdo, 'exam_submissions', 'graded_at', 'DATETIME NULL');
+    tryEnsureColumn($pdo, 'exam_submissions', 'graded_by', 'INT NULL');
+    tryEnsureColumn($pdo, 'exam_submissions', 'manual_feedback', 'TEXT NULL');
+    tryEnsureColumn($pdo, 'exam_submissions', 'manual_score', 'DECIMAL(10,2) DEFAULT 0');
+    tryEnsureColumn($pdo, 'exam_submissions', 'auto_score', 'DECIMAL(10,2) DEFAULT 0');
+    tryEnsureColumn($pdo, 'exam_submissions', 'class_score', 'DECIMAL(5,2) DEFAULT 0');
+    tryEnsureColumn($pdo, 'exam_submissions', 'exam_score', 'DECIMAL(5,2) DEFAULT 0');
+    tryEnsureColumn($pdo, 'exam_submissions', 'grade', 'VARCHAR(5) NULL');
+    tryEnsureColumn($pdo, 'exam_submissions', 'grade_point', 'DECIMAL(3,1) DEFAULT 0');
+    tryEnsureColumn($pdo, 'exam_submissions', 'updated_at', 'DATETIME NULL');
+    tryEnsureColumn($pdo, 'exam_question_grading', 'manual_score', 'DECIMAL(10,2) NULL');
+    tryEnsureColumn($pdo, 'exam_question_grading', 'manual_feedback', 'TEXT NULL');
+    tryEnsureColumn($pdo, 'exam_question_grading', 'score_source', "VARCHAR(20) DEFAULT 'ai'");
+    qodaTryEnsureFinalGradeTable($pdo);
 } catch (Exception $e) {
     error_log('IDE schema check failed: ' . $e->getMessage());
 }
@@ -65,57 +93,47 @@ if (isset($_POST['action'])) {
             $manualScore = $scoreSource === 'manual' ? $score : null;
             $aiScore = $scoreSource === 'ai' ? $score : null;
 
-            $stmt = $pdo->prepare("
-                INSERT INTO exam_question_grading
-                    (submission_id, question_index, marking_scheme, test_cases, ai_score, ai_feedback, manual_score, manual_feedback, score_source, graded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-                ON DUPLICATE KEY UPDATE
-                    marking_scheme = VALUES(marking_scheme),
-                    test_cases = VALUES(test_cases),
-                    ai_score = COALESCE(VALUES(ai_score), ai_score),
-                    ai_feedback = COALESCE(VALUES(ai_feedback), ai_feedback),
-                    manual_score = COALESCE(VALUES(manual_score), manual_score),
-                    manual_feedback = COALESCE(VALUES(manual_feedback), manual_feedback),
-                    score_source = VALUES(score_source),
-                    graded_at = NOW()
-            ");
-            $stmt->execute([
-                $submissionId,
-                $questionIndex,
-                $markingScheme,
-                $testCases,
-                $aiScore,
-                $scoreSource === 'ai' ? $feedback : null,
-                $manualScore,
-                $scoreSource === 'manual' ? $feedback : null,
-                $scoreSource
-            ]);
-
-            $subStmt = $pdo->prepare("SELECT answers FROM exam_submissions WHERE id = ?");
-            $subStmt->execute([$submissionId]);
-            $submission = $subStmt->fetch(PDO::FETCH_ASSOC);
-
-            if (!$submission) {
-                echo json_encode(['success' => false, 'error' => 'Submission not found']);
+            try {
+                $stmt = $pdo->prepare("
+                    INSERT INTO exam_question_grading
+                        (submission_id, question_index, marking_scheme, test_cases, ai_score, ai_feedback, manual_score, manual_feedback, score_source, graded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                    ON DUPLICATE KEY UPDATE
+                        marking_scheme = VALUES(marking_scheme),
+                        test_cases = VALUES(test_cases),
+                        ai_score = COALESCE(VALUES(ai_score), ai_score),
+                        ai_feedback = COALESCE(VALUES(ai_feedback), ai_feedback),
+                        manual_score = COALESCE(VALUES(manual_score), manual_score),
+                        manual_feedback = COALESCE(VALUES(manual_feedback), manual_feedback),
+                        score_source = VALUES(score_source),
+                        graded_at = NOW()
+                ");
+                $stmt->execute([
+                    $submissionId,
+                    $questionIndex,
+                    $markingScheme,
+                    $testCases,
+                    $aiScore,
+                    $scoreSource === 'ai' ? $feedback : null,
+                    $manualScore,
+                    $scoreSource === 'manual' ? $feedback : null,
+                    $scoreSource
+                ]);
+            } catch (Throwable $error) {
+                error_log('Question grading save skipped; database storage is unavailable: ' . $error->getMessage());
+                echo json_encode([
+                    'success' => true,
+                    'warning' => 'Question score kept in the current grading session, but the database could not store the per-question record because storage is unavailable.'
+                ]);
                 exit;
             }
 
-            $answers = json_decode($submission['answers'] ?? '[]', true);
-            if (!is_array($answers)) $answers = [];
-            if (!isset($answers['_scores']) || !is_array($answers['_scores'])) $answers['_scores'] = [];
-            if (!isset($answers['_ai_feedback']) || !is_array($answers['_ai_feedback'])) $answers['_ai_feedback'] = [];
-            if (!isset($answers['_score_source']) || !is_array($answers['_score_source'])) $answers['_score_source'] = [];
-            if (!isset($answers['_manual_feedback']) || !is_array($answers['_manual_feedback'])) $answers['_manual_feedback'] = [];
-            $answers['_scores'][$questionIndex] = $score;
-            $answers['_score_source'][$questionIndex] = $scoreSource;
-            if ($scoreSource === 'manual') {
-                $answers['_manual_feedback'][$questionIndex] = $feedback;
-            } else {
-                $answers['_ai_feedback'][$questionIndex] = $feedback;
+            $subStmt = $pdo->prepare("SELECT id FROM exam_submissions WHERE id = ?");
+            $subStmt->execute([$submissionId]);
+            if (!$subStmt->fetch(PDO::FETCH_ASSOC)) {
+                echo json_encode(['success' => false, 'error' => 'Submission not found']);
+                exit;
             }
-
-            $upd = $pdo->prepare("UPDATE exam_submissions SET answers = ?, updated_at = NOW() WHERE id = ?");
-            $upd->execute([json_encode($answers), $submissionId]);
 
             echo json_encode(['success' => true]);
             exit;
@@ -129,7 +147,7 @@ if (isset($_POST['action'])) {
             $scores = json_decode($_POST['scores'] ?? '{}', true);
             if (!is_array($scores)) $scores = [];
 
-            $stmt = $pdo->prepare("SELECT answers FROM exam_submissions WHERE id = ?");
+            $stmt = $pdo->prepare("SELECT answers, class_score FROM exam_submissions WHERE id = ?");
             $stmt->execute([$submissionId]);
             $submission = $stmt->fetch(PDO::FETCH_ASSOC);
 
@@ -141,38 +159,23 @@ if (isset($_POST['action'])) {
             $answers = json_decode($submission['answers'] ?? '[]', true);
             if (!is_array($answers)) $answers = [];
             $existingGrading = $answers['grading'] ?? $answers['_grading'] ?? [];
-            $classScore40 = min(40, max(0, round((float)($existingGrading['class_score'] ?? 0))));
+            $classScore40 = min(40, max(0, round((float)($submission['class_score'] ?? $existingGrading['class_score'] ?? 0))));
             $finalTotalScore = min(100, max(0, $examScore60 + $classScore40));
-            $answers['_scores'] = $scores;
-            $answers['_finalized'] = true;
-            $answers['_finalized_at'] = date('Y-m-d H:i:s');
-            $answers['_finalized_by'] = $_SESSION['user_id'];
-            $answers['_exam_percentage'] = $percentage;
-            $answers['_exam_score_60'] = $examScore60;
-            $answers['grading'] = [
+            $gradeInfo = qodaGradeInfo($finalTotalScore);
+
+            qodaPersistFinalGrade($pdo, [
+                'submission_id' => $submissionId,
                 'raw_question_score' => $rawTotalScore,
+                'percentage' => $percentage,
                 'class_score' => $classScore40,
                 'exam_score' => $examScore60,
                 'total_score' => $finalTotalScore,
-                'percentage' => $percentage,
-                'grade' => null,
-                'grade_point' => null,
-                'graded_at' => date('Y-m-d H:i:s')
-            ];
-
-            $upd = $pdo->prepare("
-                UPDATE exam_submissions
-                SET answers = ?,
-                    total_score = ?,
-                    manual_score = ?,
-                    percentage = ?,
-                    status = 'MANUALLY_GRADED',
-                    graded_at = NOW(),
-                    graded_by = ?,
-                    updated_at = NOW()
-                WHERE id = ?
-            ");
-            $upd->execute([json_encode($answers), $finalTotalScore, $rawTotalScore, $percentage, $_SESSION['user_id'], $submissionId]);
+                'grade' => $gradeInfo['grade'],
+                'grade_point' => $gradeInfo['point'],
+                'status' => 'MANUALLY_GRADED',
+                'score_source' => 'manual',
+                'graded_by' => $_SESSION['user_id']
+            ]);
 
             echo json_encode(['success' => true]);
             exit;
@@ -298,6 +301,42 @@ if ($current_score === null) {
 }
 $has_autograded = $saved_ai_score !== null || trim((string)$saved_ai_feedback) !== '';
 
+$allGradingStmt = $pdo->prepare("
+    SELECT question_index, ai_score, ai_feedback, manual_score, manual_feedback, score_source
+    FROM exam_question_grading
+    WHERE submission_id = ?
+");
+$allGradingStmt->execute([$submission_id]);
+$question_feedbacks = [];
+foreach ($allGradingStmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+    $idx = (int)$row['question_index'];
+    $effectiveScore = ($row['score_source'] ?? '') === 'manual' && $row['manual_score'] !== null
+        ? (float)$row['manual_score']
+        : ($row['ai_score'] !== null ? (float)$row['ai_score'] : ($row['manual_score'] !== null ? (float)$row['manual_score'] : null));
+    if ($effectiveScore !== null) {
+        $saved_scores[$idx] = $effectiveScore;
+    }
+    $question_feedbacks[$idx] = [
+        'ai_score' => $row['ai_score'] !== null ? (float)$row['ai_score'] : null,
+        'ai_feedback' => $row['ai_feedback'] ?? '',
+        'manual_score' => $row['manual_score'] !== null ? (float)$row['manual_score'] : null,
+        'manual_feedback' => $row['manual_feedback'] ?? '',
+        'score_source' => $row['score_source'] ?? ''
+    ];
+}
+foreach (($answers['_ai_feedback'] ?? []) as $idx => $feedback) {
+    if (!isset($question_feedbacks[$idx])) $question_feedbacks[$idx] = [];
+    $question_feedbacks[$idx]['ai_feedback'] = $question_feedbacks[$idx]['ai_feedback'] ?? $feedback;
+}
+foreach (($answers['_manual_feedback'] ?? []) as $idx => $feedback) {
+    if (!isset($question_feedbacks[$idx])) $question_feedbacks[$idx] = [];
+    $question_feedbacks[$idx]['manual_feedback'] = $question_feedbacks[$idx]['manual_feedback'] ?? $feedback;
+}
+foreach (($answers['_score_source'] ?? []) as $idx => $source) {
+    if (!isset($question_feedbacks[$idx])) $question_feedbacks[$idx] = [];
+    $question_feedbacks[$idx]['score_source'] = $question_feedbacks[$idx]['score_source'] ?? $source;
+}
+
 // Calculate total marks
 $total_marks_all = 0;
 foreach ($questions as $q) {
@@ -312,6 +351,7 @@ foreach ($questions as $q) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Qoda Code Grader IDE</title>
+    <link rel="icon" type="image/png" href="../assets/qoda-logo.png">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.44.0/min/vs/loader.js"></script>
@@ -635,8 +675,11 @@ foreach ($questions as $q) {
         padding: 16px;
         overflow-y: auto;
         font-family: monospace;
-        font-size: 12px;
+        font-size: 16px;
         white-space: pre-wrap;
+        background: #0f172a;
+        color: #e5e7eb;
+        line-height: 1.55;
     }
 
     /* Bottom Panels */
@@ -731,9 +774,49 @@ foreach ($questions as $q) {
     }
 
     .run-input-box {
+        display: none;
         border-top: 1px solid #2d2d44;
         background: #0b1220;
         padding: 10px 12px;
+    }
+
+    .terminal-session {
+        min-height: 100%;
+        background: #0f172a;
+        color: #e5e7eb;
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 16px;
+        line-height: 1.55;
+        white-space: pre-wrap;
+    }
+
+    .terminal-transcript {
+        margin: 0;
+        color: inherit;
+        white-space: pre-wrap;
+        font: inherit;
+    }
+
+    .terminal-input-line {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 6px;
+    }
+
+    .terminal-input-prompt {
+        color: #f8fafc;
+    }
+
+    .terminal-input-field {
+        flex: 0 1 220px;
+        min-width: 140px;
+        border: 0;
+        outline: 0;
+        background: transparent;
+        color: #f8fafc;
+        font: inherit;
+        caret-color: #22d3ee;
     }
 
     .run-input-box label {
@@ -832,6 +915,62 @@ foreach ($questions as $q) {
         border: 1px solid #f97316;
     }
 
+    .modal-dialog.modal-wide {
+        max-width: 980px;
+        width: min(96vw, 980px);
+    }
+
+    .marking-summary-wrap {
+        max-height: 62vh;
+        overflow: auto;
+        padding-right: 4px;
+    }
+
+    .marking-summary-table {
+        width: 100%;
+        min-width: 760px;
+        border-collapse: collapse;
+        table-layout: fixed;
+        font-size: 13px;
+    }
+
+    .marking-summary-table th,
+    .marking-summary-table td {
+        border-bottom: 1px solid #334155;
+        padding: 10px 8px;
+        vertical-align: top;
+    }
+
+    .marking-summary-table th {
+        color: #dbeafe;
+        text-align: left;
+    }
+
+    .marking-summary-table .num-col {
+        width: 110px;
+    }
+
+    .marking-summary-table .score-col {
+        width: 82px;
+        text-align: center;
+    }
+
+    .marking-summary-table .feedback-col {
+        width: auto;
+        line-height: 1.45;
+        word-break: normal;
+        overflow-wrap: anywhere;
+    }
+
+    .marking-summary-total {
+        margin-top: 16px;
+        padding: 16px;
+        border: 1px solid #334155;
+        border-radius: 10px;
+        background: #0f172a;
+        line-height: 1.45;
+    }
+
     .modal-dialog h3 {
         margin-bottom: 16px;
     }
@@ -907,6 +1046,7 @@ foreach ($questions as $q) {
 </head>
 
 <body>
+    <span id="compilationStatus" style="display:none;"></span>
 
     <div class="title-bar">
         <div class="title-left">
@@ -1057,16 +1197,13 @@ foreach ($questions as $q) {
         <!-- BOTTOM RIGHT - EVALUATION -->
         <div class="bottom-right">
             <div class="bottom-header">
-                <span><i class="fas fa-chart-line"></i> Errors and Evaluation</span>
+                <span><i class="fas fa-chart-line"></i> Feedback and Marks</span>
             </div>
             <div class="bottom-content" id="evaluationPanel">
                 <div class="eval-box">
-                    <div class="eval-row"><span>CPU Time:</span><span id="cpuTime">0.00 sec(s)</span></div>
-                    <div class="eval-row"><span>Memory:</span><span id="memoryUsage">0 KB</span></div>
-                    <div class="eval-row"><span>Compilation:</span><span id="compilationStatus">Pending</span></div>
                     <div class="eval-row" id="testStatusRow" style="display:none;"><span>Test Status:</span><span
                             id="testStatus"></span></div>
-                    <div id="aiFeedbackBox" style="margin-top: 12px; font-size: 11px; color: #8b949e;"></div>
+                    <div id="aiFeedbackBox" style="display:none;"></div>
                     <div class="score-display" id="scoreDisplay">
                         Marks Obtained: <span
                             id="obtainedMarks"><?= $current_score !== null ? $current_score : '-' ?></span> / <span
@@ -1118,6 +1255,7 @@ foreach ($questions as $q) {
     let savedAiFeedback = <?= json_encode($saved_ai_feedback) ?>;
     let savedManualFeedback = <?= json_encode($saved_manual_feedback) ?>;
     let savedScoreSource = <?= json_encode($saved_score_source) ?>;
+    let questionFeedbacks = <?= json_encode($question_feedbacks) ?>;
     let modalCallback = null;
 
     // Initialize Monaco Editor
@@ -1154,11 +1292,8 @@ foreach ($questions as $q) {
             if (manualBox) manualBox.value = savedManualFeedback;
         }
 
-        const feedback = savedScoreSource === 'manual' && savedManualFeedback ? savedManualFeedback : savedAiFeedback;
-        if (feedback) {
-            document.getElementById('aiFeedbackBox').innerHTML =
-                `<strong>${savedScoreSource === 'manual' ? 'Manual' : 'Auto'} Feedback:</strong> ${escapeHtml(String(feedback).substring(0, 350))}${String(feedback).length > 350 ? '...' : ''}`;
-        }
+        const feedbackBox = document.getElementById('aiFeedbackBox');
+        if (feedbackBox) feedbackBox.innerHTML = '';
         updateAutoGradeStatus();
     }
 
@@ -1300,14 +1435,13 @@ foreach ($questions as $q) {
                         `<span style="color:#ef4444;">${passed}/${data.results.length} passed</span>`;
                 }
                 outputDiv.innerHTML = outputHtml;
-                document.getElementById('cpuTime').innerText = `${execTime} sec(s)`;
-                document.getElementById('memoryUsage').innerText = data.memory || Math.floor(Math.random() * 50000 +
-                    20000);
-                document.getElementById('compilationStatus').innerHTML =
+                setOptionalText('cpuTime', `${execTime} sec(s)`);
+                setOptionalText('memoryUsage', data.memory || Math.floor(Math.random() * 50000 + 20000));
+                optionalElement('compilationStatus').innerHTML =
                     '<span style="color:#22c55e;">Success ✓</span>';
             } else {
                 outputDiv.innerHTML = `<span style="color:#ef4444;">Error: ${escapeHtml(data.error)}</span>`;
-                document.getElementById('compilationStatus').innerHTML =
+                optionalElement('compilationStatus').innerHTML =
                     '<span style="color:#ef4444;">Failed ✗</span>';
             }
         } catch (error) {
@@ -1323,7 +1457,8 @@ foreach ($questions as $q) {
         const terminalDiv = document.getElementById('terminalContent');
         const browserFrame = document.getElementById('browserFrame');
         const testCases = getCurrentTestCases();
-        const stdin = document.getElementById('programInput')?.value || '';
+        let stdin = document.getElementById('programInput')?.value || '';
+        const projectFiles = getCurrentProjectFiles();
         const questionText = currentQuestions[currentQuestionIndex]?.text ||
             currentQuestions[currentQuestionIndex]?.prompt ||
             currentQuestions[currentQuestionIndex]?.title ||
@@ -1347,7 +1482,7 @@ foreach ($questions as $q) {
             if (browserFrame) browserFrame.srcdoc = html;
             outputDiv.innerHTML = '<span style="color:#22c55e;">Browser preview rendered successfully.</span>';
             if (terminalDiv) terminalDiv.innerHTML = 'Web preview rendered in the Browser tab.';
-            document.getElementById('compilationStatus').innerHTML = '<span style="color:#22c55e;">Preview ready</span>';
+            setOptionalHtml('compilationStatus', '<span style="color:#22c55e;">Preview ready</span>');
             switchTab('browser');
             return;
         }
@@ -1370,20 +1505,14 @@ foreach ($questions as $q) {
                     input: stdin,
                     test_cases: testCases,
                     question_text: questionText,
-                    files: getCurrentProjectFiles()
+                    files: getCurrentProjectFiles(),
+                    use_inferred_input: false
                 })
             });
             const data = await response.json();
             const execTime = ((performance.now() - startTime) / 1000).toFixed(2);
-            if (data.generated_input && document.getElementById('programInput')) {
-                document.getElementById('programInput').value = data.generated_input;
-            }
-
             if (data.success) {
                 let outputHtml = `<div style="margin-bottom:12px;"><strong>Program Output:</strong></div>`;
-                if (data.generated_input) {
-                    outputHtml += `<div style="margin-bottom:10px; color:#93c5fd;"><strong>Auto stdin used:</strong><pre style="margin-top:6px; background:#101827; padding:8px; border-radius:6px;">${escapeHtml(data.generated_input.trim())}</pre></div>`;
-                }
                 outputHtml += `<pre style="background:#0f0f1a; padding:12px; border-radius:6px;">${escapeHtml(data.output || 'No output')}</pre>`;
                 if (terminalDiv) terminalDiv.innerHTML = escapeHtml(data.output || 'No terminal output.');
 
@@ -1405,20 +1534,385 @@ foreach ($questions as $q) {
                 }
 
                 outputDiv.innerHTML = outputHtml;
-                document.getElementById('cpuTime').innerText = data.execution_time_ms ? `${data.execution_time_ms} ms` : `${execTime} sec(s)`;
-                document.getElementById('memoryUsage').innerText = data.memory || 'N/A';
-                document.getElementById('compilationStatus').innerHTML = '<span style="color:#22c55e;">Success ✓</span>';
+                setOptionalText('cpuTime', data.execution_time_ms ? `${data.execution_time_ms} ms` : `${execTime} sec(s)`);
+                setOptionalText('memoryUsage', data.memory || 'N/A');
+                setOptionalHtml('compilationStatus', '<span style="color:#22c55e;">Success ✓</span>');
             } else {
                 const message = data.error || data.output || 'Execution failed.';
-                const generatedInputHtml = data.generated_input ? `<div style="margin:8px 0; color:#93c5fd;"><strong>Auto stdin used:</strong><pre style="margin-top:6px; background:#101827; padding:8px; border-radius:6px;">${escapeHtml(data.generated_input.trim())}</pre></div>` : '';
+                const generatedInputHtml = '';
                 outputDiv.innerHTML = `${generatedInputHtml}<span style="color:#ef4444;">Error:</span><pre style="margin-top:10px;">${escapeHtml(message)}</pre>`;
                 if (terminalDiv) terminalDiv.innerHTML = escapeHtml(message);
-                document.getElementById('compilationStatus').innerHTML = '<span style="color:#ef4444;">Failed ✗</span>';
+                setOptionalHtml('compilationStatus', '<span style="color:#ef4444;">Failed ✗</span>');
             }
         } catch (error) {
             outputDiv.innerHTML = `<span style="color:#ef4444;">Network error: ${escapeHtml(error.message)}</span>`;
             if (terminalDiv) terminalDiv.innerHTML = `Network error: ${escapeHtml(error.message)}`;
         }
+    }
+
+    async function runCode() {
+        const code = editor.getValue();
+        const language = currentQuestions[currentQuestionIndex]?.language || 'java';
+        const normalizedLanguage = String(language).toLowerCase();
+        const outputDiv = document.getElementById('outputContent');
+        const terminalDiv = document.getElementById('terminalContent');
+        const browserFrame = document.getElementById('browserFrame');
+        const testCases = getCurrentTestCases();
+        let stdin = document.getElementById('programInput')?.value || '';
+        const projectFiles = getCurrentProjectFiles();
+        const questionText = currentQuestions[currentQuestionIndex]?.text ||
+            currentQuestions[currentQuestionIndex]?.prompt ||
+            currentQuestions[currentQuestionIndex]?.title ||
+            '';
+
+        if (['html', 'css', 'javascript', 'js', 'web'].includes(normalizedLanguage) && testCases.length === 0) {
+            const projectFiles = getCurrentProjectFiles();
+            const htmlFile = projectFiles.find(file => String(file.name || '').toLowerCase().endsWith('.html'));
+            const cssFiles = projectFiles.filter(file => String(file.name || '').toLowerCase().endsWith('.css'));
+            const jsFiles = projectFiles.filter(file => String(file.name || '').toLowerCase().endsWith('.js'));
+            let html = htmlFile ? htmlFile.content : code;
+            if (!/<html[\s>]/i.test(html)) {
+                html = `<!doctype html><html><head><meta charset="utf-8"><title>Qoda Preview</title></head><body>${html}</body></html>`;
+            }
+            if (cssFiles.length) html = html.replace('</head>', `<style>${cssFiles.map(file => file.content || '').join('\n')}</style></head>`);
+            if (jsFiles.length && !htmlFile) html = html.replace('</body>', `<script>${jsFiles.map(file => file.content || '').join('\n')}<\/script></body>`);
+            if (browserFrame) browserFrame.srcdoc = html;
+            outputDiv.innerHTML = '<span style="color:#22c55e;">Browser preview rendered successfully.</span>';
+            if (terminalDiv) terminalDiv.innerHTML = 'Web preview rendered in the Browser tab.';
+            switchTab('browser');
+            return;
+        }
+
+        outputDiv.innerHTML = 'Checking code...';
+        if (terminalDiv) terminalDiv.innerHTML = 'Running...';
+        switchTab('output');
+
+        try {
+            if (codeLikelyNeedsInput(code, language)) {
+                const preflight = await runCodePreflight(code, language, projectFiles);
+                if (!preflight.success) {
+                    const message = preflight.error || preflight.output || 'Syntax or compile error detected.';
+                    outputDiv.textContent = `Error:\n${message}`;
+                    if (terminalDiv) terminalDiv.textContent = `Error:\n${message}`;
+                    return;
+                }
+                stdin = await collectProgramInputInConsole(code, language);
+            }
+
+            outputDiv.textContent = 'Running...';
+            const response = await fetch('api/run_code.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    code,
+                    language,
+                    input: stdin,
+                    test_cases: testCases,
+                    question_text: questionText,
+                    files: projectFiles,
+                    use_inferred_input: false
+                })
+            });
+            const data = await response.json();
+            if (data.success) {
+                const transcript = formatConsoleOutputWithInputEcho(data.output || 'No output', stdin, code, language, true);
+                let outputHtml = escapeHtml(transcript);
+                if (data.results && data.results.length) {
+                    let passed = 0;
+                    outputHtml += '\n\nTest Results:\n';
+                    data.results.forEach(result => {
+                        if (result.passed) passed++;
+                        outputHtml += `${result.passed ? 'PASSED' : 'FAILED'} Test ${result.test_case}\n`;
+                        outputHtml += `Input: ${escapeHtml(result.input || '[none]')}\nExpected: ${escapeHtml(result.expected)}\nGot: ${escapeHtml(result.actual || '[empty]')}${result.error ? '\nError: ' + escapeHtml(result.error) : ''}\n`;
+                    });
+                    const row = document.getElementById('testStatusRow');
+                    if (row) row.style.display = 'flex';
+                    setOptionalHtml('testStatus', passed === data.results.length ? '<span style="color:#22c55e;">All tests passed</span>' : `<span style="color:#ef4444;">${passed}/${data.results.length} passed</span>`);
+                }
+                outputDiv.innerHTML = outputHtml;
+                if (terminalDiv) terminalDiv.textContent = transcript || 'No terminal output.';
+            } else {
+                const message = data.error || data.output || 'Execution failed.';
+                const partial = data.output ? formatConsoleOutputWithInputEcho(data.output, stdin, code, language, false) : '';
+                outputDiv.textContent = partial ? `${partial}\n\nError:\n${message}` : `Error:\n${message}`;
+                if (terminalDiv) terminalDiv.textContent = outputDiv.textContent;
+            }
+        } catch (error) {
+            outputDiv.innerHTML = `<span style="color:#ef4444;">Network error: ${escapeHtml(error.message)}</span>`;
+            if (terminalDiv) terminalDiv.innerHTML = `Network error: ${escapeHtml(error.message)}`;
+        }
+    }
+
+    function codeLikelyNeedsInput(code, language) {
+        const lang = String(language || '').toLowerCase();
+        const consoleLang = ['c', 'cpp', 'java', 'python', 'py', 'php', 'csharp', 'cs', 'vbnet', 'vb'];
+        if (!consoleLang.includes(lang)) return false;
+        return /\bscanf\s*\(|\bcin\s*>>|\bScanner\b|\binput\s*\(|\breadline\s*\(|\bConsole\.ReadLine\s*\(|\bfgets\s*\(|\bgets\s*\(/i.test(code);
+    }
+
+    function cleanInputPrompt(text, fallback) {
+        const cleaned = String(text || '')
+            .replace(/\\n/g, '')
+            .replace(/\\t/g, ' ')
+            .replace(/\s+/g, ' ')
+            .replace(/["'`;]+/g, '')
+            .trim();
+        return cleaned || fallback;
+    }
+
+    function countScanfSpecifiers(format) {
+        const matches = String(format || '').match(/%(?!%)[*]?(?:\d+)?(?:\.\d+)?[hlLjzt]*[diuoxXfFeEgGaAcspn]/g);
+        return matches ? matches.length : 1;
+    }
+
+    function decodeConsoleLiteral(text) {
+        return String(text || '')
+            .replace(/\\n/g, '\n')
+            .replace(/\\r/g, '\r')
+            .replace(/\\t/g, '\t')
+            .replace(/\\"/g, '"')
+            .replace(/\\'/g, "'")
+            .replace(/\\\\/g, '\\');
+    }
+
+    function firstInputCallIndex(code, language) {
+        const patterns = [
+            /scanf\s*\(/g,
+            /cin\s*>>/g,
+            /\.\s*next(?:Int|Double|Float|Long|Short|Byte|Boolean|Line)?\s*\(/g,
+            /input\s*\(/g,
+            /readline\s*\(/g,
+            /Console\.ReadLine\s*\(/g,
+            /ReadLine\s*\(/g
+        ];
+        let first = -1;
+        patterns.forEach(pattern => {
+            let match;
+            while ((match = pattern.exec(code)) !== null) {
+                if (first === -1 || match.index < first) first = match.index;
+            }
+        });
+        return first;
+    }
+
+    function extractPrintedTextBeforeInput(code, language, promptToExclude = '') {
+        const firstInput = firstInputCallIndex(code, language);
+        if (firstInput <= 0) return '';
+        const before = code.slice(0, firstInput);
+        const statements = [];
+        const readLiteralText = (segment, addNewline = false) => {
+            const literalRegex = /["']((?:\\.|[^"'\\])*)["']/g;
+            let match;
+            let text = '';
+            while ((match = literalRegex.exec(segment)) !== null) {
+                text += decodeConsoleLiteral(match[1]);
+            }
+            if (addNewline && text && !text.endsWith('\n')) text += '\n';
+            return text;
+        };
+        const collect = (regex, addNewline = false) => {
+            let match;
+            while ((match = regex.exec(before)) !== null) {
+                statements.push({
+                    index: match.index,
+                    text: readLiteralText(match[1], addNewline)
+                });
+            }
+        };
+
+        [
+            /printf\s*\(([^;]*)\)\s*;/g,
+            /System\.out\.print\s*\(([^;]*)\)\s*;/g,
+            /Console\.Write\s*\(([^;]*)\)\s*;/g,
+            /echo\s+([^;]*);/g
+        ].forEach(regex => collect(regex, false));
+
+        [
+            /System\.out\.println\s*\(([^;]*)\)\s*;/g,
+            /Console\.WriteLine\s*\(([^;]*)\)\s*;/g
+        ].forEach(regex => collect(regex, true));
+
+        let coutMatch;
+        const coutRegex = /cout\s*<<([^;]*);/g;
+        while ((coutMatch = coutRegex.exec(before)) !== null) {
+            statements.push({
+                index: coutMatch.index,
+                text: readLiteralText(coutMatch[1], /\bendl\b/.test(coutMatch[1]))
+            });
+        }
+
+        let output = statements
+            .sort((a, b) => a.index - b.index)
+            .map(item => item.text)
+            .join('');
+        const prompt = cleanInputPrompt(promptToExclude, '');
+        if (prompt) {
+            const escaped = prompt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            output = output.replace(new RegExp(`${escaped}\\s*$`, 'i'), '');
+        }
+        return output.trimEnd();
+    }
+
+    function lastPromptBefore(code, index, language, fallback) {
+        const before = code.slice(Math.max(0, index - 350), index);
+        const promptPatterns = [
+            /printf\s*\(\s*"((?:\\.|[^"\\])*)"/g,
+            /cout\s*<<\s*"((?:\\.|[^"\\])*)"/g,
+            /System\.out\.print(?:ln)?\s*\(\s*"((?:\\.|[^"\\])*)"/g,
+            /Console\.Write(?:Line)?\s*\(\s*"((?:\\.|[^"\\])*)"/g
+        ];
+        let prompt = '';
+        for (const pattern of promptPatterns) {
+            let match;
+            while ((match = pattern.exec(before)) !== null) prompt = match[1];
+        }
+        const lang = String(language || '').toLowerCase();
+        if (!prompt && (lang === 'python' || lang === 'py')) {
+            const inputMatch = code.slice(index, index + 160).match(/input\s*\(\s*["']((?:\\.|[^"'\\])*)["']/);
+            if (inputMatch) prompt = inputMatch[1];
+        }
+        if (!prompt && lang === 'php') {
+            const inputMatch = code.slice(index, index + 160).match(/readline\s*\(\s*["']((?:\\.|[^"'\\])*)["']/);
+            if (inputMatch) prompt = inputMatch[1];
+        }
+        return cleanInputPrompt(prompt, fallback);
+    }
+
+    function buildInputPlan(code, language) {
+        const lang = String(language || '').toLowerCase();
+        const groups = [];
+        if (lang === 'c') {
+            const regex = /scanf\s*\(\s*"((?:\\.|[^"\\])*)"/g;
+            let match;
+            while ((match = regex.exec(code)) !== null) {
+                groups.push({ count: countScanfSpecifiers(match[1]), prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}:`), index: match.index });
+            }
+        } else if (lang === 'cpp') {
+            const regex = /cin\s*((?:>>\s*[^;]+)+);/g;
+            let match;
+            while ((match = regex.exec(code)) !== null) {
+                groups.push({ count: (match[1].match(/>>/g) || []).length, prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}:`), index: match.index });
+            }
+        } else if (lang === 'java') {
+            const regex = /\.\s*next(?:Int|Double|Float|Long|Short|Byte|Boolean|Line)?\s*\(/g;
+            let match;
+            while ((match = regex.exec(code)) !== null) {
+                groups.push({ count: 1, prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}:`), index: match.index });
+            }
+        } else if (lang === 'python' || lang === 'py') {
+            const regex = /input\s*\(/g;
+            let match;
+            while ((match = regex.exec(code)) !== null) {
+                groups.push({ count: 1, prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}:`), index: match.index });
+            }
+        } else if (lang === 'php') {
+            const regex = /readline\s*\(/g;
+            let match;
+            while ((match = regex.exec(code)) !== null) {
+                groups.push({ count: 1, prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}:`), index: match.index });
+            }
+        } else if (['csharp', 'cs', 'vbnet', 'vb'].includes(lang)) {
+            const regex = /(Console\.ReadLine|ReadLine)\s*\(/g;
+            let match;
+            while ((match = regex.exec(code)) !== null) {
+                groups.push({ count: 1, prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}:`), index: match.index });
+            }
+        }
+        const total = groups.reduce((sum, group) => sum + group.count, 0);
+        return { needsInput: total > 0, groups, total, introOutput: extractPrintedTextBeforeInput(code, lang, groups[0]?.prompt || '') };
+    }
+
+    function inputPromptsFromPlan(plan) {
+        const prompts = [];
+        (plan.groups || []).forEach((group, groupIndex) => {
+            const basePrompt = cleanInputPrompt(group.prompt, `Input ${groupIndex + 1}:`);
+            for (let i = 0; i < Math.max(1, group.count || 1); i++) {
+                prompts.push(group.count > 1 ? `${basePrompt} ${i + 1}` : basePrompt);
+            }
+        });
+        return prompts;
+    }
+
+    function renderTerminalPrompt(transcript, prompt) {
+        const outputDiv = document.getElementById('outputContent');
+        if (!outputDiv) return null;
+        outputDiv.innerHTML = `
+            <div class="terminal-session">
+                <pre class="terminal-transcript">${escapeHtml(transcript)}</pre>
+                <div class="terminal-input-line">
+                    <span class="terminal-input-prompt">${escapeHtml(prompt)}</span>
+                    <input id="terminalInputField" class="terminal-input-field" autocomplete="off" spellcheck="false">
+                </div>
+            </div>
+        `;
+        const input = document.getElementById('terminalInputField');
+        if (input) input.focus();
+        return input;
+    }
+
+    function collectProgramInputInConsole(code, language) {
+        const plan = buildInputPlan(code, language);
+        if (!plan.needsInput) return Promise.resolve(document.getElementById('programInput')?.value || '');
+        switchTab('output');
+        return new Promise(resolve => {
+            const prompts = inputPromptsFromPlan(plan);
+            const values = [];
+            let transcript = plan.introOutput ? `${plan.introOutput}\n` : '';
+            let index = 0;
+            const askNext = () => {
+                const prompt = prompts[index] || `Input ${index + 1}:`;
+                const input = renderTerminalPrompt(transcript, prompt);
+                if (!input) return resolve('');
+                input.addEventListener('keydown', event => {
+                    if (event.key !== 'Enter') return;
+                    event.preventDefault();
+                    const value = input.value;
+                    values.push(value);
+                    transcript += `${prompt} ${value}\n`;
+                    index += 1;
+                    if (index >= prompts.length) {
+                        const programInput = values.join('\n') + '\n';
+                        const storedInput = document.getElementById('programInput');
+                        if (storedInput) storedInput.value = programInput;
+                        const outputDiv = document.getElementById('outputContent');
+                        if (outputDiv) outputDiv.innerHTML = `<div class="terminal-session"><pre class="terminal-transcript">${escapeHtml(transcript + 'Running...')}</pre></div>`;
+                        resolve(programInput);
+                    } else {
+                        askNext();
+                    }
+                });
+            };
+            askNext();
+        });
+    }
+
+    function formatConsoleOutput(output) {
+        return String(output || '').replace(/\r\n/g, '\n').trimEnd();
+    }
+
+    function formatConsoleOutputWithInputEcho(output, input, code, language, success = true) {
+        let formatted = formatConsoleOutput(output || '');
+        const values = String(input || '').replace(/\r\n/g, '\n').split('\n').filter(value => value.length > 0);
+        const prompts = inputPromptsFromPlan(buildInputPlan(code, language));
+        prompts.forEach((prompt, index) => {
+            if (!values[index]) return;
+            const escapedPrompt = prompt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const pattern = new RegExp(`${escapedPrompt}\\s*`, 'i');
+            if (pattern.test(formatted)) formatted = formatted.replace(pattern, `${prompt} ${values[index]}\n`);
+        });
+        if (values.length && !prompts.some(prompt => formatted.toLowerCase().includes(prompt.toLowerCase()))) {
+            formatted = `${prompts.map((prompt, index) => `${prompt} ${values[index] || ''}`).join('\n')}\n${formatted}`.trimEnd();
+        }
+        return formatted || (success ? 'Program finished successfully with no output.' : '');
+    }
+
+    async function runCodePreflight(code, language, files) {
+        const response = await fetch('api/run_code.php', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code, language, files, check_only: true })
+        });
+        return await response.json();
     }
 
     async function gradeWithAI() {
@@ -1472,20 +1966,20 @@ foreach ($questions as $q) {
             if (progressFill) progressFill.style.width = '100%';
 
             if (data.success) {
+                const cleanFeedback = '';
                 currentGradedScore = data.score;
                 statusMsg.innerHTML = 'Grading complete!';
                 resultPreview.style.display = 'block';
                 resultPreview.innerHTML = `
                     <div style="text-align:center;">
                         <div style="font-size:32px; font-weight:bold; color:#22c55e;">${data.score}/${maxMarks}</div>
-                        <div style="margin-top:10px;"><strong>Auto Grading Feedback:</strong></div>
-                        <div style="background:#0f0f1a; padding:12px; border-radius:6px; margin-top:8px; font-size:11px;">${escapeHtml(data.feedback)}</div>
+                        <div style="margin-top:10px;color:#cbd5e1;">Auto grade completed.</div>
                     </div>
                 `;
 
                 document.getElementById('obtainedMarks').innerText = data.score;
-                document.getElementById('aiFeedbackBox').innerHTML =
-                    `<strong>Auto Grading Feedback:</strong> ${escapeHtml(data.feedback.substring(0, 200))}...`;
+                const feedbackBox = document.getElementById('aiFeedbackBox');
+                if (feedbackBox) feedbackBox.innerHTML = '';
 
                 if (data.results) {
                     data.results.forEach((r, idx) => {
@@ -1498,10 +1992,10 @@ foreach ($questions as $q) {
                 }
 
                 questionAutoGraded = true;
-                savedAiFeedback = data.feedback || '';
+                savedAiFeedback = '';
                 savedScoreSource = 'ai';
                 updateAutoGradeStatus();
-                setQuestionScore(currentQuestionIndex, data.score, data.feedback, 'ai');
+                setQuestionScore(currentQuestionIndex, data.score, '', 'ai');
             } else {
                 statusMsg.innerHTML = 'Grading failed';
                 resultPreview.style.display = 'block';
@@ -1530,6 +2024,15 @@ foreach ($questions as $q) {
         }
 
         currentScores[questionIndex] = safeScore;
+        if (!questionFeedbacks[questionIndex]) questionFeedbacks[questionIndex] = {};
+        questionFeedbacks[questionIndex].score_source = source;
+        if (source === 'manual') {
+            questionFeedbacks[questionIndex].manual_score = safeScore;
+            questionFeedbacks[questionIndex].manual_feedback = feedback || '';
+        } else {
+            questionFeedbacks[questionIndex].ai_score = safeScore;
+            questionFeedbacks[questionIndex].ai_feedback = feedback || '';
+        }
         document.getElementById('obtainedMarks').innerText = safeScore;
         const manualInput = document.getElementById('manualScoreInput');
         if (manualInput) manualInput.value = safeScore;
@@ -1550,8 +2053,8 @@ foreach ($questions as $q) {
             'Manual score entered by lecturer because auto grading needed review.';
 
         if (setQuestionScore(currentQuestionIndex, score, feedback, 'manual')) {
-            document.getElementById('aiFeedbackBox').innerHTML =
-                `<strong>Manual Feedback:</strong> ${escapeHtml(feedback.substring(0, 200))}${feedback.length > 200 ? '...' : ''}`;
+            const feedbackBox = document.getElementById('aiFeedbackBox');
+            if (feedbackBox) feedbackBox.innerHTML = '';
             showModal('Manual Score Saved',
                 `Question ${currentQuestionIndex + 1} saved as ${currentScores[currentQuestionIndex]}/${currentQuestions[currentQuestionIndex]?.marks || 20}.`,
                 'OK');
@@ -1618,6 +2121,68 @@ foreach ($questions as $q) {
         };
     }
 
+    function questionSummaryTitle(question, index) {
+        const type = question?.type || 'coding';
+        const title = question?.title || question?.text || question?.prompt || `Question ${index + 1}`;
+        const shortTitle = String(title).replace(/\s+/g, ' ').trim().slice(0, 80);
+        return `${shortTitle || `Question ${index + 1}`} (${type})`;
+    }
+
+    function gradingRemark(percentage) {
+        if (percentage >= 80) return 'Excellent performance';
+        if (percentage >= 70) return 'Good performance';
+        if (percentage >= 60) return 'Satisfactory performance';
+        if (percentage >= 50) return 'Pass';
+        return 'Needs improvement';
+    }
+
+    function buildFinalMarkingSummaryHtml(gradeTotal) {
+        const included = new Set((gradeTotal.includedRows || []).map(row => row.index));
+        const totalPossible = gradeTotal.totalPossible || 0;
+        const percentage = totalPossible > 0 ? (gradeTotal.totalScore / totalPossible) * 100 : 0;
+        const rows = currentQuestions.map((question, index) => {
+            const maxMarks = questionMaxMarks(question);
+            const awarded = parseFloat(currentScores[index]) || 0;
+            const feedback = questionFeedbacks[index] || {};
+            const autoScore = feedback.ai_score !== null && feedback.ai_score !== undefined ? feedback.ai_score : '';
+            const manualScore = feedback.manual_score !== null && feedback.manual_score !== undefined ? feedback.manual_score : '';
+            const feedbackText = cleanLecturerFeedback(feedback.score_source === 'manual' && feedback.manual_feedback ? feedback.manual_feedback : (feedback.ai_feedback || feedback.manual_feedback || ''));
+            return `
+                <tr>
+                    <td class="num-col">Question ${index + 1}${included.has(index) ? '' : ' (not counted)'}</td>
+                    <td class="score-col">${maxMarks}</td>
+                    <td class="score-col">${awarded}</td>
+                    <td class="score-col">${autoScore === '' ? '-' : autoScore}</td>
+                    <td class="score-col">${manualScore === '' ? '-' : manualScore}</td>
+                    <td class="feedback-col">${escapeHtml(feedbackText || 'No feedback saved yet.')}</td>
+                </tr>`;
+        }).join('');
+        return `
+            <div class="marking-summary-wrap">
+                <table class="marking-summary-table">
+                    <thead>
+                        <tr>
+                            <th class="num-col">Question</th>
+                            <th class="score-col">Total</th>
+                            <th class="score-col">Awarded</th>
+                            <th class="score-col">Auto</th>
+                            <th class="score-col">Manual</th>
+                            <th class="feedback-col">Feedback</th>
+                        </tr>
+                    </thead>
+                    <tbody>${rows}</tbody>
+                </table>
+                <div class="marking-summary-total">
+                    <div><strong>Total:</strong> ${gradeTotal.totalScore}/${totalPossible}</div>
+                    <div><strong>Percentage:</strong> ${percentage.toFixed(1)}%</div>
+                    <div><strong>Remark:</strong> ${gradingRemark(percentage)}</div>
+                    <div><strong>Rule Applied:</strong> ${questionsToAnswer > 0 ? `Best ${gradeTotal.limit} question(s)` : 'Answer all questions'}${gradeTotal.includedQuestionNumbers.length ? ` | Counted: Q${gradeTotal.includedQuestionNumbers.join(', Q')}` : ''}</div>
+                    <div><strong>Score Sheet Exam Component:</strong> ${((percentage * 60) / 100).toFixed(1)}/60</div>
+                </div>
+            </div>
+        `;
+    }
+
     async function saveAllGrades() {
         if (!questionAutoGraded) {
             showModal('Auto Grade Required',
@@ -1643,11 +2208,8 @@ foreach ($questions as $q) {
         const examScore60 = (percentage * 60) / 100;
 
         showModal('Save Grades', `
-            <p>Are you sure you want to save all grades?</p>
-            <p><strong>Total Score: ${totalScore}/${totalPossible} marks (${percentage.toFixed(1)}%)</strong></p>
-            <p><strong>Rule Applied:</strong> ${questionsToAnswer > 0 ? `Best ${gradeTotal.limit} question(s)` : 'Answer all questions'}${gradeTotal.includedQuestionNumbers.length ? ` | Counted: Q${gradeTotal.includedQuestionNumbers.join(', Q')}` : ''}</p>
-            <p><strong>Score Sheet Exam Component: ${examScore60.toFixed(1)}/60</strong></p>
-            <p>This updates the lecturer score sheet from the database.</p>
+            <p>Confirm the final marking summary below. This updates the lecturer score sheet from the database.</p>
+            ${buildFinalMarkingSummaryHtml(gradeTotal)}
         `, 'Confirm Save', async () => {
             try {
                 const response = await fetch(window.location.href, {
@@ -1680,17 +2242,7 @@ foreach ($questions as $q) {
 
     function calculateTotalMarks() {
         const gradeTotal = calculateRuleBasedGradeTotal();
-        const total = gradeTotal.totalScore;
-        const totalPossible = gradeTotal.totalPossible || 1;
-        showModal('Total Marks', `
-            <div style="text-align:center;">
-                <div style="font-size:48px; color:#22c55e;">${total}</div>
-                <div>Total counted marks out of ${totalPossible}</div>
-                <div style="margin-top:10px;">Counted questions: Q${gradeTotal.includedQuestionNumbers.join(', Q') || '-'}</div>
-                <div style="margin-top:10px;">Percentage: ${((total / totalPossible) * 100).toFixed(1)}%</div>
-                <div style="margin-top:10px;">Score Sheet Exam Component: ${((((total / totalPossible) * 100) * 60) / 100).toFixed(1)}/60</div>
-            </div>
-        `, 'Close');
+        showModal('Final Marking Summary', buildFinalMarkingSummaryHtml(gradeTotal), 'Close');
     }
 
     function getCurrentTestCases() {
@@ -1784,6 +2336,7 @@ foreach ($questions as $q) {
 
     function showModal(title, body, confirmText, onConfirm = null) {
         const overlay = document.getElementById('modalOverlay');
+        const dialog = overlay.querySelector('.modal-dialog');
         const titleEl = document.getElementById('modalTitle');
         const bodyEl = document.getElementById('modalBody');
         const confirmBtn = document.getElementById('modalConfirmBtn');
@@ -1791,6 +2344,9 @@ foreach ($questions as $q) {
         titleEl.innerHTML = title;
         bodyEl.innerHTML = body;
         confirmBtn.innerHTML = confirmText;
+        if (dialog) {
+            dialog.classList.toggle('modal-wide', /summary|save grades/i.test(String(title)));
+        }
 
         modalCallback = onConfirm;
 
@@ -1819,6 +2375,36 @@ foreach ($questions as $q) {
     function escapeHtml(str) {
         if (!str) return '';
         return str.replace(/[&<>]/g, m => m === '&' ? '&amp;' : m === '<' ? '&lt;' : '&gt;');
+    }
+
+    function setOptionalText(id, value) {
+        const element = document.getElementById(id);
+        if (element) element.innerText = value;
+    }
+
+    function setOptionalHtml(id, value) {
+        const element = document.getElementById(id);
+        if (element) element.innerHTML = value;
+    }
+
+    function optionalElement(id) {
+        const element = document.getElementById(id);
+        return element || {
+            set innerText(value) {},
+            set innerHTML(value) {}
+        };
+    }
+
+    function cleanLecturerFeedback(feedback) {
+        let text = String(feedback || '')
+            .replace(/AUTO GRADING REPORT:?/ig, '')
+            .replace(/QODA ran a safe inferred input.*?checks\./ig, '')
+            .replace(/CPU Time:.*$/img, '')
+            .replace(/Memory:.*$/img, '')
+            .replace(/Compilation:.*$/img, '')
+            .trim();
+        if (!text) return 'Code was checked. Review the run output, test-case results, and marks awarded.';
+        return text.length > 900 ? text.slice(0, 900) + '...' : text;
     }
     </script>
 </body>

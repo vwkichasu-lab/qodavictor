@@ -4,6 +4,24 @@ session_start();
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/../backend-php/config/database.php';
 require_once __DIR__ . '/../backend-php/lib/code_grader.php';
+require_once __DIR__ . '/../backend-php/lib/grade_storage.php';
+require_once __DIR__ . '/../backend-php/lib/socket_auth.php';
+
+$examAjaxAction = (string)($_POST['action'] ?? '');
+$skipExamSchemaUpgrade = ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && in_array($examAjaxAction, [
+    'screen_share_status',
+    'screen_live_frame',
+    'screen_heartbeat',
+    'screen_snapshot',
+    'poll_proctor_commands',
+    'webrtc_student_publish_offer',
+    'webrtc_poll_http_answer',
+    'webrtc_poll_offers',
+    'webrtc_submit_answer',
+    'webrtc_close_stream',
+    'auto_save',
+    'report_violation',
+], true);
 
 function ensureExamInterfaceColumn(PDO $pdo, string $table, string $column, string $definition): void
 {
@@ -44,6 +62,9 @@ function qodaProctorSignature($examId, $studentRowId, $studentIdentifier): strin
 function qodaPruneLiveScreenCaptures(PDO $pdo, bool $force = false): void
 {
     static $lastRun = 0;
+    if (!$force && mt_rand(1, 20) !== 1) {
+        return;
+    }
     if (!$force && time() - $lastRun < 20) {
         return;
     }
@@ -91,6 +112,115 @@ function qodaRunProctorStorageSave(PDO $pdo, callable $operation, string $label)
     }
 }
 
+function qodaExamClientIp(): string
+{
+    foreach (['HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 'REMOTE_ADDR'] as $key) {
+        $value = $_SERVER[$key] ?? '';
+        if ($value) {
+            return trim(explode(',', $value)[0]);
+        }
+    }
+    return '';
+}
+
+function qodaEnsureExamStudentSessionTables(PDO $pdo): void
+{
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS student_active_sessions (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            student_id INT NOT NULL,
+            student_identifier VARCHAR(100) NULL,
+            session_id VARCHAR(191) NOT NULL,
+            device_id VARCHAR(191) NOT NULL,
+            browser_fingerprint CHAR(64) NOT NULL,
+            operating_system VARCHAR(80) NULL,
+            ip_address VARCHAR(64) NULL,
+            user_agent TEXT NULL,
+            login_at DATETIME NOT NULL,
+            last_seen DATETIME NOT NULL,
+            expires_at DATETIME NULL,
+            active TINYINT(1) NOT NULL DEFAULT 1,
+            released_at DATETIME NULL,
+            release_reason VARCHAR(80) NULL,
+            locked_exam_id INT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_student_active (student_id, active, last_seen),
+            INDEX idx_session_id (session_id),
+            INDEX idx_device_id (device_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS student_session_events (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            student_id INT NULL,
+            student_identifier VARCHAR(100) NULL,
+            event_type VARCHAR(80) NOT NULL,
+            device_id VARCHAR(191) NULL,
+            browser_fingerprint CHAR(64) NULL,
+            operating_system VARCHAR(80) NULL,
+            ip_address VARCHAR(64) NULL,
+            user_agent TEXT NULL,
+            details TEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_student_events (student_id, created_at),
+            INDEX idx_event_type (event_type, created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+}
+
+function qodaVerifyStudentActiveSession(PDO $pdo, int $studentDbId, string $studentIdentifier, ?int $examId = null): ?string
+{
+    if ($studentDbId <= 0) {
+        return 'Student profile could not be verified.';
+    }
+    qodaEnsureExamStudentSessionTables($pdo);
+    $sessionId = session_id();
+    $deviceId = $_SESSION['qoda_device_id'] ?? ($_COOKIE['qoda_device_id'] ?? '');
+    $fingerprint = $_SESSION['qoda_browser_fingerprint'] ?? '';
+    $stmt = $pdo->prepare("
+        SELECT *
+        FROM student_active_sessions
+        WHERE student_id = ? AND active = 1
+        ORDER BY last_seen DESC
+        LIMIT 1
+    ");
+    $stmt->execute([$studentDbId]);
+    $active = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$active) {
+        return 'Your active login session could not be verified. Please log in again.';
+    }
+    if (($active['session_id'] ?? '') !== $sessionId || ($deviceId && ($active['device_id'] ?? '') !== $deviceId)) {
+        try {
+            $log = $pdo->prepare("
+                INSERT INTO student_session_events
+                    (student_id, student_identifier, event_type, device_id, browser_fingerprint, ip_address, user_agent, details)
+                VALUES (?, ?, 'blocked_exam_session_mismatch', ?, ?, ?, ?, ?)
+            ");
+            $log->execute([
+                $studentDbId,
+                $studentIdentifier,
+                $deviceId,
+                $fingerprint,
+                qodaExamClientIp(),
+                $_SERVER['HTTP_USER_AGENT'] ?? '',
+                'Exam access attempted from a session or device different from the active login.'
+            ]);
+        } catch (Throwable $logError) {
+            error_log('Exam session mismatch log failed: ' . $logError->getMessage());
+        }
+        return 'This exam is locked to your active login device. Please log out from the other device before attempting to continue.';
+    }
+    $update = $pdo->prepare("
+        UPDATE student_active_sessions
+        SET last_seen = NOW(), expires_at = DATE_ADD(NOW(), INTERVAL 12 HOUR), locked_exam_id = COALESCE(?, locked_exam_id)
+        WHERE id = ?
+    ");
+    $update->execute([$examId, (int)$active['id']]);
+    return null;
+}
+
+if (!$skipExamSchemaUpgrade) {
 try {
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS screen_captures (
@@ -105,6 +235,24 @@ try {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_exam_student (exam_id, student_id),
             INDEX idx_captured_at (captured_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS proctor_webrtc_streams (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            stream_key VARCHAR(191) NOT NULL UNIQUE,
+            exam_id INT NOT NULL,
+            student_id INT NOT NULL,
+            lecturer_id INT NOT NULL,
+            offer LONGTEXT NULL,
+            answer LONGTEXT NULL,
+            status VARCHAR(30) NOT NULL DEFAULT 'offer',
+            created_at DATETIME NOT NULL,
+            updated_at DATETIME NOT NULL,
+            expires_at DATETIME NOT NULL,
+            INDEX idx_exam_student_status (exam_id, student_id, status),
+            INDEX idx_lecturer (lecturer_id, updated_at),
+            INDEX idx_expires (expires_at)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ");
     ensureExamInterfaceColumn($pdo, 'screen_captures', 'image_data', 'LONGTEXT NULL');
@@ -127,8 +275,20 @@ try {
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'execution_results', 'JSON NULL');
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'ai_feedback', 'MEDIUMTEXT NULL');
     ensureExamInterfaceColumn($pdo, 'exam_submissions', 'auto_graded_at', 'DATETIME NULL');
-    $pdo->exec("ALTER TABLE exam_submissions MODIFY answers LONGTEXT NULL");
-    $pdo->exec("ALTER TABLE exam_submissions MODIFY ai_feedback MEDIUMTEXT NULL");
+    ensureExamInterfaceColumn($pdo, 'exams', 'grace_period_minutes', 'INT NOT NULL DEFAULT 0');
+    ensureExamInterfaceColumn($pdo, 'exams', 'cutoff_datetime', 'DATETIME NULL');
+    ensureExamInterfaceColumn($pdo, 'exams', 'exam_control_status', "VARCHAR(30) NOT NULL DEFAULT 'active'");
+    ensureExamInterfaceColumn($pdo, 'exams', 'pause_started_at', 'DATETIME NULL');
+    ensureExamInterfaceColumn($pdo, 'exams', 'paused_seconds_total', 'INT NOT NULL DEFAULT 0');
+    if (getenv('QODA_ALLOW_HEAVY_ALTERS') === '1') {
+        $pdo->exec("ALTER TABLE exam_submissions MODIFY answers LONGTEXT NULL");
+        $pdo->exec("ALTER TABLE exam_submissions MODIFY ai_feedback MEDIUMTEXT NULL");
+        try {
+            $pdo->exec("ALTER TABLE exam_submissions ROW_FORMAT=DYNAMIC");
+        } catch (Throwable $rowFormatError) {
+            error_log('exam_submissions row format upgrade skipped: ' . $rowFormatError->getMessage());
+        }
+    }
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS proctor_commands (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -145,8 +305,22 @@ try {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ");
     $pdo->exec("ALTER TABLE proctor_commands MODIFY command_type ENUM('warning', 'lock', 'unlock') NOT NULL");
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS student_exam_time_adjustments (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            exam_id INT NOT NULL,
+            student_id INT NOT NULL,
+            delta_minutes INT NOT NULL DEFAULT 0,
+            reason VARCHAR(255) NULL,
+            adjusted_by INT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_exam_student (exam_id, student_id),
+            INDEX idx_created_at (created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
 } catch (Exception $e) {
     error_log('Exam interface schema upgrade failed: ' . $e->getMessage());
+}
 }
 
 function qodaAnswerHasCode(array $answer): bool
@@ -301,6 +475,50 @@ function qodaAutoGradeExamAnswers(array $examRow, string $answersJson): array
     ];
 }
 
+function qodaPersistAutoQuestionScores(PDO $pdo, int $submissionId, ?string $executionResultsJson): void
+{
+    if ($submissionId <= 0 || !$executionResultsJson) {
+        return;
+    }
+
+    $rows = json_decode($executionResultsJson, true);
+    if (!is_array($rows)) {
+        return;
+    }
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS submission_question_scores (
+            id INT PRIMARY KEY AUTO_INCREMENT,
+            submission_id INT NOT NULL,
+            question_id VARCHAR(50) NOT NULL,
+            score DECIMAL(10,2) DEFAULT 0,
+            feedback TEXT,
+            UNIQUE KEY uk_submission_question (submission_id, question_id),
+            INDEX idx_submission (submission_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+
+    $stmt = $pdo->prepare("
+        INSERT INTO submission_question_scores (submission_id, question_id, score, feedback)
+        VALUES (?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE score = VALUES(score), feedback = VALUES(feedback)
+    ");
+
+    foreach ($rows as $index => $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $questionId = substr((string)($row['question_id'] ?? ('Q' . ((int)$index + 1))), 0, 50);
+        $score = round((float)($row['score'] ?? 0), 2);
+        $result = is_array($row['result'] ?? null) ? $row['result'] : [];
+        $feedback = trim((string)($result['feedback'] ?? 'Auto graded during student submission.'));
+        if ($feedback === '') {
+            $feedback = 'Auto graded during student submission.';
+        }
+        $stmt->execute([$submissionId, $questionId, $score, $feedback]);
+    }
+}
+
 // ---- AJAX handlers ----
 if (isset($_POST['action'])) {
     header('Content-Type: application/json');
@@ -333,6 +551,212 @@ if (isset($_POST['action'])) {
     $studentRowId = $sRow ? (int)$sRow['id'] : ($postedSignatureValid ? $postedStudentRowId : $ajaxStudentId);
     $studentNameForSubmission = $sRow['full_name'] ?? ($_POST['proctor_student_name'] ?? $_SESSION['user_name'] ?? null);
     $studentIdentifierForSubmission = $sRow['student_id'] ?? ($postedSignatureValid ? $postedStudentIdentifier : ($_SESSION['user_id_value'] ?? null));
+
+    if ($_POST['action'] === 'webrtc_student_publish_offer') {
+        try {
+            $streamKey = trim((string)($_POST['stream_key'] ?? ''));
+            $offer = trim((string)($_POST['offer'] ?? ''));
+            if ($streamKey === '' || $offer === '') {
+                echo json_encode(['success' => false, 'error' => 'Missing live stream offer data']);
+                exit;
+            }
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS proctor_webrtc_streams (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    stream_key VARCHAR(191) NOT NULL UNIQUE,
+                    exam_id INT NOT NULL,
+                    student_id INT NOT NULL,
+                    lecturer_id INT NOT NULL,
+                    offer LONGTEXT NULL,
+                    answer LONGTEXT NULL,
+                    status VARCHAR(30) NOT NULL DEFAULT 'offer',
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    expires_at DATETIME NOT NULL,
+                    INDEX idx_exam_student_status (exam_id, student_id, status),
+                    INDEX idx_lecturer (lecturer_id, updated_at),
+                    INDEX idx_expires (expires_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            ");
+            $stmt = $pdo->prepare("
+                INSERT INTO proctor_webrtc_streams
+                    (stream_key, exam_id, student_id, lecturer_id, offer, answer, status, created_at, updated_at, expires_at)
+                VALUES (?, ?, ?, 0, ?, NULL, 'student_offer', NOW(), NOW(), DATE_ADD(NOW(), INTERVAL 5 MINUTE))
+                ON DUPLICATE KEY UPDATE
+                    offer = VALUES(offer),
+                    answer = NULL,
+                    status = 'student_offer',
+                    updated_at = NOW(),
+                    expires_at = DATE_ADD(NOW(), INTERVAL 5 MINUTE)
+            ");
+            $stmt->execute([$streamKey, $ajaxExamId, $studentRowId, $offer]);
+            echo json_encode(['success' => true, 'stream_key' => $streamKey]);
+        } catch (Throwable $e) {
+            echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+        }
+        exit;
+    }
+
+    if ($_POST['action'] === 'webrtc_poll_http_answer') {
+        try {
+            $streamKey = trim((string)($_POST['stream_key'] ?? ''));
+            if ($streamKey === '') {
+                echo json_encode(['success' => false, 'error' => 'Missing stream key']);
+                exit;
+            }
+            $stmt = $pdo->prepare("
+                SELECT stream_key, answer, updated_at
+                FROM proctor_webrtc_streams
+                WHERE stream_key = ?
+                  AND exam_id = ?
+                  AND student_id = ?
+                  AND answer IS NOT NULL
+                  AND expires_at > NOW()
+                ORDER BY updated_at DESC
+                LIMIT 1
+            ");
+            $stmt->execute([$streamKey, $ajaxExamId, $studentRowId]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            echo json_encode(['success' => true, 'data' => $row ?: null]);
+        } catch (Throwable $e) {
+            echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+        }
+        exit;
+    }
+
+    if ($_POST['action'] === 'webrtc_poll_offers') {
+        try {
+            $stmt = $pdo->prepare("
+                SELECT stream_key, offer, lecturer_id, updated_at
+                FROM proctor_webrtc_streams
+                WHERE exam_id = ?
+                  AND student_id = ?
+                  AND status = 'offer'
+                  AND offer IS NOT NULL
+                  AND expires_at > NOW()
+                ORDER BY updated_at DESC
+                LIMIT 4
+            ");
+            $stmt->execute([$ajaxExamId, $studentRowId]);
+            echo json_encode(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+        } catch (Exception $e) {
+            echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+        }
+        exit;
+    }
+
+    if ($_POST['action'] === 'webrtc_submit_answer') {
+        try {
+            $streamKey = trim($_POST['stream_key'] ?? '');
+            $answer = trim($_POST['answer'] ?? '');
+            if ($streamKey === '' || $answer === '') {
+                echo json_encode(['success' => false, 'error' => 'Missing WebRTC answer data']);
+                exit;
+            }
+            $stmt = $pdo->prepare("
+                UPDATE proctor_webrtc_streams
+                SET answer = ?, status = 'answered', updated_at = NOW(), expires_at = DATE_ADD(NOW(), INTERVAL 5 MINUTE)
+                WHERE stream_key = ? AND exam_id = ? AND student_id = ? AND expires_at > NOW()
+            ");
+            $stmt->execute([$answer, $streamKey, $ajaxExamId, $studentRowId]);
+            echo json_encode(['success' => $stmt->rowCount() > 0]);
+        } catch (Exception $e) {
+            echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+        }
+        exit;
+    }
+
+    if ($_POST['action'] === 'webrtc_close_stream') {
+        try {
+            $streamKey = trim($_POST['stream_key'] ?? '');
+            if ($streamKey !== '') {
+                $stmt = $pdo->prepare("UPDATE proctor_webrtc_streams SET status = 'closed', updated_at = NOW(), expires_at = NOW() WHERE stream_key = ? AND exam_id = ? AND student_id = ?");
+                $stmt->execute([$streamKey, $ajaxExamId, $studentRowId]);
+            }
+            echo json_encode(['success' => true]);
+        } catch (Exception $e) {
+            echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+        }
+        exit;
+    }
+
+    if ($_POST['action'] === 'screen_share_status') {
+        $active = (int)($_POST['active'] ?? 1) === 1 ? 1 : 0;
+        $shareSessionId = trim((string)($_POST['session_id'] ?? session_id()));
+        if ($shareSessionId === '') {
+            $shareSessionId = session_id();
+        }
+
+        try {
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS screen_share_sessions (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    student_id INT NOT NULL,
+                    exam_id INT NOT NULL,
+                    session_id VARCHAR(191) NOT NULL,
+                    is_sharing TINYINT(1) NOT NULL DEFAULT 0,
+                    started_at DATETIME NULL,
+                    stopped_at DATETIME NULL,
+                    last_updated DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uniq_screen_share_session (student_id, exam_id, session_id),
+                    INDEX idx_exam_sharing (exam_id, is_sharing, last_updated),
+                    INDEX idx_student_exam (student_id, exam_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            ");
+            $stmt = $pdo->prepare("
+                INSERT INTO screen_share_sessions
+                    (student_id, exam_id, session_id, is_sharing, started_at, stopped_at, last_updated)
+                VALUES (?, ?, ?, ?, IF(? = 1, NOW(), NULL), IF(? = 1, NULL, NOW()), NOW())
+                ON DUPLICATE KEY UPDATE
+                    is_sharing = VALUES(is_sharing),
+                    started_at = IF(VALUES(is_sharing) = 1, COALESCE(started_at, NOW()), started_at),
+                    stopped_at = IF(VALUES(is_sharing) = 1, NULL, NOW()),
+                    last_updated = NOW()
+            ");
+            $stmt->execute([$studentRowId, $ajaxExamId, $shareSessionId, $active, $active, $active]);
+            echo json_encode(['success' => true, 'active' => $active, 'session_id' => $shareSessionId, 'updated_at' => date('Y-m-d H:i:s')]);
+        } catch (Throwable $shareStatusError) {
+            echo json_encode(['success' => false, 'error' => 'Screen sharing status could not be saved: ' . $shareStatusError->getMessage()]);
+        }
+        exit;
+    }
+
+    if ($_POST['action'] === 'screen_live_frame') {
+        try {
+            $frame = (string)($_POST['frame'] ?? '');
+            if (strpos($frame, 'data:image') === 0) {
+                $frame = preg_replace('/^data:image\/[a-zA-Z0-9.+-]+;base64,/', '', $frame);
+            }
+            if ($frame === '' || strlen($frame) > 900000) {
+                echo json_encode(['success' => false, 'error' => 'Invalid live frame']);
+                exit;
+            }
+            $bytes = base64_decode($frame, true);
+            if ($bytes === false || strlen($bytes) < 1024) {
+                echo json_encode(['success' => false, 'error' => 'Live frame decode failed']);
+                exit;
+            }
+            $dir = dirname(__DIR__) . '/runtime/live_frames';
+            if (!is_dir($dir)) {
+                mkdir($dir, 0775, true);
+            }
+            $safeKey = preg_replace('/[^A-Za-z0-9_-]/', '_', $ajaxExamId . '_' . $studentRowId);
+            $path = $dir . '/' . $safeKey . '.jpg';
+            $tmpPath = $path . '.tmp';
+            file_put_contents($tmpPath, $bytes, LOCK_EX);
+            rename($tmpPath, $path);
+            file_put_contents($dir . '/' . $safeKey . '.json', json_encode([
+                'exam_id' => $ajaxExamId,
+                'student_id' => $studentRowId,
+                'updated_at' => date('Y-m-d H:i:s'),
+                'session_id' => (string)($_POST['session_id'] ?? session_id()),
+            ]), LOCK_EX);
+            echo json_encode(['success' => true, 'updated_at' => date('Y-m-d H:i:s')]);
+        } catch (Throwable $liveFrameError) {
+            echo json_encode(['success' => false, 'error' => $liveFrameError->getMessage()]);
+        }
+        exit;
+    }
 
     if ($_POST['action'] === 'screen_heartbeat') {
         $active = (int)($_POST['active'] ?? 1) === 1 ? 1 : 0;
@@ -473,7 +897,18 @@ if (isset($_POST['action'])) {
             $submittedStatus = !empty($_POST['auto_submit']) ? 'timed_out' : 'submitted';
             $submissionFolder = preg_replace('/[^A-Za-z0-9_\-]/', '_', ($studentIdentifierForSubmission ?: 'student') . '_' . ($_POST['course_code'] ?? 'course'));
 
-            $examStmt = $pdo->prepare("SELECT total_marks, questions, questions_to_answer, marking_scheme FROM exams WHERE id = ? LIMIT 1");
+            $cutoffStmt = $pdo->prepare("SELECT * FROM exams WHERE id = ? LIMIT 1");
+            $cutoffStmt->execute([$ajaxExamId]);
+            $cutoffExam = $cutoffStmt->fetch(PDO::FETCH_ASSOC) ?: [];
+            $cutoffTs = !empty($cutoffExam['cutoff_datetime'])
+                ? strtotime($cutoffExam['cutoff_datetime'])
+                : (!empty($cutoffExam['end_datetime']) ? strtotime($cutoffExam['end_datetime']) : null);
+            if ($cutoffTs && time() > $cutoffTs) {
+                echo json_encode(['success' => false, 'error' => 'The submission cut-off time has passed. Please contact your lecturer.']);
+                exit;
+            }
+
+            $examStmt = $pdo->prepare("SELECT id, total_marks, questions, questions_to_answer, marking_scheme, exam_type FROM exams WHERE id = ? LIMIT 1");
             $examStmt->execute([$ajaxExamId]);
             $examRow = $examStmt->fetch(PDO::FETCH_ASSOC);
             $totalMarks = $examRow ? floatval($examRow['total_marks'] ?? 0) : 0;
@@ -513,7 +948,7 @@ if (isset($_POST['action'])) {
             $existing = $check->fetch(PDO::FETCH_ASSOC);
 
             $saveSubmission = function ($compact = false) use ($pdo, $existing, $answersToStore, $answersJsonToStore, $autoTotalScore, $totalMarks, $autoPercentage, $executionResults, $aiFeedback, $studentNameForSubmission, $studentIdentifierForSubmission, $submittedStatus, $submissionFolder, $ajaxExamId, $studentRowId) {
-                $storedExecutionResults = $compact ? null : $executionResults;
+                $storedExecutionResults = null;
                 $storedFeedback = $compact ? 'Submission saved. Auto grading details were reduced because storage rejected the full grading payload.' : $aiFeedback;
 
                 if ($existing) {
@@ -589,12 +1024,50 @@ if (isset($_POST['action'])) {
                 $submissionId = $saveSubmission(true);
             }
 
+            try {
+                qodaPersistAutoQuestionScores($pdo, (int)$submissionId, is_string($executionResults) ? $executionResults : null);
+            } catch (Throwable $scorePersistError) {
+                error_log('Auto question score persistence failed: ' . $scorePersistError->getMessage());
+            }
+
+            $finalGradePayload = null;
+            if ($examRow && $submissionId) {
+                try {
+                    $examType = strtolower(trim((string)($examRow['exam_type'] ?? '')));
+                    $isEndSemester = preg_match('/end\s*of\s*semester|end[-_\s]*semester|semester\s*exam|final/i', $examType) === 1;
+                    $autoExamScore = $isEndSemester ? round(($autoPercentage * 60) / 100, 2) : 0;
+                    $autoClassScore = $isEndSemester ? 0 : round(($autoPercentage * 40) / 100, 2);
+                    $autoFinalTotal = min(100, max(0, $autoExamScore + $autoClassScore));
+                    $gradeStatus = $isEndSemester ? 'AUTO_GRADED' : 'GRADED';
+
+                    $finalGradePayload = qodaPersistFinalGrade($pdo, [
+                        'submission_id' => $submissionId,
+                        'raw_question_score' => $autoTotalScore,
+                        'percentage' => $autoPercentage,
+                        'class_score' => $autoClassScore,
+                        'exam_score' => $autoExamScore,
+                        'total_score' => $autoFinalTotal,
+                        'status' => $gradeStatus,
+                        'score_source' => 'auto',
+                        'graded_by' => null
+                    ]);
+
+                    if (!$isEndSemester) {
+                        $publishStmt = $pdo->prepare("UPDATE exams SET results_published = 1, results_published_at = COALESCE(results_published_at, NOW()) WHERE id = ?");
+                        $publishStmt->execute([$ajaxExamId]);
+                    }
+                } catch (Throwable $finalGradeError) {
+                    error_log('Immediate final grade persistence failed: ' . $finalGradeError->getMessage());
+                }
+            }
+
             echo json_encode([
                 'success' => true,
                 'submission_id' => $submissionId,
                 'auto_score' => $autoTotalScore,
                 'percentage' => $autoPercentage,
                 'exam_score_60' => round(($autoPercentage * 60) / 100, 2),
+                'final_grade' => $finalGradePayload,
             ]);
         } catch (Throwable $submitError) {
             error_log('Submit exam failed: ' . $submitError->getMessage());
@@ -766,7 +1239,57 @@ if (isset($_POST['action'])) {
             $upd = $pdo->prepare("UPDATE proctor_commands SET handled = 1, handled_at = NOW() WHERE id IN ($placeholders)");
             $upd->execute($ids);
         }
-        echo json_encode(['success' => true, 'commands' => $commands]);
+        $timeStmt = $pdo->prepare("SELECT * FROM exams WHERE id = ? LIMIT 1");
+        $timeStmt->execute([$ajaxExamId]);
+        $timeExam = $timeStmt->fetch(PDO::FETCH_ASSOC) ?: [];
+        $durationMinutes = max(1, (int)($timeExam['duration_minutes'] ?? 180));
+        $startTs = !empty($timeExam['start_datetime']) ? strtotime($timeExam['start_datetime']) : time();
+        $endTs = !empty($timeExam['end_datetime']) ? strtotime($timeExam['end_datetime']) : ($startTs + ($durationMinutes * 60));
+        $extraMinutes = 0;
+        try {
+            $pdo->exec("
+                CREATE TABLE IF NOT EXISTS student_exam_time_adjustments (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    exam_id INT NOT NULL,
+                    student_id INT NOT NULL,
+                    delta_minutes INT NOT NULL DEFAULT 0,
+                    reason VARCHAR(255) NULL,
+                    adjusted_by INT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_exam_student (exam_id, student_id),
+                    INDEX idx_created_at (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            ");
+            $extraStmt = $pdo->prepare("
+                SELECT COALESCE(SUM(delta_minutes), 0)
+                FROM student_exam_time_adjustments
+                WHERE exam_id = ? AND student_id = ?
+            ");
+            $extraStmt->execute([$ajaxExamId, $studentRowId]);
+            $extraMinutes = (int)$extraStmt->fetchColumn();
+            if ($extraMinutes !== 0) {
+                $endTs += ($extraMinutes * 60);
+                $durationMinutes = max(1, $durationMinutes + $extraMinutes);
+            }
+        } catch (Throwable $extraTimeError) {
+            error_log('Student extra time lookup failed: ' . $extraTimeError->getMessage());
+        }
+        $isPaused = strtolower((string)($timeExam['exam_control_status'] ?? 'active')) === 'paused';
+        $pauseTs = !empty($timeExam['pause_started_at']) ? strtotime($timeExam['pause_started_at']) : time();
+        $remainingSeconds = max(0, $endTs - ($isPaused ? $pauseTs : time()));
+        echo json_encode([
+            'success' => true,
+            'commands' => $commands,
+            'timer' => [
+                'duration_minutes' => $durationMinutes,
+                'start_datetime' => $timeExam['start_datetime'] ?? null,
+                'end_datetime' => $timeExam['end_datetime'] ?? null,
+                'cutoff_datetime' => $timeExam['cutoff_datetime'] ?? null,
+                'paused' => $isPaused,
+                'remaining_seconds' => $remainingSeconds,
+                'individual_extra_minutes' => $extraMinutes
+            ]
+        ]);
         exit;
     }
 
@@ -819,7 +1342,19 @@ $examData = null;
 $questions = [];
 $error = null;
 
-if ($examId) {
+if (($_SESSION['user_role'] ?? '') === 'STUDENT' && $studentData) {
+    $sessionError = qodaVerifyStudentActiveSession(
+        $pdo,
+        (int)$studentData['id'],
+        (string)($studentData['student_id'] ?? $studentId),
+        $examId ? (int)$examId : null
+    );
+    if ($sessionError) {
+        $error = $sessionError;
+    }
+}
+
+if ($examId && !$error) {
     try {
         $preview = isset($_GET['preview']) && $_GET['preview'] == 1;
 
@@ -972,16 +1507,20 @@ if ($examData) {
         $endTs = $startTs + ($durationMins * 60);
         $examData['end_datetime'] = date('Y-m-d H:i:s', $endTs);
     }
+    $isPaused = strtolower((string)($examData['exam_control_status'] ?? 'active')) === 'paused';
+    $pauseTs = !empty($examData['pause_started_at']) ? strtotime($examData['pause_started_at']) : $nowTs;
     $examData['server_now'] = $dbNow;
     $examData['server_now_ms'] = $nowTs * 1000;
-    $examData['remaining_seconds'] = $endTs ? max(0, $endTs - $nowTs) : $durationMins * 60;
+    $examData['remaining_seconds'] = $endTs ? max(0, $endTs - ($isPaused ? $pauseTs : $nowTs)) : $durationMins * 60;
+    $examData['timer_paused'] = $isPaused;
     $examData['runtime_status'] = ($startTs && $startTs > $nowTs) ? 'upcoming' : (($endTs && $endTs <= $nowTs) ? 'expired' : 'active');
 }
-$examJson = $examData ? json_encode($examData) : 'null';
-$questionsJson = json_encode(qodaStudentSafeQuestions($questions));
-$studentNameJson = json_encode($studentName);
-$studentIdJson = json_encode($studentId);
-$previewJson = json_encode($preview ?? false);
+$jsonScriptFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES;
+$examJson = $examData ? json_encode($examData, $jsonScriptFlags) : 'null';
+$questionsJson = json_encode(qodaStudentSafeQuestions($questions), $jsonScriptFlags);
+$studentNameJson = json_encode($studentName, $jsonScriptFlags);
+$studentIdJson = json_encode($studentId, $jsonScriptFlags);
+$previewJson = json_encode($preview ?? false, $jsonScriptFlags);
 
 // If error, show error page
 if ($error):
@@ -993,6 +1532,7 @@ if ($error):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Qoda | Exam Error</title>
+    <link rel="icon" type="image/png" href="../assets/qoda-logo.png">
     <style>
     body {
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -1068,11 +1608,13 @@ endif;
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Qoda | Secure Coding Exam Interface</title>
+    <link rel="icon" type="image/png" href="../assets/qoda-logo.png">
     <!-- Monaco Editor -->
     <!-- Monaco Editor - VS Code Style -->
     <link rel="stylesheet" data-name="vs/editor/editor.main"
         href="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs/editor/editor.main.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs/loader.js"></script>
+    <script src="/socket.io/socket.io.js"></script>
     <style>
     /* ============================================
        EXAM INTERFACE STYLES - CODING ONLY
@@ -1118,7 +1660,6 @@ endif;
     body.light .header-center,
     body.light .timer,
     body.light .problem-card,
-    body.light .output-area,
     body.light .ui-output-area {
         background: #f9fafb !important;
         color: #111827 !important;
@@ -1165,14 +1706,20 @@ endif;
     .logo-icon {
         width: 36px;
         height: 36px;
-        background: linear-gradient(135deg, #007acc, #0098ff);
+        background: #1e1e1e;
         border-radius: 8px;
         display: flex;
         align-items: center;
         justify-content: center;
-        font-weight: bold;
-        font-size: 18px;
-        color: white;
+        overflow: hidden;
+        border: 1px solid #3e3e42;
+    }
+
+    .logo-icon img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
     }
 
     .system-name {
@@ -1262,17 +1809,21 @@ endif;
     }
 
     .share-screen {
-        background: transparent;
-        border: 0;
-        border-radius: 50%;
-        width: 36px;
-        height: 36px;
+        background: #1f2937;
+        border: 1px solid #4b5563;
+        border-radius: 999px;
+        width: auto;
+        min-width: 158px;
+        height: 40px;
+        padding: 0 14px;
         cursor: pointer;
-        color: #ff0000;
-        display: flex;
+        color: #f9fafb;
+        display: inline-flex;
         align-items: center;
         justify-content: center;
-        font-size: 0;
+        gap: 8px;
+        font-size: 12px;
+        font-weight: 900;
     }
 
     .share-screen:hover {
@@ -1286,16 +1837,16 @@ endif;
     }
 
     .share-screen.sharing-on {
-        background: transparent !important;
-        border-color: transparent !important;
-        color: #ff0000 !important;
+        background: #991b1b !important;
+        border-color: #ef4444 !important;
+        color: #ffffff !important;
         animation: sharingBlink 1s infinite;
     }
 
     .share-screen.sharing-off {
-        background: transparent !important;
-        border-color: transparent !important;
-        color: #7f1d1d !important;
+        background: #1f2937 !important;
+        border-color: #4b5563 !important;
+        color: #f9fafb !important;
         animation: none;
     }
 
@@ -1311,6 +1862,10 @@ endif;
     .sharing-off .share-dot {
         opacity: .35;
         box-shadow: none;
+    }
+
+    .screen-share-status-text {
+        white-space: nowrap;
     }
 
     @keyframes sharingBlink {
@@ -1560,6 +2115,46 @@ endif;
         flex-shrink: 0;
         text-align: justify;
         color: #d4d4d4;
+    }
+
+    .question-text-formatted {
+        white-space: pre-wrap;
+        word-break: break-word;
+        text-align: left;
+        line-height: 1.6;
+    }
+
+    .question-text-formatted img {
+        max-width: 100%;
+        height: auto;
+        display: block;
+        margin: 12px 0;
+        border-radius: 8px;
+        border: 1px solid #3e3e42;
+    }
+
+    .question-text-formatted table,
+    .question-format-block table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 10px 0;
+        white-space: normal;
+    }
+
+    .question-text-formatted th,
+    .question-text-formatted td,
+    .question-format-block th,
+    .question-format-block td {
+        border: 1px solid #3e3e42;
+        padding: 8px;
+        vertical-align: top;
+    }
+
+    .question-format-block {
+        margin-top: 12px;
+        padding-top: 10px;
+        border-top: 1px solid #3e3e42;
+        text-align: left;
     }
 
     /* Sub-questions */
@@ -2204,13 +2799,13 @@ endif;
         flex: 1;
         margin: 0;
         padding: 15px;
-        background: #1e1e1e;
-        color: #d4d4d4;
+        background: #0f172a;
+        color: #e5e7eb;
         font-family: 'Consolas', monospace;
-        font-size: 13px;
+        font-size: 16px;
         overflow: auto;
         white-space: pre-wrap;
-        line-height: 1.5;
+        line-height: 1.55;
     }
 
     .output-tabs {
@@ -2269,11 +2864,11 @@ endif;
     .terminal-session {
         min-height: 100%;
         padding: 12px;
-        background: #111;
-        color: #f8fafc;
+        background: #0f172a;
+        color: #e5e7eb;
         font-family: Consolas, "Courier New", monospace;
-        font-size: 14px;
-        line-height: 1.4;
+        font-size: 16px;
+        line-height: 1.55;
         white-space: pre-wrap;
     }
 
@@ -2303,7 +2898,7 @@ endif;
         background: transparent;
         color: #f8fafc;
         font: inherit;
-        caret-color: #22c55e;
+        caret-color: #22d3ee;
     }
 
     .console-input-row {
@@ -2576,13 +3171,66 @@ endif;
         color: #888;
         text-align: center;
     }
+
+    .exam-desktop-only-blocker {
+        display: none;
+    }
+
+    @media (max-width: 1024px), (pointer: coarse) and (max-width: 1180px) {
+        .exam-desktop-only-blocker {
+            position: fixed;
+            inset: 0;
+            z-index: 300000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            background: linear-gradient(135deg, #020617, #111827);
+            color: #f8fafc;
+            text-align: center;
+        }
+
+        .exam-desktop-only-card {
+            max-width: 560px;
+            border: 1px solid rgba(148, 163, 184, .35);
+            border-radius: 22px;
+            padding: 34px;
+            background: rgba(15, 23, 42, .92);
+            box-shadow: 0 24px 80px rgba(0, 0, 0, .42);
+        }
+
+        .exam-desktop-only-card i {
+            color: #38bdf8;
+            font-size: 54px;
+            margin-bottom: 16px;
+        }
+
+        .exam-desktop-only-card h1 {
+            margin: 0 0 12px;
+            font-size: 26px;
+        }
+
+        .exam-desktop-only-card p {
+            margin: 0;
+            color: #cbd5e1;
+            font-size: 17px;
+            line-height: 1.55;
+        }
+    }
     </style>
 </head>
 
 <body>
+    <div class="exam-desktop-only-blocker" role="alert">
+        <div class="exam-desktop-only-card">
+            <i class="fas fa-laptop-code" aria-hidden="true"></i>
+            <h1>Desktop Required</h1>
+            <p>This exam can only be taken on a laptop or desktop computer.</p>
+        </div>
+    </div>
     <div class="fixed-header">
         <div class="header-left">
-            <div class="logo-icon">Q</div>
+            <div class="logo-icon"><img src="../assets/qoda-logo.png" alt="QODA logo"></div>
             <span class="system-name">Qoda PU</span>
         </div>
         <div class="header-center">
@@ -2709,6 +3357,11 @@ endif;
     </div>
 
     <script>
+    window.QODA_DEBUG = window.QODA_DEBUG || new URLSearchParams(window.location.search).get('debug') === '1';
+    if (!window.QODA_DEBUG && window.console) {
+        console.log = function() {};
+        console.debug = function() {};
+    }
     // ============================================
     // ENHANCED TAB SWITCHING & WINDOW LOCK
     // ============================================
@@ -2897,7 +3550,7 @@ endif;
             localStorage.setItem('exam_timeLeft_' + examId, timeLeft);
             console.log("EXISTING - Elapsed:", elapsed, "Time left:", timeLeft);
 
-            if (timeLeft <= 0) {
+            if (!examPausedByLecturer && timeLeft <= 0) {
                 console.log("TIME IS UP!");
                 showMessageBox("Time is up. Submitting your exam now.");
                 submitExam(true);
@@ -2918,6 +3571,10 @@ endif;
         // Start countdown
         console.log("Starting new timer interval...");
         timerInterval = setInterval(function() {
+            if (examPausedByLecturer) {
+                updateTimerDisplay();
+                return;
+            }
             if (timeLeft > 0) {
                 timeLeft--;
                 localStorage.setItem('exam_timeLeft_' + examId, timeLeft);
@@ -2948,8 +3605,14 @@ endif;
         const timerDisplay = document.getElementById('timerDisplay');
 
         if (timerText) {
-            timerText.textContent =
-                `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+            timerText.textContent = examPausedByLecturer
+                ? `PAUSED - ${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+                : `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        }
+
+        if (examPausedByLecturer && timerDisplay) {
+            timerDisplay.classList.remove('warning');
+            return;
         }
 
         if (timeLeft <= 1800 && timerDisplay && !isPreview) {
@@ -2984,8 +3647,11 @@ endif;
     }
 
     async function captureViolationEvidence(reason) {
-        if (!screenSharingActive || !screenVideoEl || screenVideoEl.readyState < 2 || !screenCanvasEl) return;
+        if (!screenSharingActive || !screenStream) return;
+        await prepareEvidenceFrameCapture();
+        if (!screenVideoEl || screenVideoEl.readyState < 2 || !screenCanvasEl) return;
         const timestamp = new Date().toLocaleString();
+        console.log('Capturing violation evidence before lock', reason);
         await sendScreenSnapshot('violation', `Screen locked after rule violation: ${reason}. Captured before lock at ${timestamp}.`);
     }
 
@@ -2996,7 +3662,7 @@ endif;
         screenSharingLocked = true;
         localStorage.setItem('screen_locked_' + examId, 'true');
         localStorage.setItem('exam_lock_reason_' + examId, 'lecturer_lock');
-        showLockedScreen(message);
+        captureViolationEvidence('lecturer_lock').finally(() => showLockedScreen(message));
     }
     // ============================================
     // PERSISTENT SCREEN SHARING - SURVIVES REFRESH
@@ -3014,6 +3680,21 @@ endif;
     let screenSharePromptActive = false;
     let screenShareStartedThisPage = false;
     let screenHeartbeatInterval = null;
+    let screenShareSocket = null;
+    let screenHttpPeerConnection = null;
+    let screenHttpSignalInterval = null;
+    let screenHttpStreamKey = '';
+    let screenHttpAnswerApplied = false;
+    let liveFrameRelayInterval = null;
+    let liveFrameRelayInFlight = false;
+    const screenWebrtcPeers = {};
+    const QODA_WEBRTC_ICE_SERVERS = [
+        { urls: 'stun:openrelay.metered.ca:80' },
+        { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+        { urls: 'turns:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
+    ];
     let pageIsUnloading = false;
 
     // Start screen share with persistence
@@ -3039,12 +3720,10 @@ endif;
             await ensureExamSession();
             await requestExamFullscreen();
             screenStream = await navigator.mediaDevices.getDisplayMedia({
-                video: {
-                    cursor: "always",
-                    displaySurface: "monitor"
-                },
+                video: true,
                 audio: false
             });
+            console.log('Student stream captured', screenStream.getTracks().map(track => `${track.kind}:${track.readyState}`));
 
             screenSharingActive = true;
             screenShareStartedThisPage = true;
@@ -3053,6 +3732,7 @@ endif;
             localStorage.setItem('screen_sharing_exam_id', examId);
             localStorage.setItem('screen_sharing_start_time', Date.now().toString());
             updateScreenShareButton();
+            updateScreenShareStatus(true);
             document.getElementById('screenShareRequiredOverlay')?.remove();
             const track = screenStream.getVideoTracks()[0];
             try {
@@ -3060,8 +3740,10 @@ endif;
             } catch (captureError) {
                 screenImageCapture = null;
             }
+            startStudentScreenSocketBroadcast();
+            startStudentScreenHttpBroadcast();
+            startLiveFrameRelay();
             startScreenHeartbeat();
-            setupScreenCapturePipeline();
             startProctorCommandPolling();
             await requestExamFullscreen();
             showToast('Screen sharing active!', 'success');
@@ -3070,8 +3752,9 @@ endif;
                 track.onended = function() {
                     console.log("Screen sharing stopped");
                     screenSharingActive = false;
-                    stopScreenCapturePipeline();
                     stopScreenHeartbeat();
+                    stopStudentScreenSocketBroadcast();
+                    stopLiveFrameRelay();
                     updateScreenShareButton();
                     localStorage.removeItem('screen_active_' + examId);
                     localStorage.removeItem('screen_sharing_active');
@@ -3084,7 +3767,7 @@ endif;
             return true;
         } catch (err) {
             console.error("Screen share error:", err);
-            showToast('Screen sharing is required before writing the exam.', 'warning');
+            showToast('Screen sharing permission was not granted. Share your entire screen to continue this exam.', 'warning');
             showScreenShareOverlay();
             return false;
         } finally {
@@ -3115,8 +3798,8 @@ endif;
         btn.classList.toggle('active', screenSharingActive);
         btn.classList.toggle('sharing-on', screenSharingActive);
         btn.classList.toggle('sharing-off', !screenSharingActive);
-        btn.innerHTML = '<span class="share-dot" aria-hidden="true"></span>';
-        btn.title = screenSharingActive ? 'Screen sharing ON' : 'Screen sharing OFF';
+        btn.innerHTML = `<span class="share-dot" aria-hidden="true"></span><span class="screen-share-status-text">${screenSharingActive ? 'Screen Sharing Live' : 'Start Screen Sharing'}</span>`;
+        btn.title = screenSharingActive ? 'Screen Sharing Live' : 'Start Screen Sharing';
     }
 
     function applyExamTheme(theme) {
@@ -3248,13 +3931,13 @@ endif;
         }
         if (!screenCanvasEl) {
             screenCanvasEl = document.createElement('canvas');
-            screenCanvasEl.width = 960;
-            screenCanvasEl.height = 540;
+            screenCanvasEl.width = 1280;
+            screenCanvasEl.height = 720;
         }
         screenVideoEl.srcObject = screenStream;
         screenVideoEl.play().catch(() => {});
         if (screenCaptureInterval) clearInterval(screenCaptureInterval);
-        screenCaptureInterval = setInterval(sendScreenSnapshot, 1500);
+        screenCaptureInterval = setInterval(sendScreenSnapshot, 350);
         screenVideoEl.onloadedmetadata = () => sendScreenSnapshot();
         setTimeout(sendScreenSnapshot, 250);
         setTimeout(sendScreenSnapshot, 900);
@@ -3264,6 +3947,372 @@ endif;
         if (screenCaptureInterval) clearInterval(screenCaptureInterval);
         screenCaptureInterval = null;
         screenImageCapture = null;
+    }
+
+    async function prepareEvidenceFrameCapture() {
+        if (!screenStream) return false;
+        if (!screenVideoEl) {
+            screenVideoEl = document.createElement('video');
+            screenVideoEl.muted = true;
+            screenVideoEl.playsInline = true;
+            screenVideoEl.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;';
+            document.body.appendChild(screenVideoEl);
+        }
+        if (!screenCanvasEl) {
+            screenCanvasEl = document.createElement('canvas');
+            screenCanvasEl.width = 1920;
+            screenCanvasEl.height = 1080;
+        }
+        if (screenVideoEl.srcObject !== screenStream) {
+            screenVideoEl.srcObject = screenStream;
+        }
+        try {
+            await screenVideoEl.play();
+        } catch (error) {}
+        if (screenVideoEl.readyState >= 2) return true;
+        await new Promise(resolve => {
+            const timeout = setTimeout(resolve, 800);
+            screenVideoEl.onloadedmetadata = () => {
+                clearTimeout(timeout);
+                resolve();
+            };
+        });
+        return screenVideoEl.readyState >= 2;
+    }
+
+    function waitForIceGatheringComplete(peerConnection) {
+        if (peerConnection.iceGatheringState === 'complete') return Promise.resolve();
+        return new Promise(resolve => {
+            const timeout = setTimeout(resolve, 8000);
+            peerConnection.addEventListener('icegatheringstatechange', function onStateChange() {
+                if (peerConnection.iceGatheringState === 'complete') {
+                    clearTimeout(timeout);
+                    peerConnection.removeEventListener('icegatheringstatechange', onStateChange);
+                    resolve();
+                }
+            });
+        });
+    }
+
+    function startStudentScreenSocketBroadcast() {
+        if (isPreview || !screenStream) return;
+        if (!window.io) {
+            showToast('Live screen streaming is not available. Please refresh and try again.', 'error');
+            return;
+        }
+        if (!screenShareSocket) {
+            screenShareSocket = io({
+                path: '/socket.io',
+                transports: ['polling', 'websocket'],
+                upgrade: true,
+                reconnection: true,
+                reconnectionAttempts: 12,
+                reconnectionDelay: 800,
+                auth: { token: screenShareSocketToken }
+            });
+            screenShareSocket.on('connect', () => {
+                console.log('Student screen socket connected', screenShareSocket.id);
+                screenShareSocket.emit('student-start-screen', {
+                    exam_id: String(examId),
+                    student_id: String(proctorStudentDbId),
+                    session_id: String(screenShareSessionId)
+                });
+                console.log('screen-share-started emitted', { examId, proctorStudentDbId, screenShareSessionId });
+            });
+            screenShareSocket.on('viewer-ready', payload => createStudentScreenOffer(payload));
+            screenShareSocket.on('webrtc-answer', async payload => {
+                const key = payload?.viewer_socket_id || payload?.from;
+                const peerConnection = key ? screenWebrtcPeers[key] : null;
+                if (peerConnection && payload?.answer) {
+                    console.log('Student received answer', payload);
+                    try { await peerConnection.setRemoteDescription(payload.answer); } catch (error) { console.error('Student answer apply failed:', error); }
+                }
+            });
+            screenShareSocket.on('webrtc-ice-candidate', async payload => {
+                const key = payload?.viewer_socket_id || payload?.from;
+                const peerConnection = key ? screenWebrtcPeers[key] : null;
+                if (peerConnection && payload?.candidate) {
+                    console.log('ICE candidate exchanged: student received', payload);
+                    try { await peerConnection.addIceCandidate(payload.candidate); } catch (error) {}
+                }
+            });
+            screenShareSocket.on('connect_error', error => {
+                console.error('Student screen socket connect_error', error);
+                showToast('Live screen streaming connection failed: ' + (error.message || 'network error'), 'warning');
+            });
+            screenShareSocket.on('screen-share-error', message => {
+                console.error('Student screen-share-error', message);
+                showToast('Live screen streaming error: ' + message, 'warning');
+            });
+        } else if (screenShareSocket.connected) {
+            screenShareSocket.emit('student-start-screen', {
+                exam_id: String(examId),
+                student_id: String(proctorStudentDbId),
+                session_id: String(screenShareSessionId)
+            });
+        }
+    }
+
+    function stopStudentScreenSocketBroadcast() {
+        Object.keys(screenWebrtcPeers).forEach(key => {
+            try { screenWebrtcPeers[key].close(); } catch (error) {}
+            delete screenWebrtcPeers[key];
+        });
+        if (screenShareSocket) {
+            screenShareSocket.emit('screen-share-stopped', {
+                exam_id: String(examId),
+                student_id: String(proctorStudentDbId),
+                session_id: String(screenShareSessionId)
+            });
+            screenShareSocket.disconnect();
+            screenShareSocket = null;
+        }
+        stopStudentScreenHttpBroadcast();
+        updateScreenShareStatus(false);
+    }
+
+    function startLiveFrameRelay() {
+        if (isPreview || !screenStream) return;
+        stopLiveFrameRelay();
+        if (!screenVideoEl) {
+            screenVideoEl = document.createElement('video');
+            screenVideoEl.muted = true;
+            screenVideoEl.playsInline = true;
+            screenVideoEl.autoplay = true;
+            screenVideoEl.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
+            document.body.appendChild(screenVideoEl);
+        }
+        if (!screenCanvasEl) {
+            screenCanvasEl = document.createElement('canvas');
+        }
+        screenCanvasEl.width = 1280;
+        screenCanvasEl.height = 720;
+        screenVideoEl.srcObject = screenStream;
+        screenVideoEl.play().catch(error => console.warn('Live frame relay video play failed:', error));
+        liveFrameRelayInterval = setInterval(sendLiveFrameRelay, 500);
+        setTimeout(sendLiveFrameRelay, 250);
+        setTimeout(sendLiveFrameRelay, 900);
+    }
+
+    function stopLiveFrameRelay() {
+        if (liveFrameRelayInterval) clearInterval(liveFrameRelayInterval);
+        liveFrameRelayInterval = null;
+        liveFrameRelayInFlight = false;
+    }
+
+    async function sendLiveFrameRelay() {
+        if (isPreview || !screenSharingActive || !screenStream || !screenCanvasEl || liveFrameRelayInFlight) return;
+        if (!screenVideoEl || screenVideoEl.readyState < 2) {
+            try {
+                if (screenVideoEl) await screenVideoEl.play();
+            } catch (error) {}
+            if (!screenVideoEl || screenVideoEl.readyState < 2) return;
+        }
+        liveFrameRelayInFlight = true;
+        try {
+            const ctx = screenCanvasEl.getContext('2d', { alpha: false });
+            if (!ctx) return;
+            const drawn = await drawScreenFrame(ctx, screenCanvasEl.width, screenCanvasEl.height);
+            if (!drawn) return;
+            const frame = screenCanvasEl.toDataURL('image/jpeg', 0.62);
+            const formData = new URLSearchParams();
+            formData.append('action', 'screen_live_frame');
+            formData.append('exam_id', examId);
+            formData.append('frame', frame);
+            formData.append('session_id', String(screenShareSessionId || ''));
+            appendProctorIdentity(formData);
+            const response = await fetch('', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: formData.toString()
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!result.success) {
+                console.warn('Live frame relay failed:', result.error || result);
+            }
+        } catch (error) {
+            console.error('Live frame relay failed:', error);
+        } finally {
+            liveFrameRelayInFlight = false;
+        }
+    }
+
+    function getHttpScreenStreamKey() {
+        const sessionPart = String(screenShareSessionId || 'session').replace(/[^A-Za-z0-9_-]/g, '_');
+        return `student_screen_${examId}_${proctorStudentDbId}_${sessionPart}`;
+    }
+
+    async function startStudentScreenHttpBroadcast() {
+        if (isPreview || !screenStream || !window.RTCPeerConnection) return;
+        if (screenHttpPeerConnection && ['connected', 'connecting'].includes(screenHttpPeerConnection.connectionState)) return;
+        stopStudentScreenHttpBroadcast(false);
+        screenHttpStreamKey = getHttpScreenStreamKey();
+        screenHttpAnswerApplied = false;
+        const peerConnection = new RTCPeerConnection({
+            iceServers: QODA_WEBRTC_ICE_SERVERS,
+            bundlePolicy: 'max-bundle',
+            rtcpMuxPolicy: 'require'
+        });
+        screenHttpPeerConnection = peerConnection;
+        peerConnection.onconnectionstatechange = () => {
+            console.log('Student HTTP WebRTC state', peerConnection.connectionState);
+            if (['failed', 'disconnected', 'closed'].includes(peerConnection.connectionState)) {
+                if (screenSharingActive && screenStream) {
+                    setTimeout(() => startStudentScreenHttpBroadcast(), 2500);
+                }
+            }
+        };
+        screenStream.getTracks().forEach(track => {
+            peerConnection.addTrack(track, screenStream);
+            console.log('Tracks added to HTTP peer connection', track.kind, track.label);
+        });
+        try {
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            await waitForIceGatheringComplete(peerConnection);
+            const formData = new URLSearchParams();
+            formData.append('action', 'webrtc_student_publish_offer');
+            formData.append('exam_id', examId);
+            formData.append('stream_key', screenHttpStreamKey);
+            formData.append('offer', JSON.stringify(peerConnection.localDescription));
+            appendProctorIdentity(formData);
+            const response = await fetch('', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: formData.toString()
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!result.success) {
+                console.warn('HTTP WebRTC offer publish failed:', result.error || result);
+                return;
+            }
+            console.log('HTTP WebRTC offer published', screenHttpStreamKey);
+            if (screenHttpSignalInterval) clearInterval(screenHttpSignalInterval);
+            screenHttpSignalInterval = setInterval(pollStudentHttpWebrtcAnswer, 1200);
+            pollStudentHttpWebrtcAnswer();
+        } catch (error) {
+            console.error('HTTP WebRTC offer failed:', error);
+        }
+    }
+
+    async function pollStudentHttpWebrtcAnswer() {
+        if (!screenHttpPeerConnection || !screenHttpStreamKey || screenHttpAnswerApplied) return;
+        const formData = new URLSearchParams();
+        formData.append('action', 'webrtc_poll_http_answer');
+        formData.append('exam_id', examId);
+        formData.append('stream_key', screenHttpStreamKey);
+        appendProctorIdentity(formData);
+        try {
+            const response = await fetch('', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: formData.toString()
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!result.success || !result.data || !result.data.answer) return;
+            const answer = JSON.parse(result.data.answer);
+            await screenHttpPeerConnection.setRemoteDescription(answer);
+            screenHttpAnswerApplied = true;
+            if (screenHttpSignalInterval) clearInterval(screenHttpSignalInterval);
+            screenHttpSignalInterval = null;
+            console.log('Student applied HTTP WebRTC answer');
+        } catch (error) {
+            console.error('HTTP WebRTC answer poll failed:', error);
+        }
+    }
+
+    function stopStudentScreenHttpBroadcast(closeRemote = true) {
+        if (screenHttpSignalInterval) clearInterval(screenHttpSignalInterval);
+        screenHttpSignalInterval = null;
+        if (screenHttpPeerConnection) {
+            try { screenHttpPeerConnection.close(); } catch (error) {}
+        }
+        if (closeRemote && screenHttpStreamKey) {
+            const formData = new URLSearchParams();
+            formData.append('action', 'webrtc_close_stream');
+            formData.append('exam_id', examId);
+            formData.append('stream_key', screenHttpStreamKey);
+            appendProctorIdentity(formData);
+            fetch('', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: formData.toString(),
+                keepalive: true
+            }).catch(() => {});
+        }
+        screenHttpPeerConnection = null;
+        screenHttpAnswerApplied = false;
+    }
+
+    async function createStudentScreenOffer(payload) {
+        if (!screenStream) return;
+        const viewerSocketId = payload?.viewer_socket_id;
+        if (!viewerSocketId) return;
+        if (screenWebrtcPeers[viewerSocketId]) {
+            try { screenWebrtcPeers[viewerSocketId].close(); } catch (error) {}
+        }
+        const peerConnection = new RTCPeerConnection({
+            iceServers: QODA_WEBRTC_ICE_SERVERS,
+            bundlePolicy: 'max-bundle',
+            rtcpMuxPolicy: 'require'
+        });
+        screenWebrtcPeers[viewerSocketId] = peerConnection;
+        peerConnection.onicecandidate = event => {
+            if (event.candidate && screenShareSocket) {
+                console.log('ICE candidate exchanged: student sent', event.candidate);
+                screenShareSocket.emit('webrtc-ice-candidate', {
+                    to: viewerSocketId,
+                    viewer_socket_id: viewerSocketId,
+                    exam_id: String(examId),
+                    student_id: String(proctorStudentDbId),
+                    session_id: String(screenShareSessionId),
+                    candidate: event.candidate
+                });
+            }
+        };
+        peerConnection.onconnectionstatechange = () => {
+            if (['failed', 'disconnected', 'closed'].includes(peerConnection.connectionState)) {
+                try { peerConnection.close(); } catch (error) {}
+                delete screenWebrtcPeers[viewerSocketId];
+            }
+        };
+        screenStream.getTracks().forEach(track => {
+            peerConnection.addTrack(track, screenStream);
+            console.log('Tracks added to peer connection', track.kind, track.label);
+        });
+        try {
+            const offer = await peerConnection.createOffer();
+            console.log('Offer created', offer);
+            await peerConnection.setLocalDescription(offer);
+            screenShareSocket.emit('webrtc-offer', {
+                viewer_socket_id: viewerSocketId,
+                exam_id: String(examId),
+                student_id: String(proctorStudentDbId),
+                session_id: String(screenShareSessionId),
+                offer: peerConnection.localDescription
+            });
+            console.log('Offer sent', { viewerSocketId, examId, proctorStudentDbId, screenShareSessionId });
+        } catch (error) {
+            console.error('WebRTC offer failed:', error);
+            try { peerConnection.close(); } catch (closeError) {}
+            delete screenWebrtcPeers[viewerSocketId];
+        }
+    }
+
+    function pauseLiveFrameUploadForCompiler() {
+        const wasRunning = !!screenCaptureInterval;
+        if (screenCaptureInterval) {
+            clearInterval(screenCaptureInterval);
+            screenCaptureInterval = null;
+        }
+        return wasRunning;
+    }
+
+    function resumeLiveFrameUploadAfterCompiler(wasRunning) {
+        if (!wasRunning || !screenSharingActive || !screenCanvasEl) return;
+        if (screenCaptureInterval) clearInterval(screenCaptureInterval);
+        screenCaptureInterval = setInterval(sendScreenSnapshot, 350);
+        setTimeout(sendScreenSnapshot, 150);
     }
 
     function startScreenHeartbeat() {
@@ -3280,6 +4329,7 @@ endif;
 
     async function sendScreenHeartbeat(active = true) {
         if (isPreview || !examId) return;
+        updateScreenShareStatus(active);
         const formData = new URLSearchParams();
         formData.append('action', 'screen_heartbeat');
         formData.append('exam_id', examId);
@@ -3294,6 +4344,30 @@ endif;
             });
         } catch (error) {
             console.error('Screen heartbeat failed:', error);
+        }
+    }
+
+    async function updateScreenShareStatus(active = true) {
+        if (isPreview || !examId) return;
+        const formData = new URLSearchParams();
+        formData.append('action', 'screen_share_status');
+        formData.append('exam_id', examId);
+        formData.append('active', active ? '1' : '0');
+        formData.append('session_id', String(screenShareSessionId || ''));
+        appendProctorIdentity(formData);
+        try {
+            const response = await fetch('', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: formData.toString(),
+                keepalive: true
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!result.success) {
+                console.warn('Screen sharing status update failed:', result.error || result);
+            }
+        } catch (error) {
+            console.error('Screen sharing status update failed:', error);
         }
     }
 
@@ -3333,15 +4407,15 @@ endif;
         if (!screenSharingActive || !screenCanvasEl) return;
         if (captureType === 'live' && screenSnapshotInFlight) return;
         if (captureType === 'live') screenSnapshotInFlight = true;
-        const frameWidth = captureType === 'live' ? 640 : 1280;
-        const frameHeight = captureType === 'live' ? 360 : 720;
+        const frameWidth = captureType === 'live' ? 1280 : 1920;
+        const frameHeight = captureType === 'live' ? 720 : 1080;
         const ctx = screenCanvasEl.getContext('2d');
         screenCanvasEl.width = frameWidth;
         screenCanvasEl.height = frameHeight;
         try {
             const drewFrame = await drawScreenFrame(ctx, frameWidth, frameHeight);
             if (!drewFrame) return;
-            const snapshot = screenCanvasEl.toDataURL('image/jpeg', captureType === 'live' ? 0.34 : 0.72);
+            const snapshot = screenCanvasEl.toDataURL('image/jpeg', captureType === 'live' ? 0.72 : 0.9);
             const formData = new FormData();
             formData.append('action', 'screen_snapshot');
             formData.append('exam_id', examId);
@@ -3395,6 +4469,9 @@ endif;
             } catch (parseError) {
                 throw new Error(`Compiler returned an invalid response:\n${text.slice(0, 1000)}`);
             }
+            if (result.success && result.timer) {
+                applyServerTimerState(result.timer);
+            }
             if (!result.success || !Array.isArray(result.commands)) return;
             result.commands.forEach(command => {
                 if (command.command_type === 'warning') {
@@ -3414,12 +4491,74 @@ endif;
         }
     }
 
+    function applyServerTimerState(timerInfo) {
+        if (isPreview || !timerInfo) return;
+        const serverRemaining = parseInt(timerInfo.remaining_seconds, 10);
+        if (Number.isNaN(serverRemaining)) return;
+        const wasPaused = examPausedByLecturer;
+        examPausedByLecturer = !!timerInfo.paused;
+        if (examPausedByLecturer && !lecturerPauseNoticeShown) {
+            lecturerPauseNoticeShown = true;
+            showLecturerMessage('The examination has been temporarily paused by the lecturer.');
+        }
+        if (examPausedByLecturer) {
+            showExamPausedOverlay();
+        }
+        if (wasPaused && !examPausedByLecturer) {
+            lecturerPauseNoticeShown = false;
+            hideExamPausedOverlay();
+            showToast('The examination timer has resumed.', 'success');
+            showLecturerMessage('The examination timer has resumed. You may continue your exam.');
+        }
+        const durationMinutes = parseInt(timerInfo.duration_minutes, 10) || (dbExam.duration_minutes || 180);
+        dbExam.duration_minutes = durationMinutes;
+        dbExam.remaining_seconds = serverRemaining;
+        dbExam.end_datetime = timerInfo.end_datetime || dbExam.end_datetime;
+        dbExam.cutoff_datetime = timerInfo.cutoff_datetime || dbExam.cutoff_datetime;
+
+        if (Math.abs(serverRemaining - timeLeft) > 2) {
+            timeLeft = Math.max(0, serverRemaining);
+            localStorage.setItem('exam_timeLeft_' + examId, timeLeft);
+            const elapsed = Math.max(0, (durationMinutes * 60) - timeLeft);
+            localStorage.setItem('exam_start_time_' + examId, Math.floor(Date.now() / 1000) - elapsed);
+            updateTimerDisplay();
+        }
+
+        if (!examPausedByLecturer && serverRemaining <= 0) {
+            showMessageBox("Time is up. Submitting your exam now.");
+            submitExam(true);
+        }
+    }
+
     function showLecturerMessage(message) {
         const box = document.getElementById('lecturerMessageBox') || document.createElement('div');
         box.id = 'lecturerMessageBox';
         box.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:100001;background:#111827;color:white;border:1px solid #f59e0b;border-radius:14px;padding:16px;max-width:360px;box-shadow:0 18px 40px rgba(0,0,0,.35);';
         box.innerHTML = `<strong style="color:#fbbf24;display:block;margin-bottom:6px;"><i class="fas fa-bell"></i> Lecturer Message</strong><div style="line-height:1.45;">${escapeHtml(message)}</div><button onclick="this.parentElement.remove()" style="margin-top:10px;background:#f59e0b;color:#111827;border:0;border-radius:8px;padding:8px 12px;cursor:pointer;">OK</button>`;
         if (!box.parentElement) document.body.appendChild(box);
+    }
+
+    function showExamPausedOverlay() {
+        let overlay = document.getElementById('examPausedOverlay');
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.id = 'examPausedOverlay';
+            overlay.style.cssText = 'position:fixed;inset:0;background:rgba(15,23,42,.96);z-index:99998;color:white;display:flex;align-items:center;justify-content:center;text-align:center;padding:24px;';
+            overlay.innerHTML = `
+                <div style="max-width:560px;width:100%;background:#111827;border:1px solid #f59e0b;border-radius:18px;padding:28px;box-shadow:0 24px 60px rgba(0,0,0,.4);">
+                    <i class="fas fa-pause-circle" style="font-size:72px;color:#f59e0b;margin-bottom:18px;"></i>
+                    <h1 style="margin:0 0 10px;">Exam Paused</h1>
+                    <p style="color:#d1d5db;margin:0 0 12px;">The examination has been temporarily paused by the lecturer.</p>
+                    <p style="color:#fbbf24;margin:0;font-weight:800;">Please wait. The page will unlock automatically when the lecturer resumes the exam.</p>
+                </div>
+            `;
+            document.body.appendChild(overlay);
+        }
+    }
+
+    function hideExamPausedOverlay() {
+        const overlay = document.getElementById('examPausedOverlay');
+        if (overlay) overlay.remove();
     }
 
     function unlockExamScreen(message = 'Exam unlocked') {
@@ -3536,6 +4675,8 @@ endif;
     let showingMainQuestion = true;
     let timeLeft = 0;
     let timerInterval = null;
+    let examPausedByLecturer = false;
+    let lecturerPauseNoticeShown = false;
     let monacoEditor = null;
     let openFiles = [];
     let activeFileIndex = 0;
@@ -3557,6 +4698,13 @@ endif;
     const studentIdentifier = <?php echo json_encode($studentData['student_id'] ?? $studentId); ?>;
     const proctorStudentDbId = <?php echo json_encode((int)($studentData['id'] ?? $studentId)); ?>;
     const proctorSignature = <?php echo json_encode(qodaProctorSignature($examId, (int)($studentData['id'] ?? $studentId), (string)($studentData['student_id'] ?? $studentId))); ?>;
+    const screenShareSessionId = <?php echo json_encode(session_id()); ?>;
+    const screenShareSocketToken = <?php echo json_encode(qodaCreateSocketToken([
+        'role' => 'student',
+        'exam_id' => (string)$examId,
+        'student_id' => (string)(int)($studentData['id'] ?? $studentId),
+        'session_id' => session_id(),
+    ])); ?>;
     const CODE_EXECUTOR_URL = '../backend-php/code_executor.php';
 
     function appendProctorIdentity(payload) {
@@ -3573,7 +4721,10 @@ endif;
             mainQuestions = dbQuestions.map((q, idx) => ({
                 id: q.id || ('Q' + idx),
                 type: q.type || 'code',
-                text: q.text || q.question_text || '',
+                text: q.problemStatement || q.text || q.question_text || '',
+                problemStatement: q.problemStatement || q.text || q.question_text || '',
+                inputFormat: q.inputFormat || '',
+                outputFormat: q.outputFormat || '',
                 marks: q.marks || 5,
                 compulsory: q.compulsory || false,
                 language: q.language || 'python',
@@ -3669,10 +4820,7 @@ endif;
                 active: file === openFiles[activeFileIndex]
             }))));
 
-            const response = await fetch(CODE_EXECUTOR_URL, {
-                method: 'POST',
-                body: formData
-            });
+            const response = await postCompilerFormData(formData, 35000);
 
             const text = await response.text();
             let result;
@@ -3751,6 +4899,7 @@ endif;
         console.log("Exam ID:", examId);
         console.log("Preview mode:", isPreview);
         console.log("dbExam:", dbExam);
+        examPausedByLecturer = !!(dbExam && (dbExam.timer_paused || dbExam.exam_control_status === 'paused'));
 
         loadExamTheme();
         loadQuestions();
@@ -3934,6 +5083,41 @@ endif;
         }).join('');
     }
 
+    function sanitizeQuestionHtml(html) {
+        const raw = String(html || '');
+        if (!/<[a-z][\s\S]*>/i.test(raw)) {
+            return escapeHtml(raw).replace(/\n/g, '<br>');
+        }
+        const template = document.createElement('template');
+        template.innerHTML = raw;
+        const allowed = new Set(['B','STRONG','I','EM','U','P','BR','UL','OL','LI','PRE','CODE','TABLE','THEAD','TBODY','TR','TH','TD','IMG','DIV','SPAN','H1','H2','H3','H4','H5','H6','BLOCKQUOTE']);
+        template.content.querySelectorAll('*').forEach(node => {
+            if (!allowed.has(node.tagName)) {
+                node.replaceWith(...Array.from(node.childNodes));
+                return;
+            }
+            Array.from(node.attributes).forEach(attr => {
+                const name = attr.name.toLowerCase();
+                if (name.startsWith('on')) node.removeAttribute(attr.name);
+                if (name === 'src' && node.tagName === 'IMG') {
+                    const value = attr.value || '';
+                    if (!value.startsWith('data:image/') && !/^https?:\/\//i.test(value)) node.removeAttribute('src');
+                    return;
+                }
+                if (!['src','alt','colspan','rowspan','data-qoda-numbered'].includes(name)) node.removeAttribute(attr.name);
+            });
+        });
+        return template.innerHTML;
+    }
+
+    function formatQuestionHtml(text) {
+        return `<div class="question-text-formatted">${sanitizeQuestionHtml(text || '')}</div>`;
+    }
+
+    function renderQuestionFormatBlocks(q) {
+        return '';
+    }
+
     function renderCurrentQuestion() {
         if (mainQuestions.length === 0) {
             document.getElementById('questionText').innerHTML =
@@ -3970,7 +5154,7 @@ endif;
         const hasSubQuestions = q.hasSubQuestions && q.subQuestions && q.subQuestions.length > 0;
 
         if (hasSubQuestions) {
-            questionHtml = `<p style="margin-bottom: 15px; text-align: justify;">${escapeHtml(q.text || '')}</p>`;
+            questionHtml = formatQuestionHtml(q.problemStatement || q.text || '') + renderQuestionFormatBlocks(q);
             document.getElementById('subquestionSection').style.display = 'block';
             document.getElementById('showMainBtn').style.display = showingMainQuestion ? 'none' : 'block';
 
@@ -3982,7 +5166,7 @@ endif;
                     questionHtml += `
                 <div class="subquestion-item">
                     <span class="subquestion-letter">${getSubQuestionLetter(idx)}</span>
-                    <span class="subquestion-text">${escapeHtml(sq.text)}</span>
+                    <div class="subquestion-text">${formatQuestionHtml(sq.text)}</div>
                     <br><small style="color:#888;">Marks: ${sq.marks || 0}</small>
                 </div>
             `;
@@ -3995,7 +5179,7 @@ endif;
                 questionHtml += `
             <div class="subquestion-item">
                 <span class="subquestion-letter">${getSubQuestionLetter(currentSubQuestionIndex)}</span>
-                <span class="subquestion-text">${escapeHtml(sq.text)}</span>
+                <div class="subquestion-text">${formatQuestionHtml(sq.text)}</div>
                 <br><small style="color:#888;">Marks: ${sq.marks || 0}</small>
             </div>
         `;
@@ -4003,7 +5187,7 @@ endif;
         } else {
             document.getElementById('subquestionSection').style.display = 'none';
             showingMainQuestion = true;
-            questionHtml = `<p style="text-align: justify;">${escapeHtml(q.text || '')}</p>`;
+            questionHtml = formatQuestionHtml(q.problemStatement || q.text || '') + renderQuestionFormatBlocks(q);
         }
 
         document.getElementById('questionText').innerHTML = questionHtml;
@@ -4099,8 +5283,21 @@ endif;
         }
 
         if (savedFiles.length === 0) {
-            savedFiles = [];
-            activeFileIndex = -1;
+            const starterCode = String(q.starterCode || q.starter_code || q.template || '').trim();
+            if (starterCode) {
+                savedFiles = [{
+                    name: answerFileNameForQuestion(q, currentQuestionIndex),
+                    language: currentLanguage,
+                    content: starterCode,
+                    active: true,
+                    fromStarterCode: true
+                }];
+                savedCode = starterCode;
+                activeFileIndex = 0;
+            } else {
+                savedFiles = [];
+                activeFileIndex = -1;
+            }
         } else {
             activeFileIndex = savedFiles.findIndex(f => f.active);
             if (activeFileIndex === -1) activeFileIndex = 0;
@@ -5313,6 +6510,96 @@ endif;
         return matches ? matches.length : 1;
     }
 
+    function decodeConsoleLiteral(text) {
+        return String(text || '')
+            .replace(/\\n/g, '\n')
+            .replace(/\\r/g, '\r')
+            .replace(/\\t/g, '\t')
+            .replace(/\\"/g, '"')
+            .replace(/\\'/g, "'")
+            .replace(/\\\\/g, '\\');
+    }
+
+    function firstInputCallIndex(code, language) {
+        const lang = String(language || '').toLowerCase();
+        const patterns = [
+            /scanf\s*\(/g,
+            /cin\s*>>/g,
+            /\.\s*next(?:Int|Double|Float|Long|Short|Byte|Boolean|Line)?\s*\(/g,
+            /input\s*\(/g,
+            /readline\s*\(/g,
+            /Console\.ReadLine\s*\(/g,
+            /ReadLine\s*\(/g
+        ];
+        let first = -1;
+        patterns.forEach(pattern => {
+            let match;
+            while ((match = pattern.exec(code)) !== null) {
+                if (first === -1 || match.index < first) first = match.index;
+                if (!['python', 'py'].includes(lang) && pattern.source === 'input\\s*\\(') break;
+            }
+        });
+        return first;
+    }
+
+    function extractPrintedTextBeforeInput(code, language, promptToExclude = '') {
+        const firstInput = firstInputCallIndex(code, language);
+        if (firstInput <= 0) return '';
+        const before = code.slice(0, firstInput);
+        const statements = [];
+        const readLiteralText = (segment, addNewline = false) => {
+            const literalRegex = /["']((?:\\.|[^"'\\])*)["']/g;
+            let match;
+            let text = '';
+            while ((match = literalRegex.exec(segment)) !== null) {
+                text += decodeConsoleLiteral(match[1]);
+            }
+            if (addNewline && text && !text.endsWith('\n')) text += '\n';
+            return text;
+        };
+        const collect = (regex, addNewline = false) => {
+            let match;
+            while ((match = regex.exec(before)) !== null) {
+                statements.push({
+                    index: match.index,
+                    text: readLiteralText(match[1], addNewline)
+                });
+            }
+        };
+
+        [
+            /printf\s*\(([^;]*)\)\s*;/g,
+            /System\.out\.print\s*\(([^;]*)\)\s*;/g,
+            /Console\.Write\s*\(([^;]*)\)\s*;/g,
+            /echo\s+([^;]*);/g
+        ].forEach(regex => collect(regex, false));
+
+        [
+            /System\.out\.println\s*\(([^;]*)\)\s*;/g,
+            /Console\.WriteLine\s*\(([^;]*)\)\s*;/g
+        ].forEach(regex => collect(regex, true));
+
+        let coutMatch;
+        const coutRegex = /cout\s*<<([^;]*);/g;
+        while ((coutMatch = coutRegex.exec(before)) !== null) {
+            statements.push({
+                index: coutMatch.index,
+                text: readLiteralText(coutMatch[1], /\bendl\b/.test(coutMatch[1]))
+            });
+        }
+
+        let output = statements
+            .sort((a, b) => a.index - b.index)
+            .map(item => item.text)
+            .join('');
+        const prompt = cleanInputPrompt(promptToExclude, '');
+        if (prompt) {
+            const escaped = prompt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            output = output.replace(new RegExp(`${escaped}\\s*$`, 'i'), '');
+        }
+        return output.trimEnd();
+    }
+
     function lastPromptBefore(code, index, language, fallback) {
         const before = code.slice(Math.max(0, index - 350), index);
         const promptPatterns = [
@@ -5353,7 +6640,8 @@ endif;
             while ((match = regex.exec(code)) !== null) {
                 groups.push({
                     count: countScanfSpecifiers(match[1]),
-                    prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}`)
+                    prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}`),
+                    index: match.index
                 });
             }
         } else if (lang === 'cpp') {
@@ -5362,7 +6650,8 @@ endif;
             while ((match = regex.exec(code)) !== null) {
                 groups.push({
                     count: (match[1].match(/>>/g) || []).length,
-                    prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}`)
+                    prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}`),
+                    index: match.index
                 });
             }
         } else if (lang === 'java') {
@@ -5371,7 +6660,8 @@ endif;
             while ((match = regex.exec(code)) !== null) {
                 groups.push({
                     count: 1,
-                    prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}`)
+                    prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}`),
+                    index: match.index
                 });
             }
         } else if (lang === 'python' || lang === 'py') {
@@ -5380,7 +6670,8 @@ endif;
             while ((match = regex.exec(code)) !== null) {
                 groups.push({
                     count: 1,
-                    prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}`)
+                    prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}`),
+                    index: match.index
                 });
             }
         } else if (lang === 'php') {
@@ -5389,7 +6680,8 @@ endif;
             while ((match = regex.exec(code)) !== null) {
                 groups.push({
                     count: 1,
-                    prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}`)
+                    prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}`),
+                    index: match.index
                 });
             }
         } else if (['csharp', 'cs', 'vbnet', 'vb'].includes(lang)) {
@@ -5398,26 +6690,32 @@ endif;
             while ((match = regex.exec(code)) !== null) {
                 groups.push({
                     count: 1,
-                    prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}`)
+                    prompt: lastPromptBefore(code, match.index, lang, `Input ${groups.length + 1}`),
+                    index: match.index
                 });
             }
         }
 
         const total = groups.reduce((sum, group) => sum + group.count, 0);
         const combined = groups.length === 1 && groups[0].count > 1;
+        const firstPrompt = groups.length ? groups[0].prompt : '';
         return {
             needsInput: total > 0,
             combined,
             groups,
-            total
+            total,
+            introOutput: extractPrintedTextBeforeInput(code, lang, firstPrompt)
         };
     }
 
     function formatConsoleOutput(output) {
         return String(output || '')
             .replace(/\r\n/g, '\n')
-            .replace(/:\s+(?=(Enter|After|Before|First|Second|Result|Output|Sum|Difference|Product|Quotient)\b)/g, ':\n')
             .trimEnd();
+    }
+
+    function isMissingProgramInputError(message) {
+        return /NoSuchElementException|EOFError|EOF when reading|end of file|InputMismatchException|scanf|stdin|ReadLine/i.test(String(message || ''));
     }
 
     function inputPromptsFromPlan(plan) {
@@ -5456,7 +6754,7 @@ endif;
         return new Promise(resolve => {
             const prompts = inputPromptsFromPlan(plan);
             const values = [];
-            let transcript = 'run:\n';
+            let transcript = plan.introOutput ? `${plan.introOutput}\n` : '';
             let index = 0;
 
             const askNext = () => {
@@ -5515,11 +6813,23 @@ endif;
             formatted = `${transcript}\n${formatted}`.trimEnd();
         }
 
-        if (success && formatted && !/Code Execution Successful/i.test(formatted)) {
-            formatted += '\n\n=== Code Execution Successful ===';
-        }
+        return formatted || (success ? 'Program finished successfully with no output.' : '');
+    }
 
-        return formatted || (success ? 'Program finished successfully with no output.\n\n=== Code Execution Successful ===' : '');
+    async function postCompilerFormData(formData, timeoutMs = 30000) {
+        const liveFramesPaused = pauseLiveFrameUploadForCompiler();
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            return await fetch(CODE_EXECUTOR_URL, {
+                method: 'POST',
+                body: formData,
+                signal: controller.signal
+            });
+        } finally {
+            clearTimeout(timer);
+            resumeLiveFrameUploadAfterCompiler(liveFramesPaused);
+        }
     }
 
     async function preflightCodeSyntax(code, language) {
@@ -5534,10 +6844,7 @@ endif;
             active: file === openFiles[activeFileIndex]
         }))));
 
-        const response = await fetch(CODE_EXECUTOR_URL, {
-            method: 'POST',
-            body: formData
-        });
+        const response = await postCompilerFormData(formData, 20000);
         const text = await response.text();
         try {
             return JSON.parse(text);
@@ -5621,10 +6928,7 @@ endif;
                 active: file === openFiles[activeFileIndex]
             }))));
 
-            const response = await fetch(CODE_EXECUTOR_URL, {
-                method: 'POST',
-                body: formData
-            });
+            const response = await postCompilerFormData(formData, 35000);
             const text = await response.text();
             let result;
             try {
@@ -5636,9 +6940,35 @@ endif;
                 };
             }
 
+            if (result.error && isMissingProgramInputError(result.error) && codeLikelyNeedsInput(code, language) && !programInput) {
+                showToast('Program needs keyboard input', 'info');
+                programInput = await collectProgramInputInConsole(code, language);
+                if (programInput) {
+                    formData.set('input', programInput);
+                    if (consoleOutput) consoleOutput.textContent = 'Running...\n';
+                    const retryResponse = await postCompilerFormData(formData, 35000);
+                    const retryText = await retryResponse.text();
+                    try {
+                        result = JSON.parse(retryText);
+                    } catch (parseError) {
+                        result = {
+                            success: false,
+                            error: `Compiler endpoint returned an invalid response:\n${retryText.slice(0, 1000)}`
+                        };
+                    }
+                }
+            }
+
             if (result.error) {
                 switchOutputTab('console');
-                if (consoleOutput) consoleOutput.textContent = `Error:\n${result.error}`;
+                const partialOutput = result.output
+                    ? formatConsoleOutputWithInputEcho(result.output, programInput, code, language, false)
+                    : '';
+                if (consoleOutput) {
+                    consoleOutput.textContent = partialOutput
+                        ? `${partialOutput}\n\nError:\n${result.error}`
+                        : `Error:\n${result.error}`;
+                }
                 showToast('Execution failed', 'error');
                 return;
             }
@@ -5661,7 +6991,10 @@ endif;
             showToast('Code executed', 'success');
         } catch (error) {
             switchOutputTab('console');
-            if (consoleOutput) consoleOutput.textContent = `Connection error: ${error.message}`;
+            const message = error.name === 'AbortError'
+                ? 'The compiler took too long to respond. Check that your program is not waiting for more input or stuck in a loop, then run again.'
+                : `Connection error: ${error.message}`;
+            if (consoleOutput) consoleOutput.textContent = message;
             showToast('Connection error', 'error');
         }
     }
@@ -5684,17 +7017,25 @@ endif;
         let passedCount = 0;
         let totalMarks = 0;
         let earnedMarks = 0;
+        const staticTestLanguage = /html|css|javascript|js|sql/i.test(String(language || ''));
 
         for (let i = 0; i < visibleTestCases.length; i++) {
             const tc = visibleTestCases[i];
+            const expected = String(tc.expected || tc.expectedOutput || '').trim();
             consoleOutput.textContent += `\nTest Case ${i + 1}: Input: ${tc.input || '(none)'}\n`;
-            consoleOutput.textContent += `Expected: ${tc.expected}\n`;
+            consoleOutput.textContent += `Expected: ${expected}\n`;
 
             try {
                 // Execute code with input
                 let result;
 
-                if (tc.input) {
+                if (staticTestLanguage) {
+                    const passed = expected === '' || code.toLowerCase().includes(expected.toLowerCase());
+                    result = {
+                        success: passed,
+                        output: passed ? 'Static requirement found in code.' : 'Static requirement not found in code.'
+                    };
+                } else if (tc.input) {
                     // For languages that support stdin
                     result = await executeCodeWithInput(code, language, tc.input);
                 } else {
@@ -5702,19 +7043,15 @@ endif;
                     formData.append('action', 'execute_code');
                     formData.append('code', code);
                     formData.append('language', language);
-                    const response = await fetch(CODE_EXECUTOR_URL, {
-                        method: 'POST',
-                        body: formData
-                    });
+                    const response = await postCompilerFormData(formData, 35000);
                     result = await response.json();
                 }
 
                 const output = (result.output || '').trim();
-                const expected = (tc.expected || '').trim();
 
                 consoleOutput.textContent += `Got: ${output}\n`;
 
-                if (output === expected) {
+                if (staticTestLanguage ? result.success : output === expected) {
                     consoleOutput.textContent += `✅ PASSED\n`;
                     passedCount++;
                     earnedMarks += (tc.marks || 0);
@@ -5759,10 +7096,7 @@ endif;
             active: file === openFiles[activeFileIndex]
         }))));
 
-        const response = await fetch(CODE_EXECUTOR_URL, {
-            method: 'POST',
-            body: formData
-        });
+        const response = await postCompilerFormData(formData, 35000);
 
         const text = await response.text();
         try {
@@ -6136,8 +7470,13 @@ endif;
                 }
                 if (timerInterval) clearInterval(timerInterval);
 
-                showMessageBox("Exam submitted successfully!");
-                window.location.href = 'student_dashboard.php';
+                const scoreText = Number.isFinite(Number(result.auto_score)) && Number.isFinite(Number(result.percentage))
+                    ? ` Auto grading completed: ${Number(result.auto_score).toFixed(0)} marks (${Number(result.percentage).toFixed(0)}%).`
+                    : ' Auto grading completed and saved for lecturer review.';
+                showMessageBox("Exam submitted successfully!" + scoreText);
+                setTimeout(() => {
+                    window.location.href = 'student_dashboard.php';
+                }, 1800);
             } else {
                 showMessageBox("Submission failed: " + (result.error || "Unknown error"));
                 document.querySelectorAll('button').forEach(btn => btn.disabled = false);

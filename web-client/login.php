@@ -13,14 +13,222 @@ require_once __DIR__ . '/../backend-php/config/auth.php';
 $error = '';
 $success = '';
 
+function qodaLoginClientIp(): string
+{
+    foreach (['HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 'REMOTE_ADDR'] as $key) {
+        $value = $_SERVER[$key] ?? '';
+        if ($value) {
+            return trim(explode(',', $value)[0]);
+        }
+    }
+    return '';
+}
+
+function qodaLoginDetectOs(string $userAgent): string
+{
+    $checks = [
+        'Windows' => 'Windows',
+        'Mac OS' => 'Mac',
+        'Android' => 'Android',
+        'iPhone' => 'iOS',
+        'iPad' => 'iPadOS',
+        'Linux' => 'Linux',
+    ];
+    foreach ($checks as $needle => $label) {
+        if (stripos($userAgent, $needle) !== false) {
+            return $label;
+        }
+    }
+    return 'Unknown';
+}
+
+function qodaEnsureStudentSessionTables(PDO $db): void
+{
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS student_active_sessions (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            student_id INT NOT NULL,
+            student_identifier VARCHAR(100) NULL,
+            session_id VARCHAR(191) NOT NULL,
+            device_id VARCHAR(191) NOT NULL,
+            browser_fingerprint CHAR(64) NOT NULL,
+            operating_system VARCHAR(80) NULL,
+            ip_address VARCHAR(64) NULL,
+            user_agent TEXT NULL,
+            login_at DATETIME NOT NULL,
+            last_seen DATETIME NOT NULL,
+            expires_at DATETIME NULL,
+            active TINYINT(1) NOT NULL DEFAULT 1,
+            released_at DATETIME NULL,
+            release_reason VARCHAR(80) NULL,
+            locked_exam_id INT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_student_active (student_id, active, last_seen),
+            INDEX idx_session_id (session_id),
+            INDEX idx_device_id (device_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS student_session_events (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            student_id INT NULL,
+            student_identifier VARCHAR(100) NULL,
+            event_type VARCHAR(80) NOT NULL,
+            device_id VARCHAR(191) NULL,
+            browser_fingerprint CHAR(64) NULL,
+            operating_system VARCHAR(80) NULL,
+            ip_address VARCHAR(64) NULL,
+            user_agent TEXT NULL,
+            details TEXT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_student_events (student_id, created_at),
+            INDEX idx_event_type (event_type, created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+}
+
+function qodaCurrentDeviceId(): string
+{
+    $deviceId = $_COOKIE['qoda_device_id'] ?? '';
+    if (!preg_match('/^[A-Za-z0-9_\-]{20,80}$/', $deviceId)) {
+        $deviceId = bin2hex(random_bytes(24));
+        setcookie('qoda_device_id', $deviceId, [
+            'expires' => time() + (86400 * 365),
+            'path' => '/',
+            'httponly' => true,
+            'samesite' => 'Lax',
+            'secure' => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
+        ]);
+    }
+    return $deviceId;
+}
+
+function qodaStudentSessionContext(): array
+{
+    $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
+    $deviceId = qodaCurrentDeviceId();
+    $browserFingerprint = hash('sha256', implode('|', [
+        $deviceId,
+        $userAgent,
+        $_SERVER['HTTP_ACCEPT_LANGUAGE'] ?? '',
+        $_SERVER['HTTP_SEC_CH_UA'] ?? '',
+        $_SERVER['HTTP_SEC_CH_UA_PLATFORM'] ?? '',
+    ]));
+    return [
+        'device_id' => $deviceId,
+        'browser_fingerprint' => $browserFingerprint,
+        'operating_system' => qodaLoginDetectOs($userAgent),
+        'ip_address' => qodaLoginClientIp(),
+        'user_agent' => $userAgent,
+    ];
+}
+
+function qodaRecordStudentSessionEvent(PDO $db, array $user, string $eventType, array $context, string $details = ''): void
+{
+    try {
+        $stmt = $db->prepare("
+            INSERT INTO student_session_events
+                (student_id, student_identifier, event_type, device_id, browser_fingerprint, operating_system, ip_address, user_agent, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ");
+        $stmt->execute([
+            (int)($user['id'] ?? 0),
+            (string)($user['user_id'] ?? ''),
+            $eventType,
+            $context['device_id'] ?? '',
+            $context['browser_fingerprint'] ?? '',
+            $context['operating_system'] ?? '',
+            $context['ip_address'] ?? '',
+            $context['user_agent'] ?? '',
+            $details,
+        ]);
+    } catch (Throwable $eventError) {
+        error_log('Student session event failed: ' . $eventError->getMessage());
+    }
+}
+
+function qodaPrepareStudentLoginSession(PDO $db, array $user): array
+{
+    $context = qodaStudentSessionContext();
+    try {
+        qodaEnsureStudentSessionTables($db);
+    } catch (Throwable $setupError) {
+        error_log('Student single-session setup unavailable during login: ' . $setupError->getMessage());
+        session_regenerate_id(true);
+        return $context + [
+            'session_id' => session_id(),
+            'single_session_degraded' => true,
+        ];
+    }
+    $studentDbId = (int)($user['id'] ?? 0);
+    $studentIdentifier = (string)($user['user_id'] ?? '');
+
+    try {
+        $activeStmt = $db->prepare("
+        SELECT *
+        FROM student_active_sessions
+        WHERE student_id = ?
+          AND active = 1
+          AND (expires_at IS NULL OR expires_at > NOW())
+          AND last_seen > (NOW() - INTERVAL 12 HOUR)
+        ORDER BY last_seen DESC
+        LIMIT 1
+    ");
+        $activeStmt->execute([$studentDbId]);
+        $active = $activeStmt->fetch(PDO::FETCH_ASSOC);
+        if ($active) {
+            $releaseReason = (($active['device_id'] ?? '') !== $context['device_id'])
+                ? 'replaced_by_new_login'
+                : 'same_device_relogin';
+            $db->prepare("
+            UPDATE student_active_sessions
+            SET active = 0, released_at = NOW(), release_reason = ?
+            WHERE id = ?
+            ")->execute([$releaseReason, (int)$active['id']]);
+            qodaRecordStudentSessionEvent($db, $user, 'active_session_replaced', $context, 'Previous active session was released by a new login.');
+        }
+
+        session_regenerate_id(true);
+        $sessionId = session_id();
+        $insert = $db->prepare("
+        INSERT INTO student_active_sessions
+            (student_id, student_identifier, session_id, device_id, browser_fingerprint, operating_system, ip_address, user_agent, login_at, last_seen, expires_at, active)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW(), DATE_ADD(NOW(), INTERVAL 12 HOUR), 1)
+        ");
+        $insert->execute([
+            $studentDbId,
+            $studentIdentifier,
+            $sessionId,
+            $context['device_id'],
+            $context['browser_fingerprint'],
+            $context['operating_system'],
+            $context['ip_address'],
+            $context['user_agent'],
+        ]);
+        qodaRecordStudentSessionEvent($db, $user, 'login_success', $context, 'Student session activated.');
+
+        return $context + ['session_id' => $sessionId];
+    } catch (RuntimeException $blockLogin) {
+        throw $blockLogin;
+    } catch (Throwable $sessionError) {
+        error_log('Student single-session activation unavailable during login: ' . $sessionError->getMessage());
+        session_regenerate_id(true);
+        return $context + [
+            'session_id' => session_id(),
+            'single_session_degraded' => true,
+        ];
+    }
+}
+
 // Check if user is already logged in via session
 if (isLoggedIn()) {
     $role = $_SESSION['user_role'];
     if ($role === 'STUDENT') {
-        header('Location: student_dashboard.php');
+        header('Location: student_home.php');
         exit;
     } elseif ($role === 'LECTURER') {
-        header('Location: lecturer_dashboard.php');
+        header('Location: lecturer_home.php');
         exit;
     } elseif ($role === 'ADMIN') {
         session_unset();
@@ -69,7 +277,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'password' => $student['password'],
                         'email' => $student['email'],
                         'full_name' => $student['full_name'],
-                        'role' => 'STUDENT'
+                        'role' => 'STUDENT',
+                        'status' => $student['status'] ?? 'Active'
                     ];
                 }
             }
@@ -77,12 +286,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($user && password_verify($password, $user['password'])) {
                 if ($user['role'] === 'ADMIN') {
                     $error = 'Admin login has been disabled. Please use a lecturer account.';
+                } elseif (in_array(strtolower((string)($user['status'] ?? 'active')), ['deleted', 'inactive', 'disabled'], true)) {
+                    $error = 'This account is not active. Please contact support.';
                 } else {
+                $studentSessionContext = null;
+                if ($user['role'] === 'STUDENT') {
+                    $studentSessionContext = qodaPrepareStudentLoginSession($db, $user);
+                }
                 // Set SESSION variables
                 $_SESSION['user_id'] = $user['id'];
                 $_SESSION['user_role'] = $user['role'];
                 $_SESSION['user_id_value'] = $user['user_id'] ?? $userId;
                 $_SESSION['fullName'] = $user['full_name'] ?? '';
+                if ($studentSessionContext) {
+                    $_SESSION['qoda_device_id'] = $studentSessionContext['device_id'];
+                    $_SESSION['qoda_browser_fingerprint'] = $studentSessionContext['browser_fingerprint'];
+                    $_SESSION['qoda_session_bound_at'] = date('Y-m-d H:i:s');
+                }
                 
                 // Generate JWT token if JwtHandler exists
                 if (class_exists('JwtHandler')) {
@@ -105,9 +325,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 
                 // Redirect based on role
                 if ($user['role'] === 'STUDENT') {
-                    header('Location: student_dashboard.php');
+                    header('Location: student_home.php');
                 } elseif ($user['role'] === 'LECTURER') {
-                    header('Location: lecturer_dashboard.php');
+                    header('Location: lecturer_home.php');
                 } else {
                     $error = 'Unknown user role';
                 }
@@ -119,7 +339,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $error = 'Invalid User ID or Password';
             }
         } catch (Exception $e) {
-            $error = 'Database error: ' . $e->getMessage();
+            $message = $e->getMessage();
+            if (str_contains($message, 'currently active on another device')) {
+                $error = $message;
+            } else {
+                $error = 'Database error: ' . $message;
+            }
         }
     }
 }
@@ -132,6 +357,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Qoda - Log In</title>
+    <link rel="icon" type="image/png" href="../assets/qoda-logo.png" />
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" />
     <style>
     * {
@@ -175,47 +401,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         margin: 0 auto 22px;
         display: grid;
         place-items: center;
-        border: 5px solid rgba(255, 255, 255, .95);
+        border: 1px solid rgba(255, 255, 255, .32);
         border-radius: 50%;
-        color: #fff;
-        font-size: 48px;
-        font-weight: 900;
+        overflow: hidden;
         position: relative;
-        background: linear-gradient(145deg, rgba(255,255,255,.22), rgba(37,99,235,.18) 48%, rgba(2,6,23,.18));
+        background: rgba(15,23,42,.52);
         box-shadow:
             inset 8px 8px 18px rgba(255,255,255,.2),
             inset -12px -14px 24px rgba(0,0,0,.28),
             0 20px 45px rgba(0, 0, 0, .36);
         transform-style: preserve-3d;
         animation: qLogoFloat 2.8s ease-in-out infinite;
-        text-shadow:
-            0 1px 0 #dbeafe,
-            0 2px 0 #93c5fd,
-            0 4px 0 #2563eb,
-            0 12px 18px rgba(0,0,0,.45);
     }
 
     .qoda-loader-logo::after {
-        content: "";
-        position: absolute;
-        width: 22px;
-        height: 5px;
-        right: 10px;
-        bottom: 13px;
-        background: #fff;
-        border-radius: 999px;
-        transform: rotate(45deg);
-        box-shadow: 0 3px 0 #93c5fd, 0 10px 18px rgba(0,0,0,.35);
+        content: none;
     }
 
     .qoda-loader-logo::before {
-        content: "";
-        position: absolute;
-        inset: 8px;
-        border-radius: 50%;
-        background: radial-gradient(circle at 30% 25%, rgba(255,255,255,.55), rgba(255,255,255,.08) 34%, transparent 55%);
-        transform: translateZ(8px);
-        pointer-events: none;
+        content: none;
+    }
+
+    .qoda-loader-logo img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
     }
 
     .qoda-loader-word {
@@ -416,22 +627,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     .password-wrapper {
         position: relative;
+        display: flex;
+        align-items: center;
+    }
+
+    .password-wrapper .input-field {
+        padding-right: 58px;
     }
 
     .toggle-btn {
         position: absolute;
-        right: 16px;
+        right: 12px;
         top: 50%;
         transform: translateY(-50%);
-        background: none;
-        border: none;
+        width: 38px;
+        height: 38px;
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.12);
+        border: 1px solid rgba(255, 255, 255, 0.22);
         cursor: pointer;
-        color: rgba(255, 255, 255, 0.5);
+        color: rgba(255, 255, 255, 0.9);
         font-size: 18px;
         transition: color 0.2s;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 2;
     }
 
     .toggle-btn:hover {
+        background: rgba(66, 165, 245, 0.16);
         color: #42A5F5;
     }
 
@@ -502,18 +727,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 </head>
 
 <body>
-    <div class="qoda-loader" id="qodaLoader" aria-hidden="true">
-        <div class="qoda-loader-content">
-            <div class="qoda-loader-logo">Q</div>
-            <div class="qoda-loader-word" aria-label="Qoda PU">
-                <span style="--i:0">Q</span><span style="--i:1">o</span><span style="--i:2">d</span><span style="--i:3">a</span>
-                <span style="--i:4">&nbsp;</span><span style="--i:5">P</span><span style="--i:6">U</span>
-            </div>
-            <div class="qoda-loader-copy">Preparing your secure examination portal</div>
-            <div class="qoda-loader-bar"></div>
-        </div>
-    </div>
-
     <div class="background">
         <div class="gradient-bg"></div>
         <div class="glow-effect"></div>
@@ -554,7 +767,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     <div class="password-wrapper">
                         <input type="password" class="input-field" id="password" name="password" placeholder="Password"
                             required />
-                        <button type="button" class="toggle-btn" onclick="togglePassword()">
+                        <button type="button" class="toggle-btn" onclick="togglePassword()" aria-label="Show password" title="Show password">
                             <i class="far fa-eye-slash" id="toggleIcon"></i>
                         </button>
                     </div>
@@ -571,36 +784,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     </div>
 
     <script>
-    window.addEventListener('load', function() {
-        setTimeout(function() {
-            const loader = document.getElementById('qodaLoader');
-            if (loader) loader.classList.add('hide');
-        }, 10000);
-    });
-
     function togglePassword() {
         const passwordField = document.getElementById('password');
         const icon = document.getElementById('toggleIcon');
+        const button = icon ? icon.closest('.toggle-btn') : null;
 
         if (passwordField.type === 'password') {
             passwordField.type = 'text';
             icon.classList.remove('fa-eye-slash');
             icon.classList.add('fa-eye');
+            if (button) {
+                button.setAttribute('aria-label', 'Hide password');
+                button.setAttribute('title', 'Hide password');
+            }
         } else {
             passwordField.type = 'password';
             icon.classList.remove('fa-eye');
             icon.classList.add('fa-eye-slash');
+            if (button) {
+                button.setAttribute('aria-label', 'Show password');
+                button.setAttribute('title', 'Show password');
+            }
         }
-    }
-
-    // When user types in User ID, same text appears in Password field
-    const userIdInput = document.getElementById('userId');
-    const passwordInput = document.getElementById('password');
-
-    if (userIdInput && passwordInput) {
-        userIdInput.addEventListener('input', function() {
-            passwordInput.value = this.value;
-        });
     }
 
     // Form submission handling

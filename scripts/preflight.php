@@ -47,12 +47,38 @@ foreach (['users', 'students', 'exams', 'exam_submissions'] as $table) {
     }
 }
 
+$isProductionLike = getenv('RAILWAY_ENVIRONMENT') || getenv('RAILWAY_ENVIRONMENT_ID') || getenv('QODA_ENV') === 'production';
+foreach (['JWT_SECRET', 'QODA_APP_SECRET', 'QODA_SOCKET_SECRET'] as $secretName) {
+    $configured = trim((string)getenv($secretName)) !== '';
+    add_check(
+        $checks,
+        "Secret {$secretName}",
+        $isProductionLike ? $configured : true,
+        $configured ? 'Configured' : ($isProductionLike ? 'Missing in production' : 'Optional for local development')
+    );
+}
+
 foreach (['runtime/code-execution', 'uploads', 'web-client/uploads'] as $dir) {
     $path = __DIR__ . '/../' . $dir;
     if (!is_dir($path)) {
         @mkdir($path, 0775, true);
     }
     add_check($checks, "Writable {$dir}", is_dir($path) && is_writable($path));
+}
+
+$largeFiles = [
+    'web-client/lecturer_dashboard.php' => 900000,
+    'web-client/exam_interface.php' => 300000,
+];
+foreach ($largeFiles as $file => $warningSize) {
+    $path = __DIR__ . '/../' . $file;
+    $size = is_file($path) ? filesize($path) : 0;
+    add_check(
+        $checks,
+        "Maintainability {$file}",
+        $size > 0,
+        $size > $warningSize ? 'Large file: plan modularization (' . number_format($size) . ' bytes)' : number_format($size) . ' bytes'
+    );
 }
 
 $executables = [

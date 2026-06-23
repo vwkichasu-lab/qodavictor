@@ -8,6 +8,7 @@ RUN apt-get update \
         g++ \
         gcc \
         gnupg \
+        libcurl4-openssl-dev \
         libsqlite3-dev \
         nodejs \
         npm \
@@ -24,12 +25,14 @@ RUN apt-get update \
         > /etc/apt/sources.list.d/microsoft-prod.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends dotnet-sdk-8.0 \
-    && docker-php-ext-install pdo_mysql mysqli pdo_sqlite \
+    && docker-php-ext-install curl pdo_mysql mysqli pdo_sqlite \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /var/www/html
 
 COPY . /var/www/html/
+
+RUN npm install --omit=dev
 
 RUN mkdir -p runtime/code-execution uploads web-client/uploads \
     && chown -R www-data:www-data runtime uploads web-client/uploads \
@@ -37,4 +40,4 @@ RUN mkdir -p runtime/code-execution uploads web-client/uploads \
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "php -S 0.0.0.0:${PORT:-8080} -t /var/www/html /var/www/html/server_router.php"]
+CMD ["sh", "-c", "php /var/www/html/scripts/migrate.php || true; npm start"]

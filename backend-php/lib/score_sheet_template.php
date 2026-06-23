@@ -101,6 +101,7 @@ if (!function_exists('qodaScoreSheetGradeRemark')) {
 <head>
     <meta charset="utf-8">
     <title>{$courseCode} Score Sheet</title>
+    <link rel="icon" type="image/png" href="/assets/qoda-logo.png">
     <style>
         @page { size: A4 landscape; margin: 9mm; }
         body { font-family: Arial, Helvetica, sans-serif; color: #000; background: #fff; margin: 0; }

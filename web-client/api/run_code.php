@@ -16,6 +16,8 @@ $code = (string)($input['code'] ?? '');
 $language = (string)($input['language'] ?? 'java');
 $files = $input['files'] ?? [];
 $programInput = (string)($input['input'] ?? '');
+$useInferredInput = !empty($input['use_inferred_input']);
+$checkOnly = !empty($input['check_only']);
 $questionText = (string)($input['question_text'] ?? '');
 $testCases = $input['test_cases'] ?? [];
 if (is_string($testCases)) {
@@ -24,16 +26,34 @@ if (is_string($testCases)) {
 }
 
 try {
+    if ($checkOnly) {
+        $run = checkQodaCodeSyntax($code, $language, is_array($files) ? $files : []);
+        echo json_encode([
+            'success' => !empty($run['success']),
+            'output' => $run['output'] ?? '',
+            'error' => $run['error'] ?? '',
+            'execution_time_ms' => $run['execution_time_ms'] ?? null,
+            'memory' => 'N/A',
+        ]);
+        exit;
+    }
+
     if (is_array($testCases) && count($testCases) > 0) {
         $results = [];
         $combinedOutput = '';
+        $staticTestLanguage = qodaShouldUseStaticTestMatching($code, $language);
         foreach (array_values($testCases) as $idx => $tc) {
             $caseInput = (string)($tc['input'] ?? '');
-            $expected = (string)($tc['expected'] ?? '');
-            $run = executeQodaCode($code, $language, $caseInput, is_array($files) ? $files : []);
+            $expected = (string)($tc['expected'] ?? $tc['expectedOutput'] ?? '');
+            if ($staticTestLanguage) {
+                $passed = qodaStaticTestMatches($code, $expected, (string)($tc['comparisonMode'] ?? 'contains'));
+                $run = ['success' => true, 'output' => $passed ? 'Static requirement found in code.' : 'Static requirement not found in code.', 'error' => '', 'execution_time_ms' => 0];
+            } else {
+                $run = executeQodaCode($code, $language, $caseInput, is_array($files) ? $files : []);
+                $passed = !empty($run['success']) && qodaOutputsMatch((string)($run['output'] ?? ''), $expected, isset($tc['tolerance']) ? (float)$tc['tolerance'] : null);
+            }
             $actual = (string)($run['output'] ?? '');
             $error = (string)($run['error'] ?? '');
-            $passed = !empty($run['success']) && qodaOutputsMatch($actual, $expected, isset($tc['tolerance']) ? (float)$tc['tolerance'] : null);
             $results[] = [
                 'test_case' => $idx + 1,
                 'passed' => $passed,
@@ -59,12 +79,14 @@ try {
     }
 
     $generatedInput = '';
-    if ($programInput === '') {
+    if ($programInput === '' && $useInferredInput) {
         $generatedInput = qodaInferSampleInput($code, $language, $questionText);
         $programInput = $generatedInput;
     }
 
-    $run = executeQodaCode($code, $language, $programInput, is_array($files) ? $files : []);
+    $run = qodaShouldUseStaticTestMatching($code, $language)
+        ? ['success' => true, 'output' => 'Model solution is available for browser/static review.', 'error' => '', 'execution_time_ms' => 0]
+        : executeQodaCode($code, $language, $programInput, is_array($files) ? $files : []);
     echo json_encode([
         'success' => !empty($run['success']),
         'output' => $run['output'] ?? '',

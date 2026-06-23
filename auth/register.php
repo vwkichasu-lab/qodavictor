@@ -6,6 +6,7 @@ if (session_status() === PHP_SESSION_NONE) {
 }
 
 $error = '';
+$registeredStaffId = '';
 
 function register_base_url(string $path = ''): string
 {
@@ -15,72 +16,173 @@ function register_base_url(string $path = ''): string
     return $root . ltrim($path, '/');
 }
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $staffId = trim($_POST['staff_id'] ?? '');
+function registerEnsureColumn(PDO $pdo, string $table, string $column, string $definition): void
+{
+    $stmt = $pdo->prepare("
+        SELECT COUNT(*)
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
+    ");
+    $stmt->execute([$table, $column]);
+    if ((int)$stmt->fetchColumn() === 0) {
+        $pdo->exec("ALTER TABLE `$table` ADD COLUMN `$column` $definition");
+    }
+}
+
+function registerEnsureTables(PDO $pdo): void
+{
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id VARCHAR(100) NULL,
+            userId VARCHAR(100) NULL,
+            username VARCHAR(120) NULL,
+            staff_id VARCHAR(100) NULL,
+            title VARCHAR(50) NULL,
+            full_name VARCHAR(255) NULL,
+            fullName VARCHAR(255) NULL,
+            name VARCHAR(255) NULL,
+            email VARCHAR(255) NULL,
+            password VARCHAR(255) NOT NULL,
+            role VARCHAR(30) NOT NULL DEFAULT 'LECTURER',
+            status VARCHAR(30) NOT NULL DEFAULT 'Active',
+            department VARCHAR(255) NULL,
+            profile_pic MEDIUMTEXT NULL,
+            created_at DATETIME NULL,
+            createdAt DATETIME NULL,
+            updated_at DATETIME NULL,
+            deleted_at DATETIME NULL,
+            UNIQUE KEY uq_users_email (email),
+            INDEX idx_users_role_status (role, status)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ROW_FORMAT=DYNAMIC
+    ");
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS lecturers (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            userId INT NOT NULL,
+            lecturerId VARCHAR(100) NOT NULL,
+            department VARCHAR(255) NULL,
+            title VARCHAR(50) NULL,
+            createdAt DATETIME NULL,
+            updatedAt DATETIME NULL,
+            UNIQUE KEY uq_lecturers_user (userId)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+
+    foreach ([
+        'username' => 'VARCHAR(120) NULL',
+        'staff_id' => 'VARCHAR(100) NULL',
+        'title' => 'VARCHAR(50) NULL',
+        'deleted_at' => 'DATETIME NULL',
+        'profile_pic' => 'MEDIUMTEXT NULL',
+    ] as $column => $definition) {
+        try {
+            registerEnsureColumn($pdo, 'users', $column, $definition);
+        } catch (Throwable $ignored) {
+        }
+    }
+}
+
+function departmentAbbreviation(string $department): string
+{
+    $parts = preg_split('/\s+/', strtoupper(trim($department)), -1, PREG_SPLIT_NO_EMPTY);
+    if (!$parts) {
+        return 'GEN';
+    }
+    if (count($parts) === 1) {
+        return preg_replace('/[^A-Z0-9]/', '', substr($parts[0], 0, 4)) ?: 'GEN';
+    }
+    $abbr = '';
+    foreach ($parts as $part) {
+        $abbr .= $part[0] ?? '';
+    }
+    return preg_replace('/[^A-Z0-9]/', '', substr($abbr, 0, 5)) ?: 'GEN';
+}
+
+function generateLecturerStaffId(PDO $pdo, string $department): string
+{
+    $prefix = 'PULC/' . departmentAbbreviation($department) . '/';
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM users WHERE role = 'LECTURER' OR staff_id LIKE ?");
+    $stmt->execute([$prefix . '%']);
+    $next = max(1, (int)$stmt->fetchColumn() + 1);
+
+    do {
+        $staffId = $prefix . str_pad((string)$next, 5, '0', STR_PAD_LEFT);
+        $check = $pdo->prepare("SELECT id FROM users WHERE staff_id = ? OR user_id = ? OR userId = ? LIMIT 1");
+        $check->execute([$staffId, $staffId, $staffId]);
+        $exists = (bool)$check->fetch();
+        $next++;
+    } while ($exists);
+
+    return $staffId;
+}
+
+try {
+    registerEnsureTables($pdo);
+} catch (Exception $schemaError) {
+    $error = 'Registration setup failed: ' . $schemaError->getMessage();
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
+    $username = trim($_POST['username'] ?? '');
     $name = trim($_POST['name'] ?? '');
     $email = trim($_POST['email'] ?? '');
     $department = trim($_POST['department'] ?? '');
-    $password = $_POST['password'] ?? '';
-    $role = strtoupper(trim($_POST['role'] ?? 'LECTURER'));
+    $title = trim($_POST['title'] ?? 'Mr.');
 
-    if ($role !== 'LECTURER') {
-        $error = 'Only lecturers can register. Students must log in with accounts created by a lecturer.';
-    } elseif ($staffId === '' || $name === '' || $email === '' || $password === '') {
+    if ($username === '' || $name === '' || $email === '' || $department === '') {
         $error = 'Please fill all required fields.';
-    } elseif (strlen($password) < 6) {
-        $error = 'Password must be at least 6 characters.';
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $error = 'Please enter a valid email address.';
     } else {
         try {
+            $staffId = generateLecturerStaffId($pdo, $department);
             $check = $pdo->prepare("
                 SELECT id
                 FROM users
-                WHERE user_id = ? OR userId = ? OR email = ? OR staff_id = ?
+                WHERE email = ? OR username = ? OR staff_id = ? OR user_id = ? OR userId = ?
                 LIMIT 1
             ");
-            $check->execute([$staffId, $staffId, $email, $staffId]);
+            $check->execute([$email, $username, $staffId, $staffId, $staffId]);
 
             if ($check->fetch()) {
                 $error = 'This lecturer account already exists.';
             } else {
                 $pdo->beginTransaction();
-
-                $hashedPassword = password_hash($password, PASSWORD_DEFAULT);
+                $hashedPassword = password_hash($staffId, PASSWORD_DEFAULT);
                 $stmt = $pdo->prepare("
                     INSERT INTO users
-                        (user_id, userId, full_name, fullName, name, email, password,
-                         role, status, staff_id, department, created_at, createdAt)
+                        (user_id, userId, username, staff_id, title, full_name, fullName, name, email, password,
+                         role, status, department, created_at, createdAt, updated_at)
                     VALUES
-                        (?, ?, ?, ?, ?, ?, ?, 'LECTURER', 'Active', ?, ?, NOW(), NOW())
+                        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'LECTURER', 'Active', ?, NOW(), NOW(), NOW())
                 ");
                 $stmt->execute([
                     $staffId,
                     $staffId,
+                    $username,
+                    $staffId,
+                    $title,
                     $name,
                     $name,
                     $name,
                     $email,
                     $hashedPassword,
-                    $staffId,
                     $department
                 ]);
 
                 $userId = (int)$pdo->lastInsertId();
-
                 $profile = $pdo->prepare("
                     INSERT INTO lecturers (userId, lecturerId, department, title, createdAt, updatedAt)
-                    VALUES (?, ?, ?, 'Lecturer', NOW(), NOW())
+                    VALUES (?, ?, ?, ?, NOW(), NOW())
+                    ON DUPLICATE KEY UPDATE department = VALUES(department), title = VALUES(title), updatedAt = NOW()
                 ");
-                $profile->execute([$userId, $staffId, $department]);
-
+                $profile->execute([$userId, $staffId, $department, $title]);
                 $pdo->commit();
 
-                $_SESSION['user_id'] = $userId;
-                $_SESSION['user_role'] = 'LECTURER';
-                $_SESSION['user_id_value'] = $staffId;
-                $_SESSION['fullName'] = $name;
-
-                header('Location: ' . register_base_url('web-client/lecturer_dashboard.php'));
-                exit;
+                $registeredStaffId = $staffId;
+                $_POST = [];
             }
         } catch (Exception $e) {
             if ($pdo->inTransaction()) {
@@ -97,171 +199,186 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Lecturer Registration - QODA</title>
-    <link rel="stylesheet" href="../assets/css/style.css">
+    <link rel="icon" type="image/png" href="../assets/qoda-logo.png">
     <style>
-        body { background: #f4f7fb; font-family: Arial, sans-serif; }
-        .qoda-loader {
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: Inter, Arial, sans-serif;
+            color: #0f172a;
+            background: #020617 url("../assets/qoda-landing.png") center / cover no-repeat fixed;
+        }
+        body::before {
+            content: "";
             position: fixed;
             inset: 0;
-            z-index: 9999;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: radial-gradient(circle at 30% 35%, #2563eb, #07111f 70%);
-            transition: opacity .35s ease, visibility .35s ease;
+            background: rgba(2, 6, 23, .58);
         }
-        .qoda-loader.hide { opacity: 0; visibility: hidden; }
-        .qoda-loader-content { text-align: center; color: #fff; padding: 32px; }
-        .qoda-loader-logo {
-            width: 86px;
-            height: 86px;
-            margin: 0 auto 22px;
+        .page {
+            position: relative;
+            z-index: 1;
+            min-height: 100vh;
             display: grid;
             place-items: center;
-            border: 5px solid rgba(255, 255, 255, .95);
-            border-radius: 50%;
-            color: #fff;
-            font-size: 48px;
-            font-weight: 900;
-            position: relative;
-            background: linear-gradient(145deg, rgba(255,255,255,.22), rgba(37,99,235,.18) 48%, rgba(2,6,23,.18));
-            box-shadow:
-                inset 8px 8px 18px rgba(255,255,255,.2),
-                inset -12px -14px 24px rgba(0,0,0,.28),
-                0 20px 45px rgba(0, 0, 0, .36);
-            transform-style: preserve-3d;
-            animation: qLogoFloat 2.8s ease-in-out infinite;
-            text-shadow:
-                0 1px 0 #dbeafe,
-                0 2px 0 #93c5fd,
-                0 4px 0 #2563eb,
-                0 12px 18px rgba(0,0,0,.45);
+            padding: 24px;
         }
-        .qoda-loader-logo::after {
-            content: "";
-            position: absolute;
-            width: 22px;
-            height: 5px;
-            right: 10px;
-            bottom: 13px;
-            background: #fff;
-            border-radius: 999px;
-            transform: rotate(45deg);
-            box-shadow: 0 3px 0 #93c5fd, 0 10px 18px rgba(0,0,0,.35);
+        .card {
+            width: min(760px, 100%);
+            border: 1px solid rgba(255,255,255,.5);
+            border-radius: 24px;
+            background: rgba(255,255,255,.92);
+            box-shadow: 0 24px 70px rgba(0,0,0,.34);
+            backdrop-filter: blur(16px);
+            padding: 28px;
         }
-        .qoda-loader-logo::before {
-            content: "";
-            position: absolute;
-            inset: 8px;
-            border-radius: 50%;
-            background: radial-gradient(circle at 30% 25%, rgba(255,255,255,.55), rgba(255,255,255,.08) 34%, transparent 55%);
-            transform: translateZ(8px);
-            pointer-events: none;
-        }
-        .qoda-loader-word {
+        .top {
             display: flex;
-            justify-content: center;
-            gap: 4px;
-            color: #fff;
-            font-size: 48px;
-            font-weight: 900;
-            text-shadow: 0 14px 36px rgba(0, 0, 0, .35);
+            align-items: center;
+            justify-content: space-between;
+            gap: 14px;
+            margin-bottom: 18px;
         }
-        .qoda-loader-word span {
-            display: inline-block;
-            opacity: 0;
-            transform: translateY(28px) scale(.92);
-            animation: qodaLetter 1.35s ease-in-out infinite;
-            animation-delay: calc(var(--i) * .16s);
-        }
-        .qoda-loader-copy { margin-top: 18px; font-size: 15px; color: rgba(255, 255, 255, .76); }
-        .qoda-loader-bar {
-            width: min(280px, 70vw);
-            height: 4px;
-            margin: 26px auto 0;
+        .logo {
+            width: 48px;
+            height: 48px;
+            display: grid;
+            place-items: center;
+            border-radius: 16px;
+            background: rgba(15,23,42,.08);
+            border: 1px solid rgba(15,23,42,.12);
             overflow: hidden;
-            border-radius: 999px;
-            background: rgba(255, 255, 255, .2);
         }
-        .qoda-loader-bar::before {
-            content: "";
-            display: block;
-            width: 0%;
-            height: 100%;
+        .logo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+        h1 { margin: 0; font-size: 28px; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+        label { display:block; margin-bottom: 7px; font-size: 13px; font-weight: 800; color: #334155; }
+        input, select {
+            width: 100%;
+            border: 1px solid #cbd5e1;
+            border-radius: 14px;
+            padding: 13px 14px;
+            font: inherit;
+            color: #0f172a;
             background: #fff;
-            animation: qodaProgress 10s linear forwards;
+            outline: none;
         }
-        @keyframes qodaLetter {
-            0%, 100% { opacity: .35; transform: translateY(10px) scale(.96); }
-            35%, 65% { opacity: 1; transform: translateY(-12px) scale(1.04); }
+        input:focus, select:focus { border-color: #0ea5e9; box-shadow: 0 0 0 4px rgba(14,165,233,.14); }
+        .full { grid-column: 1 / -1; }
+        .submit {
+            width: 100%;
+            margin-top: 18px;
+            border: 0;
+            border-radius: 16px;
+            padding: 14px;
+            color: #fff;
+            font-weight: 900;
+            cursor: pointer;
+            background: linear-gradient(135deg, #0ea5e9, #7c3aed);
+            box-shadow: 0 16px 32px rgba(37,99,235,.28);
         }
-        @keyframes qodaProgress {
-            to { width: 100%; }
+        .error { margin-bottom: 14px; padding: 12px 14px; border-radius: 14px; background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
+        .back { display:block; margin-top: 14px; text-align:center; color:#2563eb; font-weight:800; text-decoration:none; }
+        .modal {
+            position: fixed;
+            inset: 0;
+            z-index: 5;
+            display: none;
+            place-items: center;
+            background: rgba(2,6,23,.66);
+            padding: 20px;
         }
-        @keyframes qLogoFloat {
-            0%, 100% { transform: perspective(700px) rotateX(12deg) rotateY(-16deg) translateY(0); }
-            50% { transform: perspective(700px) rotateX(18deg) rotateY(16deg) translateY(-8px); }
+        .modal.show { display: grid; }
+        .modal-card {
+            width: min(440px, 100%);
+            border-radius: 22px;
+            background: #fff;
+            padding: 28px;
+            box-shadow: 0 24px 60px rgba(0,0,0,.32);
         }
-        .register-card { max-width: 460px; margin: 48px auto; background: #fff; padding: 28px; border-radius: 8px; box-shadow: 0 12px 30px rgba(15, 23, 42, .12); }
-        .register-card h1 { margin: 0 0 20px; font-size: 26px; color: #111827; }
-        label { display: block; margin-top: 14px; font-weight: 700; color: #374151; }
-        input { width: 100%; padding: 12px; margin-top: 6px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 15px; }
-        button { width: 100%; margin-top: 22px; padding: 13px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; font-weight: 700; cursor: pointer; }
-        .error { background: #fee2e2; color: #991b1b; padding: 12px; border-radius: 6px; margin-bottom: 16px; }
-        .muted { color: #64748b; font-size: 14px; margin-top: 14px; text-align: center; }
-        .muted a { color: #2563eb; }
+        .generated-id {
+            margin: 16px 0;
+            padding: 14px;
+            border-radius: 14px;
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+            color: #1d4ed8;
+            font-size: 20px;
+            font-weight: 900;
+            text-align: center;
+        }
+        .modal-card a {
+            display:block;
+            text-align:center;
+            text-decoration:none;
+            color:#fff;
+            background:#2563eb;
+            border-radius:14px;
+            padding:13px;
+            font-weight:900;
+        }
+        @media (max-width: 680px) {
+            .grid { grid-template-columns: 1fr; }
+            .full { grid-column: auto; }
+            .top { align-items:flex-start; }
+        }
     </style>
 </head>
 <body>
-    <div class="qoda-loader" id="qodaLoader" aria-hidden="true">
-        <div class="qoda-loader-content">
-            <div class="qoda-loader-logo">Q</div>
-            <div class="qoda-loader-word" aria-label="Qoda PU">
-                <span style="--i:0">Q</span><span style="--i:1">o</span><span style="--i:2">d</span><span style="--i:3">a</span>
-                <span style="--i:4">&nbsp;</span><span style="--i:5">P</span><span style="--i:6">U</span>
+    <main class="page">
+        <section class="card">
+            <div class="top">
+                <div>
+                    <h1>Lecturer Registration</h1>
+                    <p style="margin:6px 0 0;color:#64748b;">Create your QODA account.</p>
+                </div>
+                <div class="logo"><img src="../assets/qoda-logo.png" alt="QODA logo"></div>
             </div>
-            <div class="qoda-loader-copy">Preparing your lecturer workspace</div>
-            <div class="qoda-loader-bar"></div>
+
+            <?php if ($error): ?>
+                <div class="error"><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></div>
+            <?php endif; ?>
+
+            <form method="post">
+                <div class="grid">
+                    <div>
+                        <label for="title">Title</label>
+                        <select id="title" name="title" required>
+                            <?php foreach (['Mr.', 'Mrs.', 'Miss', 'Dr.', 'Prof.', 'Rev.', 'Ing.'] as $titleOption): ?>
+                                <option value="<?= htmlspecialchars($titleOption) ?>" <?= ($_POST['title'] ?? 'Mr.') === $titleOption ? 'selected' : '' ?>><?= htmlspecialchars($titleOption) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="username">Username</label>
+                        <input id="username" name="username" required value="<?= htmlspecialchars($_POST['username'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
+                    </div>
+                    <div>
+                        <label for="name">Full Name</label>
+                        <input id="name" name="name" required value="<?= htmlspecialchars($_POST['name'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
+                    </div>
+                    <div>
+                        <label for="email">Email</label>
+                        <input id="email" type="email" name="email" required value="<?= htmlspecialchars($_POST['email'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
+                    </div>
+                    <div class="full">
+                        <label for="department">Department</label>
+                        <input id="department" name="department" required value="<?= htmlspecialchars($_POST['department'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
+                    </div>
+                </div>
+                <button class="submit" type="submit">Create Lecturer Account</button>
+            </form>
+            <a class="back" href="<?= htmlspecialchars(register_base_url('web-client/login.php'), ENT_QUOTES, 'UTF-8') ?>">Back to login</a>
+        </section>
+    </main>
+
+    <div class="modal <?= $registeredStaffId ? 'show' : '' ?>" id="successModal">
+        <div class="modal-card">
+            <h2 style="margin:0 0 8px;">Registration Successful</h2>
+            <p style="color:#475569;line-height:1.55;">Your generated staff ID is your username and default password. Change it after first login.</p>
+            <div class="generated-id"><?= htmlspecialchars($registeredStaffId, ENT_QUOTES, 'UTF-8') ?></div>
+            <a href="<?= htmlspecialchars(register_base_url('web-client/login.php'), ENT_QUOTES, 'UTF-8') ?>">Go to Login</a>
         </div>
     </div>
-
-    <div class="register-card">
-        <h1>Lecturer Registration</h1>
-        <?php if ($error): ?>
-            <div class="error"><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></div>
-        <?php endif; ?>
-
-        <form method="post">
-            <input type="hidden" name="role" value="LECTURER">
-
-            <label for="staff_id">Lecturer ID</label>
-            <input id="staff_id" name="staff_id" required value="<?= htmlspecialchars($_POST['staff_id'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
-
-            <label for="name">Full Name</label>
-            <input id="name" name="name" required value="<?= htmlspecialchars($_POST['name'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
-
-            <label for="email">Email</label>
-            <input id="email" type="email" name="email" required value="<?= htmlspecialchars($_POST['email'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
-
-            <label for="department">Department</label>
-            <input id="department" name="department" value="<?= htmlspecialchars($_POST['department'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
-
-            <label for="password">Password</label>
-            <input id="password" type="password" name="password" required minlength="6">
-
-            <button type="submit">Create Lecturer Account</button>
-        </form>
-
-        <p class="muted">Students cannot register. Their accounts must be created by a lecturer.</p>
-        <p class="muted"><a href="<?= htmlspecialchars(register_base_url('web-client/login.php'), ENT_QUOTES, 'UTF-8') ?>">Back to login</a></p>
-    </div>
-    <script>
-        window.addEventListener('load', function() {
-            setTimeout(function() {
-                var loader = document.getElementById('qodaLoader');
-                if (loader) loader.classList.add('hide');
-            }, 10000);
-        });
-    </script>
 </body>
 </html>

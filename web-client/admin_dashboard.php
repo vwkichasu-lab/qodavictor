@@ -436,6 +436,7 @@ $page = $_GET['page'] ?? 'dashboard';
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>QODA | Super Admin Dashboard</title>
+    <link rel="icon" type="image/png" href="../assets/qoda-logo.png">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
@@ -519,17 +520,20 @@ $page = $_GET['page'] ?? 'dashboard';
     .header-logo {
         width: 48px;
         height: 48px;
-        background: linear-gradient(135deg, #4f46e5, #06b6d4);
+        background: var(--card);
         border-radius: 14px;
         display: flex;
         align-items: center;
         justify-content: center;
+        overflow: hidden;
+        border: 1px solid var(--border);
     }
 
-    .header-logo span {
-        font-size: 26px;
-        font-weight: 800;
-        color: white;
+    .header-logo img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
     }
 
     .header-title {
@@ -1365,7 +1369,7 @@ $page = $_GET['page'] ?? 'dashboard';
     <div class="header-bar">
         <div class="header-left">
             <button class="mobile-menu-btn" onclick="toggleMobileSidebar()"><i class="fas fa-bars"></i></button>
-            <div class="header-logo"><span>Q</span></div>
+            <div class="header-logo"><img src="../assets/qoda-logo.png" alt="QODA logo"></div>
             <div class="header-title">QODA SUPER ADMIN</div>
         </div>
         <div class="header-center">

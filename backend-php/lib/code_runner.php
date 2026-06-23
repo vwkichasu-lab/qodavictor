@@ -33,6 +33,9 @@ if (!function_exists('qodaFindExecutable')) {
 
     function qodaRunProcess(string $command, string $cwd, string $input = '', int $timeout = 8): array
     {
+        if ($timeout === 8) {
+            $timeout = (int)(getenv('QODA_RUN_TIMEOUT') ?: 12);
+        }
         $descriptors = [
             0 => ['pipe', 'r'],
             1 => ['pipe', 'w'],
@@ -51,12 +54,16 @@ if (!function_exists('qodaFindExecutable')) {
         $output = '';
         $error = '';
         $start = microtime(true);
+        $exitCode = null;
         while (true) {
             $status = proc_get_status($process);
             $output .= stream_get_contents($pipes[1]);
             $error .= stream_get_contents($pipes[2]);
 
             if (!$status['running']) {
+                if (isset($status['exitcode']) && (int)$status['exitcode'] !== -1) {
+                    $exitCode = (int)$status['exitcode'];
+                }
                 break;
             }
             if ((microtime(true) - $start) > $timeout) {
@@ -66,8 +73,8 @@ if (!function_exists('qodaFindExecutable')) {
                 }
                 proc_close($process);
                 $hint = trim($input) === ''
-                    ? "\nIf this program expects input, add test-case input values and run again."
-                    : '';
+                    ? "\nIf this program expects input, enter the required input values and run again."
+                    : "\nThe program may still be waiting for more input, or it may be stuck in a loop. Add every required input line and run again.";
                 return ['ok' => false, 'output' => $output, 'error' => "Execution timed out after {$timeout} seconds." . $hint];
             }
             usleep(100000);
@@ -76,7 +83,10 @@ if (!function_exists('qodaFindExecutable')) {
         foreach ($pipes as $pipe) {
             if (is_resource($pipe)) fclose($pipe);
         }
-        $exitCode = proc_close($process);
+        $closeCode = proc_close($process);
+        if ($exitCode === null) {
+            $exitCode = $closeCode;
+        }
         return ['ok' => $exitCode === 0, 'output' => $output, 'error' => $error];
     }
 
@@ -88,6 +98,10 @@ if (!function_exists('qodaFindExecutable')) {
             'python3' => 'python',
             'js' => 'javascript',
             'node' => 'javascript',
+            'html/css/js' => 'html',
+            'html css js' => 'html',
+            'web' => 'html',
+            'web development' => 'html',
             'c++' => 'cpp',
             'cs' => 'csharp',
             'c#' => 'csharp',
@@ -113,6 +127,14 @@ if (!function_exists('qodaFindExecutable')) {
             return $match[1];
         }
         return 'Main';
+    }
+
+    function qodaJavaPackageName(string $code): string
+    {
+        if (preg_match('/^\s*package\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*;/m', $code, $match)) {
+            return $match[1];
+        }
+        return '';
     }
 
     function qodaNormalizeProjectFiles(array $postedFiles): array
@@ -294,7 +316,7 @@ if (!function_exists('qodaFindExecutable')) {
                     unset($fileInfo);
                     $javaFiles = qodaProjectFilesByExtension($safeFiles, 'java');
                     $javaArgs = implode(' ', array_map(fn($file) => '"' . str_replace('/', DIRECTORY_SEPARATOR, $file['name']) . '"', $javaFiles));
-                    $result = qodaRunProcess('"' . $javac . '" ' . $javaArgs, $tmpBase, '', 15);
+                    $result = qodaRunProcess('"' . $javac . '" -d "' . $tmpBase . '" ' . $javaArgs, $tmpBase, '', 15);
                     break;
 
                 case 'c':
@@ -414,6 +436,7 @@ if (!function_exists('qodaFindExecutable')) {
                     if (!$javac || !$java) return ['ok' => false, 'output' => '', 'error' => 'Java JDK is not installed on this server.'];
                     $isJavaGui = qodaUsesJavaDesktopGui($code);
                     $className = qodaPublicClassName($code);
+                    $packageName = qodaJavaPackageName($code);
                     if (!$safeFiles) {
                         $safeFiles[] = ['name' => $className . '.java', 'content' => $code, 'active' => true];
                         qodaWriteProjectFiles($tmpBase, $safeFiles);
@@ -425,6 +448,7 @@ if (!function_exists('qodaFindExecutable')) {
                             $targetName = $match[1] . '.java';
                             if (preg_match('/public\s+static\s+void\s+main\s*\(/', $content)) {
                                 $className = $match[1];
+                                $packageName = qodaJavaPackageName($content);
                             }
                             $fileInfo['name'] = $targetName;
                         }
@@ -438,7 +462,7 @@ if (!function_exists('qodaFindExecutable')) {
                     $javaArgs = implode(' ', array_map(function ($file) {
                         return '"' . str_replace('/', DIRECTORY_SEPARATOR, $file['name']) . '"';
                     }, $javaFiles));
-                    $compile = qodaRunProcess('"' . $javac . '" ' . $javaArgs, $tmpBase, '', 15);
+                    $compile = qodaRunProcess('"' . $javac . '" -d "' . $tmpBase . '" ' . $javaArgs, $tmpBase, '', 15);
                     if (!$compile['ok']) {
                         $result = $compile;
                         break;
@@ -451,7 +475,8 @@ if (!function_exists('qodaFindExecutable')) {
                         ];
                         break;
                     }
-                    $result = qodaRunProcess('"' . $java . '" -cp "' . $tmpBase . '" ' . $className, $tmpBase, $input, 8);
+                    $runClass = preg_replace('/[^A-Za-z0-9_.$]/', '', $packageName !== '' ? $packageName . '.' . $className : $className);
+                    $result = qodaRunProcess('"' . $java . '" -cp "' . $tmpBase . '" ' . $runClass, $tmpBase, $input, 8);
                     break;
 
                 case 'c':

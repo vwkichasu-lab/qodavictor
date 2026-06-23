@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/../backend-php/lib/grade_storage.php';
 
 // Check if user is logged in
 if (!isLoggedIn()) {
@@ -14,28 +15,70 @@ if ($_SESSION['user_role'] !== 'STUDENT') {
 }
 
 $db = getDB();
+$studentDashboardAjaxAction = (string)($_POST['action'] ?? '');
+$skipStudentSchemaUpgrade = ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' && in_array($studentDashboardAjaxAction, [
+    'get_student_exams',
+], true);
 
-try {
-    $checkResultsPublished = $db->prepare("
-        SELECT COUNT(*)
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'exams' AND COLUMN_NAME = 'results_published'
-    ");
-    $checkResultsPublished->execute();
-    if ((int)$checkResultsPublished->fetchColumn() === 0) {
-        $db->exec("ALTER TABLE exams ADD COLUMN results_published TINYINT(1) NOT NULL DEFAULT 0");
+// Results are stored in a compact table so the large submission payload table
+// does not need to be updated every time a lecturer saves a grade.
+if (!$skipStudentSchemaUpgrade) {
+    try {
+        qodaTryEnsureFinalGradeTable($db);
+    } catch (Throwable $finalGradeSetupError) {
+        error_log('Student final grade table setup failed: ' . $finalGradeSetupError->getMessage());
     }
-    $checkResultsPublishedAt = $db->prepare("
-        SELECT COUNT(*)
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'exams' AND COLUMN_NAME = 'results_published_at'
-    ");
-    $checkResultsPublishedAt->execute();
-    if ((int)$checkResultsPublishedAt->fetchColumn() === 0) {
-        $db->exec("ALTER TABLE exams ADD COLUMN results_published_at DATETIME NULL");
+}
+
+function ensureStudentDashboardColumn(PDO $db, string $table, string $column, string $definition): void
+{
+    try {
+        $stmt = $db->prepare("
+            SELECT COUNT(*)
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
+        ");
+        $stmt->execute([$table, $column]);
+        if ((int)$stmt->fetchColumn() === 0) {
+            $db->exec("ALTER TABLE `$table` ADD COLUMN `$column` $definition");
+        }
+    } catch (Throwable $error) {
+        error_log("Student dashboard column setup skipped for {$table}.{$column}: " . $error->getMessage());
     }
-} catch (Exception $e) {
-    // The dashboard can still load; unpublished results will be treated as hidden if the column exists.
+}
+
+if (!$skipStudentSchemaUpgrade) {
+    try {
+        ensureStudentDashboardColumn($db, 'exams', 'results_published', 'TINYINT(1) NOT NULL DEFAULT 0');
+        ensureStudentDashboardColumn($db, 'exams', 'results_published_at', 'DATETIME NULL');
+        $db->exec("
+        CREATE TABLE IF NOT EXISTS exam_question_grading (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            submission_id INT NOT NULL,
+            question_index INT NOT NULL,
+            marking_scheme TEXT NULL,
+            test_cases LONGTEXT NULL,
+            ai_score DECIMAL(10,2) NULL,
+            ai_feedback TEXT NULL,
+            manual_score DECIMAL(10,2) NULL,
+            manual_feedback TEXT NULL,
+            score_source VARCHAR(20) DEFAULT 'ai',
+            graded_at DATETIME NULL,
+            UNIQUE KEY uniq_submission_question (submission_id, question_index),
+            INDEX idx_submission_id (submission_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+    ensureStudentDashboardColumn($db, 'exam_submissions', 'class_score', 'DECIMAL(5,2) DEFAULT 0');
+    ensureStudentDashboardColumn($db, 'exam_submissions', 'exam_score', 'DECIMAL(5,2) DEFAULT 0');
+    ensureStudentDashboardColumn($db, 'exam_submissions', 'grade', 'VARCHAR(5) NULL');
+    ensureStudentDashboardColumn($db, 'exam_submissions', 'grade_point', 'DECIMAL(3,1) DEFAULT 0');
+    if (getenv('QODA_ALLOW_HEAVY_ALTERS') === '1') {
+        $db->exec("ALTER TABLE students MODIFY profile_pic MEDIUMTEXT NULL");
+    }
+    qodaTryEnsureFinalGradeTable($db);
+    } catch (Exception $e) {
+        // The dashboard can still load; unpublished results will be treated as hidden if the column exists.
+    }
 }
 
 // Get student details
@@ -77,23 +120,41 @@ if (isset($_POST['action'])) {
     
     if ($_POST['action'] === 'upload_profile_pic') {
         if (isset($_FILES['profile_pic']) && $_FILES['profile_pic']['error'] == 0) {
-            $uploadDir = 'uploads/';
-            if (!file_exists($uploadDir)) mkdir($uploadDir, 0777, true);
-            
             $ext = strtolower(pathinfo($_FILES['profile_pic']['name'], PATHINFO_EXTENSION));
             $allowed = ['jpg', 'jpeg', 'png', 'gif'];
             
             if (in_array($ext, $allowed)) {
-                $filename = 'student_' . $_SESSION['user_id'] . '_' . time() . '.' . $ext;
-                $uploadPath = $uploadDir . $filename;
-                
-                if (move_uploaded_file($_FILES['profile_pic']['tmp_name'], $uploadPath)) {
-                    $updateStmt = $db->prepare("UPDATE students SET profile_pic = ? WHERE id = ?");
-                    $updateStmt->execute([$filename, $_SESSION['user_id']]);
-                    echo json_encode(['success' => true, 'url' => $uploadPath]);
-                } else {
-                    echo json_encode(['success' => false, 'error' => 'Upload failed']);
+                if (($_FILES['profile_pic']['size'] ?? 0) > 2 * 1024 * 1024) {
+                    echo json_encode(['success' => false, 'error' => 'Profile picture must be 2MB or smaller']);
+                    exit;
                 }
+                $tmpPath = $_FILES['profile_pic']['tmp_name'];
+                $mime = mime_content_type($tmpPath) ?: ('image/' . ($ext === 'jpg' ? 'jpeg' : $ext));
+                $profilePicDataUrl = 'data:' . $mime . ';base64,' . base64_encode(file_get_contents($tmpPath));
+                $uploadDir = __DIR__ . '/uploads/profile_pictures';
+                if (!is_dir($uploadDir)) {
+                    mkdir($uploadDir, 0775, true);
+                }
+                $fileName = 'student_' . (int)$_SESSION['user_id'] . '_' . time() . '.' . $ext;
+                $absolutePath = $uploadDir . '/' . $fileName;
+                if (!move_uploaded_file($_FILES['profile_pic']['tmp_name'], $absolutePath)) {
+                    echo json_encode(['success' => false, 'error' => 'Could not save uploaded profile picture']);
+                    exit;
+                }
+                $imageData = 'uploads/profile_pictures/' . $fileName;
+                $updateStmt = $db->prepare("UPDATE students SET profile_pic = ?, updated_at = NOW() WHERE id = ?");
+                try {
+                    $updateStmt->execute([$profilePicDataUrl, $_SESSION['user_id']]);
+                    $imageData = $profilePicDataUrl;
+                } catch (Throwable $imageStoreError) {
+                    error_log('Student profile picture data-url storage failed, using file path fallback: ' . $imageStoreError->getMessage());
+                    try {
+                        $updateStmt->execute(['uploads/profile_pictures/' . $fileName, $_SESSION['user_id']]);
+                    } catch (Throwable $pathStoreError) {
+                        error_log('Student profile picture file-path storage also failed: ' . $pathStoreError->getMessage());
+                    }
+                }
+                echo json_encode(['success' => true, 'url' => $imageData, 'preview_url' => $profilePicDataUrl]);
             } else {
                 echo json_encode(['success' => false, 'error' => 'Invalid file type']);
             }
@@ -118,7 +179,7 @@ if (isset($_POST['action'])) {
             }
             
             $hashed = password_hash($new, PASSWORD_DEFAULT);
-            $updateStmt = $db->prepare("UPDATE students SET password = ? WHERE id = ?");
+            $updateStmt = $db->prepare("UPDATE students SET password = ?, updated_at = NOW() WHERE id = ?");
             $updateStmt->execute([$hashed, $_SESSION['user_id']]);
             
             echo json_encode(['success' => true]);
@@ -130,11 +191,15 @@ if (isset($_POST['action'])) {
     
     if ($_POST['action'] === 'get_student_exams') {
         try {
+            $finalGradeTableReady = qodaTableExists($db, 'exam_final_grades');
+            $examColumns = qodaTableColumns($db, 'exams');
+            $questionGradingReady = qodaTableExists($db, 'exam_question_grading');
             $studentId = $_SESSION['user_id'];
             
-            $coursesStmt = $db->prepare("SELECT DISTINCT course_code FROM course_enrollments WHERE student_id = ?");
-            $coursesStmt->execute([$studentId]);
-            $enrolledCourses = $coursesStmt->fetchAll(PDO::FETCH_COLUMN);
+            $enrolledCourses = array_values(array_unique(array_filter(array_map(
+                fn($course) => trim((string)($course['course_code'] ?? '')),
+                $enrolledCoursesList
+            ))));
             
             if (empty($enrolledCourses)) {
                 echo json_encode(['success' => true, 'data' => []]);
@@ -142,6 +207,43 @@ if (isset($_POST['action'])) {
             }
             
             $placeholders = implode(',', array_fill(0, count($enrolledCourses), '?'));
+            $finalGradeSelect = $finalGradeTableReady ? "
+                    efg.percentage AS final_percentage,
+                    efg.class_score AS final_class_score,
+                    efg.exam_score AS final_exam_score,
+                    efg.total_score AS final_total_score,
+                    efg.grade AS final_grade,
+                    efg.grade_point AS final_grade_point,
+                    efg.status AS final_status,
+                    efg.graded_at AS final_graded_at," : "
+                    NULL AS final_percentage,
+                    NULL AS final_class_score,
+                    NULL AS final_exam_score,
+                    NULL AS final_total_score,
+                    NULL AS final_grade,
+                    NULL AS final_grade_point,
+                    NULL AS final_status,
+                    NULL AS final_graded_at,";
+            $finalGradeJoin = $finalGradeTableReady
+                ? "LEFT JOIN exam_final_grades efg ON efg.submission_id = es.id"
+                : "";
+            $resultsPublishedSelect = isset($examColumns['results_published'])
+                ? "COALESCE(e.results_published, CASE WHEN UPPER(COALESCE(es.status, '')) IN ('GRADED', 'MARKED', 'AUTO_GRADED', 'MANUALLY_GRADED') THEN 1 ELSE 0 END) AS results_published,"
+                : "CASE WHEN UPPER(COALESCE(es.status, '')) IN ('GRADED', 'MARKED', 'AUTO_GRADED', 'MANUALLY_GRADED') THEN 1 ELSE 0 END AS results_published,";
+            $questionScoreSelect = $questionGradingReady ? "
+                    (
+                        SELECT SUM(
+                            CASE
+                                WHEN eqg.score_source = 'manual' AND eqg.manual_score IS NOT NULL THEN eqg.manual_score
+                                WHEN eqg.ai_score IS NOT NULL THEN eqg.ai_score
+                                WHEN eqg.manual_score IS NOT NULL THEN eqg.manual_score
+                                ELSE 0
+                            END
+                        )
+                        FROM exam_question_grading eqg
+                        WHERE eqg.submission_id = es.id
+                    ) AS question_score_sum," : "
+                    NULL AS question_score_sum,";
             
             $examStmt = $db->prepare("
                 SELECT 
@@ -154,9 +256,17 @@ if (isset($_POST['action'])) {
                     e.end_datetime,
                     e.questions,
                     e.instructions,
-                    e.results_published,
+                    $resultsPublishedSelect
                     es.percentage as score,
                     es.total_score,
+                    es.auto_score,
+                    es.manual_score,
+                    es.class_score,
+                    es.exam_score,
+                    es.grade,
+                    es.grade_point,
+                    $finalGradeSelect
+                    $questionScoreSelect
                     es.answers,
                     es.status as submission_status,
                     es.submitted,
@@ -171,6 +281,7 @@ if (isset($_POST['action'])) {
                     ORDER BY COALESCE(es2.submitted_at, es2.submittedAt, es2.updated_at, es2.started_at) DESC, es2.id DESC
                     LIMIT 1
                 )
+                $finalGradeJoin
                 LEFT JOIN exam_visibility ev ON ev.exam_id = e.id AND ev.student_id = ?
                 WHERE e.published = 1
                   AND e.course_code IN ($placeholders)
@@ -196,7 +307,7 @@ if (isset($_POST['action'])) {
                 $startDate = $startTs ? date('M d, Y h:i A', $startTs) : 'Not scheduled';
                 $endDate = $endTs ? date('Y-m-d H:i:s', $endTs) : null;
                 
-                $submissionStatus = $exam['submission_status'] ?? null;
+                $submissionStatus = $exam['final_status'] ?: ($exam['submission_status'] ?? null);
                 $grading = [];
                 if (!empty($exam['answers'])) {
                     $answers = json_decode($exam['answers'], true);
@@ -212,22 +323,64 @@ if (isset($_POST['action'])) {
                     }
                 }
 
-                $classScore = isset($grading['class_score']) ? min(40, max(0, round((float)$grading['class_score']))) : null;
-                $examScore = isset($grading['exam_score']) ? min(60, max(0, round((float)$grading['exam_score']))) : null;
-                $grade = $grading['grade'] ?? null;
-                $gradePoint = isset($grading['grade_point']) ? round((float)$grading['grade_point'], 1) : null;
+                $submissionStatusKey = strtoupper((string)$submissionStatus);
+                $isGradedLike = in_array($submissionStatusKey, ['GRADED', 'MARKED', 'AUTO_GRADED', 'MANUALLY_GRADED'], true);
 
-                $score = $grading['total_score'] ?? $exam['score'];
+                $directClassScore = null;
+                $classScoreSource = ($exam['final_class_score'] !== null && $exam['final_class_score'] !== '') ? $exam['final_class_score'] : ($exam['class_score'] ?? null);
+                if ($classScoreSource !== null && $classScoreSource !== '' && ($isGradedLike || (float)$classScoreSource > 0)) {
+                    $directClassScore = min(40, max(0, round((float)$classScoreSource)));
+                }
+                $classScore = $directClassScore ?? (isset($grading['class_score']) ? min(40, max(0, round((float)$grading['class_score']))) : null);
+
+                $directExamScore = null;
+                $examScoreSource = ($exam['final_exam_score'] !== null && $exam['final_exam_score'] !== '') ? $exam['final_exam_score'] : ($exam['exam_score'] ?? null);
+                if ($examScoreSource !== null && $examScoreSource !== '' && ($isGradedLike || (float)$examScoreSource > 0)) {
+                    $directExamScore = min(60, max(0, round((float)$examScoreSource)));
+                }
+                $examScore = $directExamScore ?? (isset($grading['exam_score']) ? min(60, max(0, round((float)$grading['exam_score']))) : null);
+
+                $grade = ($exam['final_grade'] ?? null) ?: (($exam['grade'] ?? null) ?: ($grading['grade'] ?? null));
+                $gradePointSource = ($exam['final_grade_point'] !== null && $exam['final_grade_point'] !== '') ? $exam['final_grade_point'] : ($exam['grade_point'] ?? null);
+                $gradePoint = $gradePointSource !== null && $gradePointSource !== '' ? round((float)$gradePointSource, 1) : (isset($grading['grade_point']) ? round((float)$grading['grade_point'], 1) : null);
+                $questionMarksTotal = 0.0;
+                $examQuestions = json_decode($exam['questions'] ?? '[]', true);
+                if (is_array($examQuestions)) {
+                    foreach ($examQuestions as $question) {
+                        $questionMarksTotal += (float)($question['marks'] ?? 0);
+                    }
+                }
+
+                $score = ($exam['final_total_score'] !== null && $exam['final_total_score'] !== '') ? $exam['final_total_score'] : null;
                 if (($score === null || $score === '') && $exam['total_score'] !== null && $exam['total_score'] !== '') {
                     $score = $exam['total_score'];
                 }
                 if (($score === null || $score === '') && !empty($grading)) {
                     $score = $grading['total_score'] ?? null;
                 }
+                if (($score === null || $score === '') && $exam['score'] !== null && $exam['score'] !== '') {
+                    $score = $exam['score'];
+                }
+                if ($examScore === null && isset($exam['question_score_sum']) && $exam['question_score_sum'] !== null && $exam['question_score_sum'] !== '') {
+                    $rawQuestionScore = max(0, (float)$exam['question_score_sum']);
+                    $questionPercentage = $questionMarksTotal > 0 ? ($rawQuestionScore / $questionMarksTotal) * 100 : $rawQuestionScore;
+                    $examScore = min(60, max(0, round(($questionPercentage * 60) / 100)));
+                }
+                if ($examScore === null && isset($exam['score']) && $exam['score'] !== null && $exam['score'] !== '') {
+                    $examScore = min(60, max(0, round(((float)$exam['score'] * 60) / 100)));
+                }
                 if ($examScore !== null || $classScore !== null) {
-                    $score = min(100, max(0, (int)($examScore ?? 0) + (int)($classScore ?? 0)));
+                    if ($classScore === null && $score !== null && $score !== '') {
+                        $classScore = min(40, max(0, round((float)$score) - (int)($examScore ?? 0)));
+                    }
+                    if ($classScore === null) $classScore = 0;
+                    $score = min(100, max(0, (int)($examScore ?? 0) + (int)$classScore));
                 } else {
                     $score = ($score === null || $score === '') ? null : min(100, max(0, round((float)$score)));
+                    if ($score !== null) {
+                        $examScore = min(60, max(0, (int)$score));
+                        $classScore = min(40, max(0, (int)$score - $examScore));
+                    }
                 }
                 if ($grade === null && $score !== null) {
                     if ($score >= 80) { $grade = 'A'; $gradePoint = 4.0; }
@@ -241,8 +394,6 @@ if (isset($_POST['action'])) {
                 }
                 
                 // Proper status determination
-                $submissionStatusKey = strtoupper((string)$submissionStatus);
-
                 $hasRealSubmission = !empty($exam['submitted_at']) || !empty($exam['submittedAt']) || intval($exam['submitted'] ?? 0) === 1;
 
                 $resultsPublished = intval($exam['results_published'] ?? 0) === 1;
@@ -275,6 +426,7 @@ if (isset($_POST['action'])) {
                     'duration' => $exam['duration_minutes'] . ' minutes',
                     'durationMins' => $exam['duration_minutes'],
                     'status' => $status,
+                    'results_published' => $resultsPublished,
                     'score' => $score,
                     'class_score' => $classScore,
                     'exam_score' => $examScore,
@@ -313,6 +465,14 @@ $student = (object)[
     'gender' => $studentData['gender'] ?? '',
     'dob' => $studentData['date_of_birth'] ?? ''
 ];
+
+$studentProfilePicRaw = trim((string)($student->profile_pic ?? ''));
+$studentProfilePicSrc = '';
+if ($studentProfilePicRaw !== '') {
+    $studentProfilePicSrc = preg_match('/^(data:image\/|https?:\/\/)/i', $studentProfilePicRaw)
+        ? $studentProfilePicRaw
+        : (str_starts_with($studentProfilePicRaw, 'uploads/') ? $studentProfilePicRaw : 'uploads/' . $studentProfilePicRaw);
+}
 ?>
 
 <!DOCTYPE html>
@@ -322,6 +482,7 @@ $student = (object)[
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title><?php echo $pageTitle; ?></title>
+    <link rel="icon" type="image/png" href="../assets/qoda-logo.png">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
     <style>
@@ -406,14 +567,20 @@ $student = (object)[
     .logo-icon {
         width: 45px;
         height: 45px;
-        background: linear-gradient(135deg, var(--accent), var(--purple));
+        background: var(--bg);
         border-radius: 12px;
         display: flex;
         align-items: center;
         justify-content: center;
-        font-size: 22px;
-        font-weight: bold;
-        color: white;
+        overflow: hidden;
+        border: 1px solid var(--border);
+    }
+
+    .logo-icon img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        display: block;
     }
 
     .logo-text h1 {
@@ -1187,13 +1354,65 @@ $student = (object)[
             display: none;
         }
     }
+
+    .student-desktop-only-blocker {
+        display: none;
+    }
+
+    @media (max-width: 1024px) {
+        .student-desktop-only-blocker {
+            position: fixed;
+            inset: 0;
+            z-index: 99999;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            background: #07111f;
+            color: #f8fafc;
+            text-align: center;
+        }
+
+        .student-desktop-only-card {
+            max-width: 520px;
+            border: 1px solid rgba(148, 163, 184, .35);
+            border-radius: 24px;
+            padding: 30px;
+            background: rgba(15, 23, 42, .94);
+            box-shadow: 0 28px 90px rgba(0, 0, 0, .45);
+        }
+
+        .student-desktop-only-card i {
+            font-size: 42px;
+            color: #38bdf8;
+            margin-bottom: 16px;
+        }
+
+        .student-desktop-only-card h2 {
+            margin: 0 0 10px;
+            font-size: 26px;
+        }
+
+        .student-desktop-only-card p {
+            color: #cbd5e1;
+            line-height: 1.6;
+            margin: 0;
+        }
+    }
     </style>
 </head>
 
 <body>
+    <div class="student-desktop-only-blocker">
+        <div class="student-desktop-only-card">
+            <i class="fas fa-desktop"></i>
+            <h2>Use a laptop or desktop</h2>
+            <p>The Qoda student portal and exam interface are restricted to laptop and desktop screens for secure programming assessments.</p>
+        </div>
+    </div>
     <div class="top-bar">
         <div class="logo-area">
-            <div class="logo-icon">Q</div>
+            <div class="logo-icon"><img src="../assets/qoda-logo.png" alt="QODA logo"></div>
             <div class="logo-text">
                 <h1>Qoda PU</h1>
                 <p>Student Portal</p>
@@ -1205,9 +1424,10 @@ $student = (object)[
                 <div class="student-id">ID: <?php echo htmlspecialchars($student->matric_number); ?></div>
             </div>
             <div class="student-avatar">
-                <?php if (!empty($student->profile_pic)): ?>
-                <img src="uploads/<?php echo htmlspecialchars($student->profile_pic); ?>" alt="Profile">
+                <?php if ($studentProfilePicSrc !== ''): ?>
+                <img class="student-avatar-img" src="<?php echo htmlspecialchars($studentProfilePicSrc); ?>" alt="Profile">
                 <?php else: ?>
+                <img class="student-avatar-img" src="" alt="Profile" style="display:none;">
                 <i class="fas fa-user-graduate"></i>
                 <?php endif; ?>
             </div>
@@ -1362,20 +1582,9 @@ $student = (object)[
                     </div>
                 </div>
                 <div class="filter-bar">
-                    <input type="text" id="searchResults" placeholder="🔍 Search by course name or code...">
-                    <select id="filterResultsCourse">
-                        <option value="all">All Courses</option>
-                    </select>
-                    <select id="filterResultsTimeframe">
-                        <option value="all">All Time</option>
-                        <option value="today">Today</option>
-                        <option value="week">This Week</option>
-                        <option value="month">This Month</option>
-                        <option value="year">This Year</option>
-                    </select>
-                    <input type="month" id="filterResultsDate" placeholder="Filter by month">
-                    <button class="btn btn-primary" onclick="filterResults()">Apply Filter</button>
-                    <button class="btn btn-outline" onclick="resetResultsFilter()">Reset</button>
+                    <input type="text" id="searchResults" name="qoda_course_result_search" autocomplete="off"
+                        placeholder="Search by course name or code...">
+                    <button class="btn btn-primary" onclick="filterResults()"><i class="fas fa-search"></i> Search</button>
                 </div>
                 <div class="panel-body" style="padding: 0;" id="resultsContainer">
                     <div class="spinner"></div>
@@ -1395,11 +1604,12 @@ $student = (object)[
                         <div style="text-align: center;">
                             <div class="student-avatar"
                                 style="width: 120px; height: 120px; border-radius: 50%; font-size: 48px;">
-                                <?php if (!empty($student->profile_pic)): ?>
-                                <img src="uploads/<?php echo htmlspecialchars($student->profile_pic); ?>" alt="Profile"
+                                <?php if ($studentProfilePicSrc !== ''): ?>
+                                <img class="student-avatar-img" src="<?php echo htmlspecialchars($studentProfilePicSrc); ?>" alt="Profile"
                                     id="profileImage" style="width:100%;height:100%;object-fit:cover;">
                                 <?php else: ?>
-                                <i class="fas fa-user-graduate"></i>
+                                <img class="student-avatar-img" src="" alt="Profile" id="profileImage" style="width:100%;height:100%;object-fit:cover;display:none;">
+                                <i class="fas fa-user-graduate" id="profileFallbackIcon"></i>
                                 <?php endif; ?>
                             </div>
                             <button class="btn btn-outline" style="margin-top: 12px;"
@@ -1432,18 +1642,25 @@ $student = (object)[
                                         <?php echo htmlspecialchars($student->level ?: 'Not set'); ?></div>
                                 </div>
                                 <div>
-                                    <label style="color: var(--text-muted); font-size: 12px;">Email</label>
-                                    <div style="font-size: 18px; font-weight: 600;">
-                                        <?php echo htmlspecialchars($student->email ?: 'Not set'); ?></div>
+                                    <label style="color: var(--text-muted); font-size: 12px;">Courses Enrolled</label>
+                                    <?php if (!empty($enrolledCoursesList)): ?>
+                                    <ol style="margin: 8px 0 0 22px; display: grid; gap: 8px;">
+                                        <?php foreach ($enrolledCoursesList as $course): ?>
+                                        <li style="font-size: 16px; font-weight: 600;">
+                                            <?php echo htmlspecialchars(($course['course_code'] ?? '') . ' - ' . ($course['course_name'] ?? '')); ?>
+                                        </li>
+                                        <?php endforeach; ?>
+                                    </ol>
+                                    <?php else: ?>
+                                    <div style="font-size: 18px; font-weight: 600;">No courses enrolled</div>
+                                    <?php endif; ?>
                                 </div>
                                 <div>
                                     <label style="color: var(--text-muted); font-size: 12px;">Change Password</label>
-                                    <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px;">
-                                        <input type="password" id="currentPassword" placeholder="Current Password"
-                                            style="flex: 1; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text);">
-                                        <input type="password" id="newPassword" placeholder="New Password"
-                                            style="flex: 1; padding: 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text);">
-                                        <button class="btn btn-primary" onclick="changePassword()">Update</button>
+                                    <div style="margin-top: 8px;">
+                                        <button class="btn btn-primary" onclick="openPasswordModal()">
+                                            <i class="fas fa-key"></i> Change Password
+                                        </button>
                                     </div>
                                 </div>
                             </div>
@@ -1475,6 +1692,45 @@ $student = (object)[
                 <span class="modal-close" onclick="closeResultModal()">&times;</span>
             </div>
             <div id="resultModalBody"></div>
+        </div>
+    </div>
+
+    <div id="passwordModal" class="modal">
+        <div class="modal-content" style="max-width: 520px;">
+            <div class="modal-header">
+                <h3><i class="fas fa-key"></i> Change Password</h3>
+                <span class="modal-close" onclick="closePasswordModal()">&times;</span>
+            </div>
+            <div style="display: grid; gap: 14px;">
+                <div style="position: relative;">
+                    <input type="password" id="modalCurrentPassword" placeholder="Current password"
+                        style="width: 100%; padding: 12px 44px 12px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text);">
+                    <button type="button" onclick="toggleStudentPassword('modalCurrentPassword', this)"
+                        style="position:absolute;right:10px;top:50%;transform:translateY(-50%);border:0;background:transparent;color:var(--text);cursor:pointer;font-size:16px;">
+                        <i class="fas fa-eye"></i>
+                    </button>
+                </div>
+                <div style="position: relative;">
+                    <input type="password" id="modalNewPassword" placeholder="New password"
+                        style="width: 100%; padding: 12px 44px 12px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text);">
+                    <button type="button" onclick="toggleStudentPassword('modalNewPassword', this)"
+                        style="position:absolute;right:10px;top:50%;transform:translateY(-50%);border:0;background:transparent;color:var(--text);cursor:pointer;font-size:16px;">
+                        <i class="fas fa-eye"></i>
+                    </button>
+                </div>
+                <div style="position: relative;">
+                    <input type="password" id="modalConfirmPassword" placeholder="Confirm new password"
+                        style="width: 100%; padding: 12px 44px 12px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text);">
+                    <button type="button" onclick="toggleStudentPassword('modalConfirmPassword', this)"
+                        style="position:absolute;right:10px;top:50%;transform:translateY(-50%);border:0;background:transparent;color:var(--text);cursor:pointer;font-size:16px;">
+                        <i class="fas fa-eye"></i>
+                    </button>
+                </div>
+                <div style="display: flex; justify-content: flex-end; gap: 10px;">
+                    <button class="btn btn-outline" onclick="closePasswordModal()">Cancel</button>
+                    <button class="btn btn-primary" onclick="submitPasswordChange()">Update Password</button>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -1654,7 +1910,7 @@ $student = (object)[
         const total = myExams.length;
         const completed = myExams.filter(e => ['submitted', 'completed'].includes(e.status)).length;
         const upcoming = myExams.filter(e => e.status === 'upcoming' || e.status === 'active' || e.status === 'available').length;
-        const results = myExams.filter(e => e.status === 'completed' && e.score !== null).length;
+        const results = myExams.filter(isPublishedResult).length;
 
         document.getElementById('totalExams').innerText = total;
         document.getElementById('completedExams').innerText = completed;
@@ -1889,54 +2145,20 @@ $student = (object)[
 
     function renderResults() {
         const container = document.getElementById('resultsContainer');
-        let results = myExams.filter(e => e.status === 'completed' && e.score !== null);
+        let results = myExams.filter(isPublishedResult);
 
-        const courses = [...new Map(results.map(e => [e.code, `${e.name} (${e.code})`])).entries()].sort((a, b) => a[0].localeCompare(b[0]));
-        const courseSelect = document.getElementById('filterResultsCourse');
-        if (courseSelect) {
-            const selectedCourse = courseSelect.value || 'all';
-            courseSelect.innerHTML = '<option value="all">All Courses</option>' + courses.map(([code, label]) =>
-                `<option value="${escapeHtml(code)}">${escapeHtml(label)}</option>`).join('');
-            courseSelect.value = courses.some(([code]) => code === selectedCourse) ? selectedCourse : 'all';
-        }
+        const searchTerm = (document.getElementById('searchResults')?.value || '').toLowerCase().trim();
+        const studentTerms = [
+            '<?php echo strtolower(addslashes($student->matric_number)); ?>',
+            '<?php echo strtolower(addslashes($student->name)); ?>'
+        ].filter(Boolean);
+        const looksLikeStudentIdentity = studentTerms.some(term => term === searchTerm || term.includes(searchTerm) || searchTerm.includes(term));
 
-        const searchTerm = document.getElementById('searchResults')?.value.toLowerCase() || '';
-        const courseFilter = document.getElementById('filterResultsCourse')?.value || 'all';
-        const dateFilter = document.getElementById('filterResultsDate')?.value;
-        const timeframe = document.getElementById('filterResultsTimeframe')?.value || 'all';
-
-        if (searchTerm) {
+        if (searchTerm && !looksLikeStudentIdentity) {
             results = results.filter(e =>
                 e.name.toLowerCase().includes(searchTerm) ||
                 e.code.toLowerCase().includes(searchTerm)
             );
-        }
-        if (courseFilter !== 'all') {
-            results = results.filter(e => e.code === courseFilter);
-        }
-        if (dateFilter) {
-            results = results.filter(e => {
-                const sourceDate = e.submitted_at || e.rawDate || e.start_datetime;
-                if (!sourceDate) return false;
-                const d = new Date(sourceDate);
-                if (Number.isNaN(d.getTime())) return false;
-                const month = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-                return month === dateFilter;
-            });
-        }
-        if (timeframe !== 'all') {
-            const now = new Date();
-            results = results.filter(e => {
-                const sourceDate = e.submitted_at || e.rawDate || e.start_datetime;
-                if (!sourceDate) return false;
-                const d = new Date(sourceDate);
-                if (Number.isNaN(d.getTime())) return false;
-                if (timeframe === 'today') return d.toDateString() === now.toDateString();
-                if (timeframe === 'week') return d >= new Date(now.getTime() - 7 * 86400000);
-                if (timeframe === 'month') return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
-                if (timeframe === 'year') return d.getFullYear() === now.getFullYear();
-                return true;
-            });
         }
 
         if (results.length === 0) {
@@ -1969,8 +2191,8 @@ $student = (object)[
                     <td><strong>${escapeHtml(e.name)}</strong></td>
                     <td>${escapeHtml(e.code)}</span></td>
                     <td>${escapeHtml(e.date)}</span></td>
-                    <td>${e.class_score ?? '-'}</span></td>
-                    <td>${e.exam_score ?? '-'}</span></td>
+                    <td>${e.class_score ?? 0}</span></td>
+                    <td>${e.exam_score ?? 0}</span></td>
                     <td><strong style="color: var(--success);">${e.score}</strong></span></td>
                     <td><span class="badge badge-info">${grade}</span></span></td>
                     <td>${gp}</span></td>
@@ -1985,12 +2207,17 @@ $student = (object)[
         renderResults();
     }
 
+    function isPublishedResult(exam) {
+        const hasScore = exam && exam.score !== null && exam.score !== undefined && exam.score !== '';
+        if (!hasScore) return false;
+        return exam.results_published === true ||
+            exam.results_published === 1 ||
+            exam.results_published === '1' ||
+            exam.status === 'completed';
+    }
+
     function resetResultsFilter() {
         document.getElementById('searchResults').value = '';
-        document.getElementById('filterResultsCourse').value = 'all';
-        const timeframe = document.getElementById('filterResultsTimeframe');
-        if (timeframe) timeframe.value = 'all';
-        document.getElementById('filterResultsDate').value = '';
         renderResults();
     }
 
@@ -2057,8 +2284,8 @@ $student = (object)[
                     <div style="display: grid; gap: 10px;">
                         <div><strong>Exam Name:</strong> ${escapeHtml(exam.name)}</div>
                         <div><strong>Course Code:</strong> ${escapeHtml(exam.code)}</div>
-                        <div><strong>Class Score:</strong> ${exam.class_score ?? '-'} / 40</div>
-                        <div><strong>Exam Score:</strong> ${exam.exam_score ?? '-'} / 60</div>
+                        <div><strong>Class Score:</strong> ${exam.class_score ?? 0} / 40</div>
+                        <div><strong>Exam Score:</strong> ${exam.exam_score ?? 0} / 60</div>
                         <div><strong>Total Score:</strong> ${exam.score} / 100</div>
                         <div><strong>Date Taken:</strong> ${escapeHtml(exam.date)}</div>
                         <div><strong>Duration:</strong> ${escapeHtml(exam.duration)}</div>
@@ -2163,15 +2390,34 @@ $student = (object)[
         });
     }
 
-    async function changePassword() {
-        const current = document.getElementById('currentPassword').value;
-        const newPass = document.getElementById('newPassword').value;
-        if (!current || !newPass) {
+    function openPasswordModal() {
+        const modal = document.getElementById('passwordModal');
+        if (modal) modal.style.display = 'flex';
+    }
+
+    function closePasswordModal() {
+        ['modalCurrentPassword', 'modalNewPassword', 'modalConfirmPassword'].forEach(id => {
+            const input = document.getElementById(id);
+            if (input) input.value = '';
+        });
+        const modal = document.getElementById('passwordModal');
+        if (modal) modal.style.display = 'none';
+    }
+
+    async function submitPasswordChange() {
+        const current = document.getElementById('modalCurrentPassword').value;
+        const newPass = document.getElementById('modalNewPassword').value;
+        const confirmPass = document.getElementById('modalConfirmPassword').value;
+        if (!current || !newPass || !confirmPass) {
             toast('Please fill all fields');
             return;
         }
         if (newPass.length < 6) {
             toast('Password must be at least 6 characters');
+            return;
+        }
+        if (newPass !== confirmPass) {
+            toast('New password and confirmation do not match');
             return;
         }
 
@@ -2190,8 +2436,7 @@ $student = (object)[
             const result = await response.json();
             if (result.success) {
                 toast('Password changed successfully');
-                document.getElementById('currentPassword').value = '';
-                document.getElementById('newPassword').value = '';
+                closePasswordModal();
             } else {
                 toast(result.error || 'Failed to change password');
             }
@@ -2199,6 +2444,39 @@ $student = (object)[
             toast('Network error');
         }
     }
+
+    async function changePassword() {
+        await submitPasswordChange();
+    }
+
+    function toggleStudentPassword(inputId, button) {
+        const input = document.getElementById(inputId);
+        if (!input) return;
+        const showing = input.type === 'text';
+        input.type = showing ? 'password' : 'text';
+        const icon = button?.querySelector('i');
+        if (icon) icon.className = showing ? 'fas fa-eye' : 'fas fa-eye-slash';
+    }
+
+    function applyStudentProfilePic(src) {
+        if (!src) return;
+        const profileImage = document.getElementById('profileImage');
+        const fallbackIcon = document.getElementById('profileFallbackIcon');
+        if (profileImage) {
+            profileImage.src = src;
+            profileImage.style.display = 'block';
+        }
+        if (fallbackIcon) fallbackIcon.style.display = 'none';
+        document.querySelectorAll('.student-avatar-img').forEach(img => {
+            img.src = src;
+            img.style.display = 'block';
+        });
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        const cached = localStorage.getItem('qoda_student_profile_pic');
+        if (cached) applyStudentProfilePic(cached);
+    });
 
     function uploadProfilePic(input) {
         if (input.files && input.files[0]) {
@@ -2211,7 +2489,11 @@ $student = (object)[
                 })
                 .then(r => r.json()).then(data => {
                     if (data.success) {
-                        document.getElementById('profileImage').src = data.url + '?t=' + new Date().getTime();
+                        const src = data.preview_url || data.url;
+                        if (src) {
+                            localStorage.setItem('qoda_student_profile_pic', src);
+                            applyStudentProfilePic(src);
+                        }
                         toast('Profile picture updated');
                     } else {
                         toast('Upload failed');
@@ -2281,6 +2563,7 @@ $student = (object)[
     window.onclick = function(event) {
         if (event.target === document.getElementById('coursesModal')) closeCoursesModal();
         if (event.target === document.getElementById('resultModal')) closeResultModal();
+        if (event.target === document.getElementById('passwordModal')) closePasswordModal();
     }
     </script>
 </body>
