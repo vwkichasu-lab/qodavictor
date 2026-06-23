@@ -100,6 +100,15 @@ function departmentAbbreviation(string $department): string
     return preg_replace('/[^A-Z0-9]/', '', substr($abbr, 0, 5)) ?: 'GEN';
 }
 
+function lecturerRegistrationInviteCode(): string
+{
+    $code = getenv('LECTURER_INVITE_CODE');
+    if ($code === false || trim($code) === '') {
+        $code = $_ENV['LECTURER_INVITE_CODE'] ?? $_SERVER['LECTURER_INVITE_CODE'] ?? '';
+    }
+    return trim((string)$code);
+}
+
 function generateLecturerStaffId(PDO $pdo, string $department): string
 {
     $prefix = 'PULC/' . departmentAbbreviation($department) . '/';
@@ -129,11 +138,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
     $email = trim($_POST['email'] ?? '');
     $department = trim($_POST['department'] ?? '');
     $title = trim($_POST['title'] ?? 'Mr.');
+    $inviteCode = trim($_POST['lecturer_invite_code'] ?? '');
+    $expectedInviteCode = lecturerRegistrationInviteCode();
 
-    if ($name === '' || $email === '' || $department === '') {
+    if ($name === '' || $email === '' || $department === '' || $inviteCode === '') {
         $error = 'Please fill all required fields.';
     } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
         $error = 'Please enter a valid email address.';
+    } elseif ($expectedInviteCode === '') {
+        $error = 'Lecturer registration is not configured. Please set the LECTURER_INVITE_CODE environment variable.';
+    } elseif (!hash_equals($expectedInviteCode, $inviteCode)) {
+        $error = 'Invalid lecturer invite code. Only authorized lecturers can create lecturer accounts.';
     } else {
         try {
             $staffId = generateLecturerStaffId($pdo, $department);
@@ -340,7 +355,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
 
             <div class="notice">
                 <strong>Lecturers only</strong>
-                Students should not register here. Student IDs such as PUIT/, PUSE/, PUAS/, PU/, or PUC/ must be used on the login page with the password given by the lecturer.
+                Students should not register here. Lecturer registration requires an invite code from the QODA owner. Student IDs such as PUIT/, PUSE/, PUAS/, PU/, or PUC/ must be used on the login page with the password given by the lecturer.
             </div>
 
             <?php if ($error): ?>
@@ -371,6 +386,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
                             placeholder="e.g., Information Technology"
                             value="<?= htmlspecialchars($_POST['department'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
                         <small class="field-hint">QODA will generate your lecturer ID from this department, for example PULC/IT/00001.</small>
+                    </div>
+                    <div class="full">
+                        <label for="lecturer_invite_code">Lecturer Invite Code</label>
+                        <input id="lecturer_invite_code" name="lecturer_invite_code" type="password" required
+                            autocomplete="off"
+                            placeholder="Enter the invite code given by the QODA owner">
+                        <small class="field-hint">This prevents students or random visitors from creating lecturer accounts.</small>
                     </div>
                     <div class="full">
                         <label>Account Type</label>
