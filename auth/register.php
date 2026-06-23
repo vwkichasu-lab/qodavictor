@@ -100,12 +100,6 @@ function departmentAbbreviation(string $department): string
     return preg_replace('/[^A-Z0-9]/', '', substr($abbr, 0, 5)) ?: 'GEN';
 }
 
-function registerLooksLikeStudentIdentifier(string $value): bool
-{
-    $candidate = strtoupper(preg_replace('/\s+/', '', trim($value)));
-    return (bool)preg_match('/^(PUIT|PUSE|PUAS|PUC|PU)\//', $candidate);
-}
-
 function generateLecturerStaffId(PDO $pdo, string $department): string
 {
     $prefix = 'PULC/' . departmentAbbreviation($department) . '/';
@@ -131,23 +125,19 @@ try {
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
-    $username = trim($_POST['username'] ?? '');
     $name = trim($_POST['name'] ?? '');
     $email = trim($_POST['email'] ?? '');
     $department = trim($_POST['department'] ?? '');
     $title = trim($_POST['title'] ?? 'Mr.');
 
-    if ($username === '' || $name === '' || $email === '' || $department === '') {
+    if ($name === '' || $email === '' || $department === '') {
         $error = 'Please fill all required fields.';
-    } elseif (registerLooksLikeStudentIdentifier($username)) {
-        $error = 'This looks like a student ID. Students should not register here. Please use the login details given by your lecturer.';
-    } elseif (str_contains($username, '/')) {
-        $error = 'Do not use a student or staff ID as your username. Enter a simple name-based lecturer username instead.';
     } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
         $error = 'Please enter a valid email address.';
     } else {
         try {
             $staffId = generateLecturerStaffId($pdo, $department);
+            $username = $staffId;
             $check = $pdo->prepare("
                 SELECT id
                 FROM users
@@ -368,14 +358,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
                         </select>
                     </div>
                     <div>
-                        <label for="username">Preferred Lecturer Username</label>
-                        <input id="username" name="username" required
-                            placeholder="e.g., victor.kichasu"
-                            autocomplete="username"
-                            value="<?= htmlspecialchars($_POST['username'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
-                        <small class="field-hint">Do not enter a student ID like PUIT/22110014 here.</small>
-                    </div>
-                    <div>
                         <label for="name">Full Name</label>
                         <input id="name" name="name" required value="<?= htmlspecialchars($_POST['name'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
                     </div>
@@ -389,6 +371,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
                             placeholder="e.g., Information Technology"
                             value="<?= htmlspecialchars($_POST['department'] ?? '', ENT_QUOTES, 'UTF-8') ?>">
                         <small class="field-hint">QODA will generate your lecturer ID from this department, for example PULC/IT/00001.</small>
+                    </div>
+                    <div class="full">
+                        <label>Account Type</label>
+                        <input value="Lecturer account only - student accounts are created by lecturers" readonly>
+                        <small class="field-hint">Students should log in with their assigned student ID and password. They do not register here.</small>
                     </div>
                 </div>
                 <button class="submit" type="submit">Create Lecturer Account</button>
