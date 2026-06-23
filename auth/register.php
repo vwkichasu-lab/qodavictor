@@ -5,6 +5,9 @@ if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
+header('Location: ../web-client/login.php');
+exit;
+
 $error = '';
 $registeredStaffId = '';
 

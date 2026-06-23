@@ -183,6 +183,67 @@
         }
     }
 
+    async function createLecturerAccount(event) {
+        const title = document.getElementById('newLecturerTitle')?.value || 'Mr.';
+        const fullName = document.getElementById('newLecturerName')?.value.trim() || '';
+        const email = document.getElementById('newLecturerEmail')?.value.trim() || '';
+        const department = document.getElementById('newLecturerDepartment')?.value.trim() || '';
+        const resultBox = document.getElementById('newLecturerResult');
+
+        if (!fullName || !email || !department) {
+            toast('Please enter the lecturer name, email, and department.');
+            return;
+        }
+
+        const btn = event?.currentTarget || event?.target;
+        const originalText = btn ? btn.innerHTML : '';
+        if (btn) {
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Creating...';
+        }
+        if (resultBox) {
+            resultBox.style.display = 'none';
+            resultBox.innerHTML = '';
+        }
+
+        try {
+            const result = await apiRequest('create_lecturer', {
+                title,
+                full_name: fullName,
+                email,
+                department
+            });
+
+            if (!result.success) {
+                toast(result.error || 'Could not create lecturer account.');
+                return;
+            }
+
+            const staffId = result.staff_id || '';
+            document.getElementById('newLecturerName').value = '';
+            document.getElementById('newLecturerEmail').value = '';
+            document.getElementById('newLecturerDepartment').value = '';
+            if (resultBox) {
+                resultBox.style.display = 'block';
+                resultBox.innerHTML = `
+                    <strong>Lecturer created successfully.</strong><br>
+                    Login ID: <code>${escapeHTML(staffId)}</code><br>
+                    Default password: <code>${escapeHTML(result.default_password || staffId)}</code><br>
+                    Ask the lecturer to change this password after first login.
+                `;
+            }
+            toast('Lecturer account created successfully.');
+        } catch (error) {
+            console.error('Create lecturer error:', error);
+            toast('Network error creating lecturer account.');
+        } finally {
+            if (btn) {
+                btn.disabled = false;
+                btn.innerHTML = originalText;
+            }
+        }
+    }
+
     async function deleteLecturerAccount() {
         const confirmed = await confirmPopup('Delete your lecturer account? This signs you out and disables this account.', 'Delete Account', 'Delete');
         if (!confirmed) return;
@@ -4380,4 +4441,3 @@
     }, 30000);
 
     document.addEventListener('DOMContentLoaded', enhanceSidebarTooltips);
-

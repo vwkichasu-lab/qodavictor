@@ -577,6 +577,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         color: transparent;
     }
 
+    .login-brand {
+        display: grid;
+        place-items: center;
+        gap: 10px;
+        margin-bottom: 22px;
+    }
+
+    .login-brand img {
+        width: 78px;
+        height: 78px;
+        object-fit: cover;
+        border-radius: 22px;
+        border: 1px solid rgba(255, 255, 255, 0.24);
+        box-shadow: 0 14px 34px rgba(0, 0, 0, 0.35);
+    }
+
+    .login-brand span {
+        color: rgba(255, 255, 255, 0.84);
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+    }
+
     .error-message {
         background: rgba(205, 12, 12, 0.63);
         border: 1px solid rgba(252, 6, 6, 0.99);
@@ -746,6 +770,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     <div class="container">
         <div class="glass-card">
+            <div class="login-brand">
+                <img src="../assets/qoda-logo.png" alt="QODA logo">
+                <span>QODA Secure Exam</span>
+            </div>
             <h1 class="form-title">User Log in</h1>
 
             <?php if ($error): ?>
@@ -778,7 +806,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             <div class="login-links">
                 <a href="forgot_password.php" class="forgot-link">Forgot password?</a>
-                <a href="../auth/register.php" class="forgot-link">Lecturer Registration</a>
             </div>
         </div>
     </div>

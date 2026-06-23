@@ -508,6 +508,44 @@ if (!function_exists('qodaColumnExists')) {
     }
 }
 
+if (!function_exists('qodaLecturerDepartmentAbbreviation')) {
+    function qodaLecturerDepartmentAbbreviation(string $department): string
+    {
+        $parts = preg_split('/\s+/', strtoupper(trim($department)), -1, PREG_SPLIT_NO_EMPTY);
+        if (!$parts) {
+            return 'GEN';
+        }
+        if (count($parts) === 1) {
+            return preg_replace('/[^A-Z0-9]/', '', substr($parts[0], 0, 4)) ?: 'GEN';
+        }
+        $abbr = '';
+        foreach ($parts as $part) {
+            $abbr .= $part[0] ?? '';
+        }
+        return preg_replace('/[^A-Z0-9]/', '', substr($abbr, 0, 5)) ?: 'GEN';
+    }
+}
+
+if (!function_exists('qodaGenerateLecturerStaffId')) {
+    function qodaGenerateLecturerStaffId(PDO $pdo, string $department): string
+    {
+        $prefix = 'PULC/' . qodaLecturerDepartmentAbbreviation($department) . '/';
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM users WHERE role = 'LECTURER' OR staff_id LIKE ?");
+        $stmt->execute([$prefix . '%']);
+        $next = max(1, (int)$stmt->fetchColumn() + 1);
+
+        do {
+            $staffId = $prefix . str_pad((string)$next, 5, '0', STR_PAD_LEFT);
+            $check = $pdo->prepare("SELECT id FROM users WHERE staff_id = ? OR user_id = ? OR userId = ? LIMIT 1");
+            $check->execute([$staffId, $staffId, $staffId]);
+            $exists = (bool)$check->fetch();
+            $next++;
+        } while ($exists);
+
+        return $staffId;
+    }
+}
+
 if (!function_exists('qodaExamOptionalColumnValues')) {
     function qodaExamOptionalColumnValues(PDO $pdo, array $values): array
     {
@@ -3300,6 +3338,115 @@ function generateAICodeFeedback($code, $language, $testResults, $score, $maxMark
                     ]);
                     echo json_encode(['success' => true, 'message' => 'Profile updated successfully']);
                 } catch (Exception $e) {
+                    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+                }
+                break;
+
+            case 'create_lecturer':
+                try {
+                    $title = trim($_POST['title'] ?? 'Mr.');
+                    $fullName = trim($_POST['full_name'] ?? '');
+                    $email = trim($_POST['email'] ?? '');
+                    $department = trim($_POST['department'] ?? '');
+
+                    if ($fullName === '' || $email === '' || $department === '') {
+                        echo json_encode(['success' => false, 'error' => 'Full name, email, and department are required']);
+                        break;
+                    }
+                    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                        echo json_encode(['success' => false, 'error' => 'A valid email address is required']);
+                        break;
+                    }
+
+                    foreach ([
+                        'username' => 'VARCHAR(120) NULL',
+                        'staff_id' => 'VARCHAR(100) NULL',
+                        'title' => 'VARCHAR(50) NULL',
+                        'fullName' => 'VARCHAR(255) NULL',
+                        'name' => 'VARCHAR(255) NULL',
+                        'createdAt' => 'DATETIME NULL',
+                        'updated_at' => 'DATETIME NULL',
+                    ] as $column => $definition) {
+                        try {
+                            ensureLecturerColumn($pdo, 'users', $column, $definition);
+                        } catch (Throwable $ignored) {
+                        }
+                    }
+
+                    $emailCheck = $pdo->prepare("SELECT id FROM users WHERE email = ? AND COALESCE(status, 'Active') <> 'Deleted' LIMIT 1");
+                    $emailCheck->execute([$email]);
+                    if ($emailCheck->fetch()) {
+                        echo json_encode(['success' => false, 'error' => 'A user with this email already exists']);
+                        break;
+                    }
+
+                    $pdo->exec("
+                        CREATE TABLE IF NOT EXISTS lecturers (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            userId INT NOT NULL,
+                            lecturerId VARCHAR(100) NOT NULL,
+                            department VARCHAR(255) NULL,
+                            title VARCHAR(50) NULL,
+                            createdAt DATETIME NULL,
+                            updatedAt DATETIME NULL,
+                            UNIQUE KEY uq_lecturers_user (userId)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                    ");
+
+                    $staffId = qodaGenerateLecturerStaffId($pdo, $department);
+                    $hashedPassword = password_hash($staffId, PASSWORD_DEFAULT);
+
+                    $pdo->beginTransaction();
+                    $stmt = $pdo->prepare("
+                        INSERT INTO users
+                            (user_id, userId, username, staff_id, title, full_name, fullName, name, email, password,
+                             role, status, department, created_at, createdAt, updated_at)
+                        VALUES
+                            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'LECTURER', 'Active', ?, NOW(), NOW(), NOW())
+                    ");
+                    $stmt->execute([
+                        $staffId,
+                        $staffId,
+                        $staffId,
+                        $staffId,
+                        $title,
+                        $fullName,
+                        $fullName,
+                        $fullName,
+                        $email,
+                        $hashedPassword,
+                        $department
+                    ]);
+
+                    $newUserId = (int)$pdo->lastInsertId();
+                    $profile = $pdo->prepare("
+                        INSERT INTO lecturers (userId, lecturerId, department, title, createdAt, updatedAt)
+                        VALUES (?, ?, ?, ?, NOW(), NOW())
+                        ON DUPLICATE KEY UPDATE department = VALUES(department), title = VALUES(title), updatedAt = NOW()
+                    ");
+                    $profile->execute([$newUserId, $staffId, $department, $title]);
+
+                    try {
+                        $audit = $pdo->prepare("INSERT INTO audit_logs (actor_id, actor_role, action, description, ip_address) VALUES (?, 'LECTURER', 'CREATE_LECTURER', ?, ?)");
+                        $audit->execute([
+                            $lecturerId,
+                            'Created lecturer account ' . $staffId . ' for ' . $fullName,
+                            $_SERVER['REMOTE_ADDR'] ?? ''
+                        ]);
+                    } catch (Throwable $ignored) {
+                    }
+
+                    $pdo->commit();
+                    echo json_encode([
+                        'success' => true,
+                        'message' => 'Lecturer account created successfully',
+                        'staff_id' => $staffId,
+                        'default_password' => $staffId
+                    ]);
+                } catch (Exception $e) {
+                    if ($pdo->inTransaction()) {
+                        $pdo->rollBack();
+                    }
                     echo json_encode(['success' => false, 'error' => $e->getMessage()]);
                 }
                 break;
